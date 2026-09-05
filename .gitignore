@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+runtime/
+evidence/
+.env
+*.gguf
+*.safetensors
+*.bin
+*.resume
+*.meta
+runtime.json

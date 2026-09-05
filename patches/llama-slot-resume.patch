@@ -1,0 +1,114 @@
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -37,6 +37,89 @@
+ #endif
+ 
+ constexpr int HTTP_POLLING_SECONDS = 1;
++
++// Local archive format. The proxy supplies model/build identity and atomic publication.
++static void slot_resume_io(std::fstream & file, void * data, size_t size, bool writing) {
++    if (writing) {
++        file.write(static_cast<const char *>(data), size);
++    } else {
++        file.read(static_cast<char *>(data), size);
++    }
++    if (!file) { throw std::runtime_error("Invalid or incomplete slot resume file"); }
++}
++
++template<typename T>
++static void slot_resume_value(std::fstream & file, T & value, bool writing) {
++    slot_resume_io(file, &value, sizeof(value), writing);
++}
++
++static void slot_resume_blob(std::fstream & file, std::vector<uint8_t> & data, bool writing, uint64_t & remaining) {
++    uint64_t size = data.size();
++    slot_resume_value(file, size, writing);
++    if (!writing) {
++        if (size > remaining) { throw std::runtime_error("Invalid slot resume blob size"); }
++        remaining -= size;
++        data.resize(size);
++    }
++    if (size) { slot_resume_io(file, data.data(), size, writing); }
++}
++
++static void slot_resume_file(const std::string & path, server_prompt & prompt,
++        llama_context * ctx_dft, common_speculative * spec, llama_seq_id id, bool writing) {
++    std::fstream file(path, std::ios::binary | (writing ? std::ios::out | std::ios::trunc : std::ios::in));
++    if (!file) { throw std::runtime_error("Missing slot resume file"); }
++    uint64_t remaining = writing ? 0 : std::filesystem::file_size(path);
++    uint32_t magic = 0x51534c54, version = 1;
++    slot_resume_value(file, magic, writing);
++    slot_resume_value(file, version, writing);
++    if (magic != 0x51534c54 || version != 1) { throw std::runtime_error("Unsupported slot resume format"); }
++    std::vector<uint8_t> draft, speculative;
++    if (writing) {
++        if (ctx_dft) {
++            draft.resize(llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE));
++            if (llama_state_seq_get_data_ext(ctx_dft, draft.data(), draft.size(), id, LLAMA_STATE_SEQ_FLAGS_NONE) != draft.size()) {
++                throw std::runtime_error("Unable to save draft state");
++            }
++        }
++        common_speculative_get_state(spec, id, speculative);
++    }
++    slot_resume_blob(file, draft, writing, remaining);
++    slot_resume_blob(file, speculative, writing, remaining);
++    uint32_t count = prompt.checkpoints.size();
++    slot_resume_value(file, count, writing);
++    if (!writing) {
++        if (count > 65536 || count > remaining / 40) { throw std::runtime_error("Invalid checkpoint count"); }
++        prompt.checkpoints.clear();
++        prompt.checkpoints.resize(count);
++    }
++    for (auto & cp : prompt.checkpoints) {
++        slot_resume_value(file, cp.n_tokens, writing);
++        slot_resume_value(file, cp.pos_min, writing);
++        slot_resume_value(file, cp.pos_max, writing);
++        slot_resume_blob(file, cp.data_tgt, writing, remaining);
++        slot_resume_blob(file, cp.data_dft, writing, remaining);
++        slot_resume_blob(file, cp.data_spec, writing, remaining);
++        if (!writing && (cp.n_tokens < 0 || cp.n_tokens > prompt.n_tokens() || cp.pos_min < 0 || cp.pos_max < cp.pos_min)) {
++            throw std::runtime_error("Invalid checkpoint positions");
++        }
++        if (!writing) { cp.id_task = -1; }
++    }
++    if (writing) {
++        file.flush();
++        if (!file) { throw std::runtime_error("Unable to flush slot resume file"); }
++    } else {
++        if (file.peek() != std::char_traits<char>::eof()) { throw std::runtime_error("Trailing slot resume data"); }
++        if (ctx_dft) {
++            if (draft.empty() || llama_state_seq_set_data_ext(ctx_dft, draft.data(), draft.size(), id, LLAMA_STATE_SEQ_FLAGS_NONE) != draft.size()) {
++                throw std::runtime_error("Unable to restore draft state");
++            }
++        } else if (!draft.empty()) {
++            throw std::runtime_error("Slot archive requires draft context");
++        }
++        common_speculative_set_state(spec, id, speculative);
++    }
++}
++
+ 
+ static common_speculative_output_limits server_output_limits(const common_params & params) {
+     if (params.embedding ||
+@@ -2560,6 +2643,13 @@
+                         reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+                     if (nwrite == 0) {
+                         send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
++                        break;
++                    }
++
++                    try {
++                        slot_resume_file(filepath + ".resume", slot->prompt, ctx_dft, spec.get(), slot->id, true);
++                    } catch (const std::exception & err) {
++                        send_error(task, err.what(), ERROR_TYPE_SERVER);
+                         break;
+                     }
+ 
+@@ -2622,6 +2712,7 @@
+ 
+                         slot->prompt.clear();
+                         slot->prompt.tokens = std::move(restored);
++                        slot_resume_file(filepath + ".resume", slot->prompt, ctx_dft, spec.get(), slot->id, false);
+                     } catch (const std::exception & err) {
+                         slot->prompt_clear();
+                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);

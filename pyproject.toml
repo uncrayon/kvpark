@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sloth-memory"
+version = "0.1.0a1"
+description = "Let your local AI nap. Resume long conversations from saved inference state."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Ulises Rayon"}]
+keywords = ["llama.cpp", "kv-cache", "local-ai", "open-weights", "agents"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/uncrayon/sloth-memory"
+Issues = "https://github.com/uncrayon/sloth-memory/issues"
+
+[project.scripts]
+sloth-memory = "sloth_memory.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
