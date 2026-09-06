@@ -53,7 +53,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m pip install . ./.hermes-test
+      - run: python -m pip install . -e ./.hermes-test
       - run: python tests/hermes/test_integration.py -v
         env:
           PYTHONPATH: .hermes-test
