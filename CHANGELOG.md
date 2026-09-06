@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.0a2 — Hermes adapter and configurable cleanup
+
+- Added native Hermes plugin discovery, automatic service startup/reuse, and
+  `/sloth-memory setup` onboarding with future-session model routing.
+- Added native park/delete/status commands plus retention, budget, cleanup,
+  base URL, and autostart controls.
+- Cleanup defaults to enabled, checks hourly, and expires disk snapshots seven
+  days after saving; restores no longer extend their lifetime.
+- Persisted cleanup settings across restarts; added manual sweeps and safe cleanup
+  of expired unpublished snapshot generations.
+- Enforced the snapshot budget after saves and budget reductions even when
+  scheduled cleanup is disabled. MIT licensing is unchanged.
+
 ## 0.1.0a1 — first developer alpha
 
 - Extracted the conversation archive proxy into an agent-independent Python package.

@@ -11,6 +11,7 @@ import hmac
 import json
 import logging
 import os
+import re
 from pathlib import Path
 import threading
 import time
@@ -111,6 +112,13 @@ class Archive:
         self._snapshot = {}
         self.entries = {}
         ARCHIVE.mkdir(parents=True, exist_ok=True)
+        from .retention import Retention
+        self.retention = Retention(ARCHIVE / "retention.json", lambda: dict(
+            ttl_days=TTL_DAYS, max_gib=MAX_ARCHIVE_GB, cleanup_enabled=True))
+        overrides = os.environ.get("SLOTH_POLICY_OVERRIDES")
+        if overrides:
+            self.retention.update(json.loads(overrides))
+        self.gc_wakeup = threading.Event()
         for path in ARCHIVE.glob("k-*.meta"):
             try:
                 meta = json.loads(path.read_text())
@@ -128,6 +136,7 @@ class Archive:
             "resident_key": self.current_key, "resident_thread": self.current_thread,
             "activity": self.activity, "runtime_error": self.runtime_error,
             "entries": self.entries, "recent": list(self.events)[:12],
+            "retention": self.retention.settings(),
         })
 
     def set_activity(self, phase, key=None):
@@ -212,7 +221,7 @@ class Archive:
             for path in files:
                 with path.open("rb") as fh:
                     os.fsync(fh.fileno())
-            if sum(path.stat().st_size for path in files) > MAX_ARCHIVE_GB * 1024**3:
+            if sum(path.stat().st_size for path in files) > self.retention.settings()["max_gib"] * 1024**3:
                 raise ValueError("snapshot exceeds max-gib; increase the limit before parking")
             meta = dict(format=2, filename=filename, identity=self.identity,
                         tokens=result["n_saved"], bytes=sum(p.stat().st_size for p in files),
@@ -241,6 +250,7 @@ class Archive:
         self.record("saved", key, tokens=meta["tokens"], gib=round(meta["bytes"] / 1024**3, 3),
                     seconds=round(time.monotonic() - t0, 3))
         log.info("saved %s: %d tokens", key, meta["tokens"])
+        self.enforce_capacity()
 
     def restore(self, key, incoming=None):
         meta = self.entries.get(key)
@@ -249,7 +259,7 @@ class Archive:
         if meta["identity"] != self.identity:
             self.record("incompatible", key)
             return  # Keep old artifacts, but NEVER pass wrong weights to restore.
-        if TTL_DAYS > 0 and time.time() - meta["last_used"] > TTL_DAYS * 86400:
+        if self.retention.expired(meta, time.time()):
             self.remove(key)
             self.record("expired", key)
             return
@@ -333,7 +343,7 @@ class Archive:
         snapshot = copy.deepcopy(self._snapshot)
         now = time.time()
         entries = [dict(key=k, tokens=v["tokens"], gib=round(v["bytes"] / 1024**3, 3),
-                        age_days=round((now - v["last_used"]) / 86400, 3),
+                        age_days=round((now - v.get("saved_at", v["last_used"])) / 86400, 3),
                         resident=k == snapshot["resident_key"], thread=v.get("thread"))
                    for k, v in snapshot["entries"].items()]
         return dict(resident_key=snapshot["resident_key"], resident_thread=snapshot["resident_thread"],
@@ -341,7 +351,9 @@ class Archive:
                     upstream=f"{UPSTREAM_HOST}:{UPSTREAM_PORT}", archive_dir=str(ARCHIVE),
                     archived=len(entries), entries=entries,
                     total_gib=round(sum(v["bytes"] for v in snapshot["entries"].values()) / 1024**3, 3),
-                    ttl_days=TTL_DAYS, max_gib=MAX_ARCHIVE_GB,
+                    service="sloth-memory", control_version=2,
+                    ttl_days=snapshot["retention"]["ttl_days"], max_gib=snapshot["retention"]["max_gib"],
+                    cleanup_enabled=snapshot["retention"]["cleanup_enabled"], cleanup_interval_seconds=3600,
                     recent=[dict(e, ago_s=round(now-e["at"], 1)) for e in snapshot["recent"]])
 
     def doctor(self):
@@ -367,19 +379,50 @@ class Archive:
             self.record("forgotten", key)
         return dict(ok=True, key=key, note="Saved archive deleted; transcript and resident inference state are unchanged.")
 
-    def gc(self):
+    def update_retention(self, values):
         with self.lock:
+            settings = self.retention.update(values)
+            self.enforce_capacity()
+            self.record("retention-updated", None, **settings)
+            self.gc_wakeup.set()
+            return settings
+
+    def enforce_capacity(self):
+        total = sum(m["bytes"] for m in self.entries.values())
+        for key, meta in sorted(self.entries.items(), key=lambda item: item[1]["last_used"]):
+            if total <= self.retention.settings()["max_gib"] * 1024**3:
+                break
+            self.remove(key)
+            total -= meta["bytes"]
+            self.record("evicted", key)
+
+    def gc(self, *, manual=False):
+        with self.lock:
+            if not manual and not self.retention.settings()["cleanup_enabled"]:
+                return dict(deleted=0, orphan_files=0, cleanup_enabled=False)
+            before = len(self.entries)
+            now = time.time()
             for key, meta in list(self.entries.items()):
-                if TTL_DAYS > 0 and time.time() - meta["last_used"] > TTL_DAYS * 86400:
+                if self.retention.expired(meta, now, manual=manual):
                     self.remove(key)
                     self.record("expired", key)
-            total = sum(m["bytes"] for m in self.entries.values())
-            for key, meta in sorted(self.entries.items(), key=lambda item: item[1]["last_used"]):
-                if total <= MAX_ARCHIVE_GB * 1024**3:
-                    break
-                self.remove(key)
-                total -= meta["bytes"]
-                self.record("evicted", key)
+            self.enforce_capacity()
+            # A crash can leave an unpublished generation. Match only our exact
+            # filenames, never arbitrary files or another application's backups.
+            referenced = {m["filename"] + suffix for m in self.entries.values() for suffix in ("", ".resume")}
+            ttl = self.retention.settings()["ttl_days"]
+            orphans = 0
+            for path in ARCHIVE.iterdir() if ttl > 0 else ():
+                if (re.fullmatch(r"k-[0-9a-f]{64}\.[0-9a-f]{32}\.bin(?:\.resume)?", path.name)
+                        and path.name not in referenced and not path.is_symlink() and path.is_file()
+                        and now - path.stat().st_mtime >= ttl * 86400):
+                    path.unlink()
+                    orphans += 1
+            if orphans:
+                self.record("orphan-cleanup", None, files=orphans)
+            self.publish_status()
+            return dict(deleted=before - len(self.entries), orphan_files=orphans,
+                        cleanup_enabled=self.retention.settings()["cleanup_enabled"])
 
 
 class ResponseMetrics:
@@ -456,6 +499,13 @@ class Handler(BaseHTTPRequestHandler):
                 payload = ARCHIVE_STATE.status()
             elif method == "GET" and path == CONTROL_PREFIX + "doctor":
                 payload = ARCHIVE_STATE.doctor()
+            elif method == "GET" and path == CONTROL_PREFIX + "settings":
+                payload = ARCHIVE_STATE.status()
+                payload = {k: payload[k] for k in ("ttl_days", "max_gib", "cleanup_enabled")}
+            elif method == "POST" and path == CONTROL_PREFIX + "settings":
+                payload = ARCHIVE_STATE.update_retention(json.loads(body or b"{}"))
+            elif method == "POST" and path == CONTROL_PREFIX + "cleanup":
+                payload = ARCHIVE_STATE.gc(manual=True)
             elif method == "POST" and path == CONTROL_PREFIX + "forget":
                 req = json.loads(body or b"{}")
                 if not isinstance(req, dict):
@@ -627,7 +677,8 @@ def gc_loop():
             ARCHIVE_STATE.gc()
         except Exception:
             log.exception("GC failed")
-        time.sleep(3600)
+        ARCHIVE_STATE.gc_wakeup.wait(3600)
+        ARCHIVE_STATE.gc_wakeup.clear()
 
 
 def main():

@@ -7,8 +7,9 @@ it when you return. Built for people running open-weight models on their own har
 MIT licensed. No cloud service, account, or Python runtime dependencies.
 
 **Developer alpha · Linux · one local llama.cpp slot · pinned patched runtime.**
-The service is independent of Hermes. Agents integrate through an HTTP proxy and
-explicit session metadata; a plain Python example is included.
+The service is independent of Hermes. A native Hermes adapter provides startup,
+slash-command onboarding, and cleanup controls. Other agents integrate through
+an HTTP proxy and explicit session metadata; a plain Python example is included.
 
 ## What it does
 
@@ -37,7 +38,7 @@ supported GGUF model. Start with the CPU build to verify functionality; it is no
 a GPU performance recommendation. Models and compiled runtimes are not bundled.
 
 ```bash
-git clone --branch v0.1.0-alpha.1 https://github.com/uncrayon/sloth-memory.git
+git clone --branch v0.1.0-alpha.2 https://github.com/uncrayon/sloth-memory.git
 cd sloth-memory
 python3 -m venv .venv
 source .venv/bin/activate
@@ -69,6 +70,31 @@ sloth-memory doctor
 Both processes use `~/.local/share/sloth-memory` by default, respecting
 `XDG_DATA_HOME`. To change it, pass the **same** `--archive-dir` to both commands.
 Keep the backend terminal running while using the proxy.
+
+## Use with Hermes
+
+Install sloth-memory in Hermes' Python environment, enable it with
+`hermes plugins enable sloth-memory`, and restart Hermes. Then run:
+
+```text
+/sloth-memory setup
+```
+
+The [Hermes setup guide](docs/hermes.md) covers selecting the backend and model.
+Once configured, services start with Hermes and keep running for cleanup.
+
+```text
+/sloth-memory park
+/sloth-memory delete
+/sloth-memory retention 7
+/sloth-memory cleanup off
+/sloth-memory cleanup on
+/sloth-memory base-url http://127.0.0.1:8080
+```
+
+By default, cleanup runs hourly and expires snapshots **seven days after saving**.
+It deletes disk snapshots, not transcripts or live RAM. Preferences persist across
+restarts; the guide lists every command and the external-service option.
 
 ## Try it without an agent framework
 
@@ -111,8 +137,7 @@ removed before forwarding to llama.cpp. Send `slot_archive_role: "background"`
 for detached work. A user/account ID is not a conversation ID.
 
 See the [integration contract](docs/integration.md) for branching, compaction,
-streaming, authentication, and the Hermes migration path. The alpha includes a
-generic client; it does not install or patch Hermes.
+streaming and authentication. The optional Hermes adapter does not patch Hermes.
 
 ## Commands
 
@@ -124,6 +149,8 @@ generic client; it does not install or patch Hermes.
 | `sloth-memory park --session …` | Save exactly that resident conversation |
 | `sloth-memory status` | Inspect archives and actual completed-request reuse |
 | `sloth-memory forget --session …` | Delete that saved archive; keep the transcript |
+| `sloth-memory settings --ttl-days 7 --cleanup` | Persist cleanup preferences without a restart |
+| `sloth-memory cleanup` | Run cleanup now |
 
 `doctor` does not prove checkpoint support or cache reuse. Verify the complete
 flow with your own model:

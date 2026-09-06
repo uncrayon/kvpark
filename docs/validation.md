@@ -1,5 +1,29 @@
 # Alpha validation
 
+## Hermes and cleanup — alpha.2
+
+The standalone suite now covers persistent cleanup controls, expiry by save date,
+crash-orphan cleanup, directory ownership, and safe startup/attachment. Separate
+tests load the actual pip entry point through Hermes in temporary profiles,
+dispatch native slash commands, persist settings through Hermes' config writer,
+and exercise real request middleware with foreground/background turn bindings.
+
+An optional real-model test also verifies that Hermes discovery itself starts
+the CPU backend and proxy, native park/delete operate on a real conversation,
+unloading Hermes leaves cleanup services running, and reloading attaches without
+duplicate processes. It passed locally with Qwen3-4B and the pinned CPU runtime.
+
+Run the integration tests in Hermes' Python environment with sloth-memory installed:
+
+```bash
+python tests/hermes/test_integration.py -v
+```
+
+For the optional real-model test, set `SLOTH_TEST_SERVER` and `SLOTH_TEST_MODEL`
+to absolute local paths. It uses temporary profiles, ports, and archive files,
+and terminates only the processes it launches. The Hermes CI job pins upstream
+`9dd6634c5635321cf38840cc30e9b51226689128` and runs without model downloads.
+
 ## Standalone release test — September 5, 2026
 
 The standalone package was exercised without Hermes against a clean CPU build of

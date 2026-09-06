@@ -79,13 +79,18 @@ all endpoints then require that bearer token. If the backend requires a key, set
 the corresponding upstream authentication option when launching the backend.
 Never publish keys, transcript files, or archive directories.
 
+## Cleanup settings API
+
+`GET /_sloth/settings` reads `ttl_days`, `max_gib`, and `cleanup_enabled`.
+`POST /_sloth/settings` atomically persists any subset of those settings.
+`POST /_sloth/cleanup` runs a manual sweep with the saved age/budget rules.
+Unknown keys, invalid booleans, negative ages, and nonpositive budgets are refused.
+Status includes `service: "sloth-memory"` and `control_version: 2` for adapters.
+
 ## Hermes
 
-Hermes motivated the original implementation. Its adapter needs verified
-foreground/background persistence intent and a native command that captures the
-exact session identity. Older integrations used `/__slot_proxy/` and `SLOT_PROXY_*`;
-this standalone alpha uses `/_sloth/` and `SLOTH_*`.
-
-Do not point an old Hermes command plugin at the new API without adapting it.
-This release deliberately ships no installer that edits Hermes internals. Use
-the generic contract above to build an adapter against your Hermes version.
+The native adapter now ships as a `hermes_agent.plugins` entry point. Follow the
+[Hermes guide](hermes.md) for launch-on-load, slash-command setup, parking,
+deletion, and persistent cleanup controls. It does not edit Hermes internals.
+Legacy `/qwen-slot` plugins use `/__slot_proxy/` and `SLOT_PROXY_*`; this package
+uses `/_sloth/` and `SLOTH_*`.

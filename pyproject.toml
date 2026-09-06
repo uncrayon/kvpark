@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sloth-memory"
-version = "0.1.0a1"
+version = "0.1.0a2"
 description = "Let your local AI nap. Resume long conversations from saved inference state."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,6 +24,9 @@ Issues = "https://github.com/uncrayon/sloth-memory/issues"
 
 [project.scripts]
 sloth-memory = "sloth_memory.cli:main"
+
+[project.entry-points."hermes_agent.plugins"]
+sloth-memory = "sloth_memory.hermes"
 
 [tool.setuptools.packages.find]
 where = ["src"]

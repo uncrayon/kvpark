@@ -41,3 +41,19 @@ jobs:
         with:
           name: python-distributions
           path: dist/*
+  hermes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: 9dd6634c5635321cf38840cc30e9b51226689128
+          path: .hermes-test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install . ./.hermes-test
+      - run: python tests/hermes/test_integration.py -v
+        env:
+          PYTHONPATH: .hermes-test

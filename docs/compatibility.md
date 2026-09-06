@@ -67,11 +67,21 @@ and repark after runtime updates.
 
 ## Storage policy
 
-`serve --ttl-days 7 --max-gib 32` sets the defaults. `--ttl-days 0` disables time
-expiry. The budget applies to published snapshots; a save may temporarily need
-extra space. A snapshot larger than the whole budget is rejected, preserving the
-previous generation. Periodic GC evicts least-recently-used entries, so the budget
-can be exceeded between GC runs and retention is not guaranteed.
+New archives default to seven days after the last save, cleanup enabled, and a
+32 GiB budget. The proxy checks at startup and hourly when inference is idle.
+Restoring does not extend snapshot age. Expired unpublished generation files are
+also cleaned; arbitrary files, symlinks, and live RAM state are not swept.
+
+`settings --ttl-days 7 --max-gib 32 --cleanup` changes and persists preferences.
+`--no-cleanup` disables scheduled deletion and age expiry on restore;
+`--ttl-days 0` disables age expiry only. `sloth-memory cleanup` runs a manual sweep.
+Explicit `serve --ttl-days … --max-gib … --[no-]cleanup` flags override saved
+preferences; omitted flags preserve them.
+
+The budget is enforced after saving and when reducing it, including when scheduled
+cleanup is off. Least-recently-used snapshots can be evicted before seven days.
+The limit applies to published snapshots; atomic replacement temporarily needs
+extra space. An oversized snapshot is rejected, preserving the preceding generation.
 
 Explicit parking always saves the current state. When switching away, an already
 parked conversation is refreshed after 4,096 tokens of growth. A selected

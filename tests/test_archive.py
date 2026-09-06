@@ -105,7 +105,7 @@ class ArchiveTests(unittest.TestCase):
     def test_expired_archive_not_restored(self):
         key = self.a.current_key
         self.a.park(key=key)
-        self.a.entries[key]["last_used"] -= 8 * 86400
+        self.a.entries[key]["saved_at"] -= 8 * 86400
         self.a.restore(key)
         self.assertNotIn("/slots/0?action=restore", self.calls)
         self.assertFalse(self.a.entries)

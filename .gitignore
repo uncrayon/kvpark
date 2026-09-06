@@ -13,3 +13,4 @@ evidence/
 *.resume
 *.meta
 runtime.json
+.hermes-test/
