@@ -103,7 +103,7 @@ class Service:
             return None
         if config["external"]:
             return status
-        if Path(status.get("archive_dir", "")).resolve() != Path(config["archive_dir"]):
+        if Path(status.get("archive_dir", "")).resolve() != Path(config["archive_dir"]).resolve():
             return None
         upstream = status.get("upstream_url", "http://" + status.get("upstream", ""))
         if upstream != target(config).url:

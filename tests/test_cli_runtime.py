@@ -22,7 +22,7 @@ class LauncherTests(unittest.TestCase):
                         runtime.backend_command(sys.executable, str(model), Path(tmp), 8090, extra)
                 argv = runtime.backend_command(sys.executable, str(model), Path(tmp), 8090, ["--ctx-size", "4096"])
                 self.assertEqual(argv[argv.index("--parallel") + 1], "1")
-                self.assertEqual(argv[argv.index("--model") + 1], str(model))
+                self.assertEqual(argv[argv.index("--model") + 1], str(model.resolve()))
                 with patch.dict(os.environ, {"LLAMA_ARG_MODEL": "another-model"}):
                     with self.assertRaisesRegex(ValueError, "LLAMA_ARG"):
                         runtime.backend_command(sys.executable, str(model), Path(tmp), 8090, [])
@@ -39,7 +39,7 @@ class LauncherTests(unittest.TestCase):
                 linked.return_value = subprocess.CompletedProcess([], 0, "", "")
                 runtime.write_manifest(manifest, os.getpid(), argv)
                 data = json.loads(manifest.read_text())
-                self.assertIn(str(second), data["files"])
+                self.assertIn(str(second.resolve()), data["files"])
                 second.write_bytes(b"replacement")
                 runtime.write_manifest(manifest, os.getpid(), argv)
                 self.assertNotEqual(data["identity"], json.loads(manifest.read_text())["identity"])
