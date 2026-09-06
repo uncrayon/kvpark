@@ -1,7 +1,7 @@
 # Backends and operating systems
 
-This describes the next development version. The published alpha.2 remains
-Linux-only with its original llama.cpp integration.
+This describes the current `main` development version (`0.2.0.dev0`). The published
+alpha.2 remains Linux-only with its original llama.cpp integration.
 
 ## Capability contract
 

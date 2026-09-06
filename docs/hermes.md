@@ -1,8 +1,8 @@
 # Hermes adapter and onboarding
 
-For the next development version's portable startup, automatic port selection,
-and other inference engines, see [backend setup](backends.md). The instructions
-below describe the published alpha.2.
+These instructions install the current `main` development version (`0.2.0.dev0`),
+including portable startup and automatic port selection. The published alpha.2
+does not contain those changes. See [backend setup](backends.md) for capabilities.
 
 The adapter ships inside sloth-memory as a native Hermes plugin. It uses plugin
 discovery, request middleware, commands, and profile settings. It does not patch
@@ -14,16 +14,30 @@ Install into **the same Python environment that runs Hermes**:
 
 ```bash
 # With your Hermes virtual environment activated:
-python -m pip install https://github.com/uncrayon/sloth-memory/releases/download/v0.1.0-alpha.2/sloth_memory-0.1.0a2-py3-none-any.whl
+git clone --branch main https://github.com/uncrayon/sloth-memory.git
+cd sloth-memory
+python -m pip install --upgrade .
 hermes plugins enable sloth-memory
 ```
 
-Restart Hermes to discover the entry point. The adapter is tested against Hermes
+For an existing checkout, use `git pull --ff-only origin main` on its `main`
+branch, then repeat the pip install command. Run `sloth-memory --version` in
+Hermes' environment to confirm `0.2.0.dev0`. Restart Hermes after installation or
+upgrade to load the entry point. The adapter is tested against Hermes
 0.21.0, upstream commit `9dd6634c5635321cf38840cc30e9b51226689128`.
 Use Python 3.11–3.13 for Hermes; the standalone service also supports 3.10/3.14.
 
-Build the [compatible runtime](compatibility.md) and obtain your own GGUF model
-before managed startup. Onboarding does not download weights or compile a backend.
+For managed disk snapshots, build the [compatible runtime](compatibility.md)
+and obtain your own GGUF model before setup:
+
+```bash
+python scripts/build_runtime.py --cmake-arg=-DGGML_METAL=OFF
+```
+
+This starts with a CPU build, including on macOS. Use the absolute binary path
+printed by the build; Windows typically places `llama-server.exe` under
+`runtime/build/bin/Release`. Onboarding does not download weights or compile a
+backend. Connecting an existing server in routing mode requires no build.
 
 ## Guided setup
 
@@ -31,23 +45,46 @@ before managed startup. Onboarding does not download weights or compile a backen
 /sloth-memory setup
 ```
 
-This shows defaults and the next step. Configure the backend, check readiness,
-then select the route:
+This shows defaults and the next step. For managed disk snapshots, configure
+the included patched runtime:
 
 ```text
 /sloth-memory setup --server "/absolute/path/to/llama-server" --model "/absolute/path/to/model.gguf"
-/sloth-memory start
-/sloth-memory connect
+/sloth-memory status
 ```
 
-Setup begins startup automatically. `connect` uses Hermes' config writer to select
-the custom model `local` at the proxy's `/v1` URL for **future sessions**. Restart
-Hermes and start a new conversation. Existing sessions retain their saved route;
-their prompt history is not rewritten.
+Complete setup starts services and saves the selected proxy `/v1` URL through
+Hermes' config writer for **new sessions**. Managed llama.cpp uses the model alias
+`local`; an existing backend uses the exact model ID you configure. `start` and
+`connect` remain available to retry startup or explicitly select the route.
+Restart Hermes and start a new conversation for the initial test. Existing
+sessions using the configured upstream or a previously selected proxy can be
+redirected by the native OpenAI client middleware; unrelated routes are unchanged.
 
-After configuration, the enabled plugin starts the backend and proxy when Hermes
-loads. Existing compatible services are reused; an archive-directory lock
-coordinates concurrent Hermes surfaces. Services stay running after Hermes closes
+### Try an existing llama.cpp server on your Mac
+
+Keep that server running and use its listening URL and served model ID:
+
+```text
+/sloth-memory setup --backend llama.cpp --cache-mode routing --upstream-url http://127.0.0.1:8090 --model "your-served-alias"
+/sloth-memory status
+```
+
+This tests `Hermes → sloth-memory → your existing llama.cpp`. It does **not**
+enable disk park/resume: stock llama.cpp has save/restore APIs, but this adapter
+currently requires its additional state companion for native archives. To test
+persistence after this routing test, explicitly clear the existing upstream and
+select native mode with a separate archive directory:
+
+```text
+/sloth-memory setup --backend llama.cpp --cache-mode native --upstream-url "" --no-external --archive-dir "/absolute/path/to/sloth-native" --server "/absolute/path/to/llama-server" --model "/absolute/path/to/model.gguf"
+```
+
+See [other backends](backends.md#connect-an-existing-server) for Ollama, vLLM, and MLX-LM.
+
+After configuration, the enabled plugin starts the proxy and, in managed native
+mode, the backend when Hermes loads. Existing upstream servers must already be
+running. Existing compatible services are reused; an archive-directory lock coordinates concurrent Hermes surfaces. Services stay running after Hermes closes
 so cleanup continues. Reopening Hermes does not launch another model copy.
 
 ## Defaults
@@ -59,8 +96,9 @@ so cleanup continues. Reopening Hermes does not launch another model copy.
 | Snapshot lifetime | 7 days after the last successful save |
 | Cleanup frequency | Proxy startup and hourly, when inference is idle |
 | Saved snapshot budget | 32 GiB |
-| Proxy base URL | `http://127.0.0.1:8080` |
-| Backend port | `8090` |
+| Preferred proxy base URL | `http://127.0.0.1:8080`; falls back to a free port |
+| Preferred managed backend port | `8090`; falls back to a free port |
+| Archive directory | [Platform-specific default](backends.md#platform-storage) |
 
 Cleanup deletes **disk snapshots**, including expired unpublished generations
 left by crashes. It keeps transcripts, weights, and live RAM state. Restoring does
@@ -79,6 +117,9 @@ also checked before restoring a snapshot.
 /sloth-memory slots
 /sloth-memory delete
 ```
+
+Disk park/resume requires native snapshot mode. Routing-only adapters report
+`capabilities.disk_snapshots: false` in status and reject parking.
 
 Park and delete target the current verified conversation and make no model call.
 To delete another saved slot, copy its full key from `slots`:
@@ -115,7 +156,8 @@ Change the base address with:
 ```
 
 Use `connect` afterward to select the new route for future sessions. A second
-managed stack needs a separate archive directory and backend port:
+managed stack needs a separate archive directory. Ports below are preferences;
+occupied ports fall back automatically:
 
 ```text
 /sloth-memory setup --base-url http://127.0.0.1:18080 --upstream-port 18090 --archive-dir "/path/to/separate/archive" --server "/path/to/llama-server" --model "/path/to/model.gguf"

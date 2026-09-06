@@ -6,12 +6,12 @@ sloth-memory saves a local model's conversation inference state to disk and rest
 it when you return. Built for people running open-weight models on their own hardware.
 MIT licensed. No cloud service or account. The portable runtime uses psutil.
 
-**In development:** Linux/macOS/Windows portability, automatic free-port selection,
-and routing adapters for llama.cpp, Ollama, vLLM, and MLX-LM. Disk park/resume still
-requires our patched llama.cpp runtime. See [backend capabilities](docs/backends.md).
-The installation below selects the published alpha.2; these changes are not in it.
-
-**Developer alpha · Linux · one local llama.cpp slot · pinned patched runtime.**
+**Current `main` · development version `0.2.0.dev0`.** Supports Linux, macOS, and
+Windows startup, automatic free-port selection, and routing adapters for llama.cpp,
+Ollama, vLLM, and MLX-LM. Disk park/resume through this adapter still requires the
+managed patched llama.cpp runtime and one slot. See [backend capabilities](docs/backends.md).
+The published [alpha.2](https://github.com/uncrayon/sloth-memory/releases/tag/v0.1.0-alpha.2)
+is the older Linux version; install from `main` below to test the merged changes.
 The service is independent of Hermes. A native Hermes adapter provides startup,
 slash-command onboarding, and cleanup controls. Other agents integrate through
 an HTTP proxy and explicit session metadata; a plain Python example is included.
@@ -31,24 +31,40 @@ It does not add semantic memory, expand the context window, or reconstruct a cha
 from a cache file. Parking does not release the model's preallocated KV buffer.
 
 ```text
-Your agent → sloth-memory :8080 → patched llama-server :8090
+Your agent → sloth-memory (local proxy) → inference server
                      ↕
               local archive files
 ```
 
-## Install the alpha
+## Install from main
 
-Requirements: Linux, Python 3.10+, Git, CMake, a C/C++ toolchain, and your own
-supported GGUF model. Start with the CPU build to verify functionality; it is not
-a GPU performance recommendation. Models and compiled runtimes are not bundled.
+Requirements: Linux, macOS, or Windows, Python 3.10+, and Git. Building the managed
+llama.cpp runtime also needs CMake, a C/C++ toolchain, and your own supported GGUF
+model. On macOS, install the Xcode Command Line Tools for the compiler. Models
+and compiled runtimes are not bundled.
+
+For Hermes, follow [installation in Hermes' Python environment](docs/hermes.md#install-alongside-hermes)
+instead of creating the standalone environment below.
+
+Standalone installation on macOS/Linux:
 
 ```bash
-git clone --branch v0.1.0-alpha.2 https://github.com/uncrayon/sloth-memory.git
+git clone --branch main https://github.com/uncrayon/sloth-memory.git
 cd sloth-memory
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install .
-python scripts/build_runtime.py
+```
+
+On Windows, use `py -3 -m venv .venv` and activate it in PowerShell with
+`.\.venv\Scripts\Activate.ps1`, then run the same pip command.
+
+To connect an existing server, continue with [backend setup](docs/backends.md#connect-an-existing-server);
+no runtime build is needed for routing. To test disk park/resume, build the managed
+runtime (CPU first):
+
+```bash
+python scripts/build_runtime.py --cmake-arg=-DGGML_METAL=OFF
 ```
 
 The build script fetches an exact llama.cpp commit and applies the included
@@ -56,7 +72,10 @@ checkpoint persistence patch. It builds in `runtime/`; it does not modify an
 existing inference installation. See [runtime compatibility](docs/compatibility.md)
 for GPU builds and the current scope.
 
-Start the backend in one terminal:
+Start the backend in one terminal (on Windows, use the `llama-server.exe` path
+printed by the build, usually `runtime/build/bin/Release/llama-server.exe`).
+The multiline shell examples below use macOS/Linux syntax; in PowerShell, put
+the command on one line and omit the continuation backslashes:
 
 ```bash
 sloth-memory backend \
@@ -69,12 +88,16 @@ In another terminal with the same virtual environment active:
 
 ```bash
 sloth-memory serve
-sloth-memory doctor
 ```
 
-Both processes use `~/.local/share/sloth-memory` by default, respecting
-`XDG_DATA_HOME`. To change it, pass the **same** `--archive-dir` to both commands.
-Keep the backend terminal running while using the proxy.
+Keep both terminals running. Run `sloth-memory doctor` from a third terminal with
+the same environment active. Ports 8080 and 8090 are preferences; occupied ports
+automatically fall back to free ones. CLI controls discover the selected proxy.
+
+Storage defaults to `~/Library/Application Support/sloth-memory` on macOS,
+`~/.local/share/sloth-memory` on Linux, or `%LOCALAPPDATA%\sloth-memory` on Windows;
+`XDG_DATA_HOME` overrides these. To change it, pass the **same** `--archive-dir` to
+the backend, proxy, and control commands.
 
 ## Use with Hermes
 
@@ -86,7 +109,10 @@ Install sloth-memory in Hermes' Python environment, enable it with
 ```
 
 The [Hermes setup guide](docs/hermes.md) covers selecting the backend and model.
-Once configured, services start with Hermes and keep running for cleanup.
+Complete setup starts the proxy and selects its actual URL for new Hermes sessions.
+The managed llama.cpp backend also starts with Hermes; existing servers remain
+under your control. Services keep running after Hermes closes for cleanup. No sudo
+is needed. Disk controls below require native snapshot mode.
 
 ```text
 /sloth-memory park
@@ -103,8 +129,12 @@ restarts; the guide lists every command and the external-service option.
 
 ## Try it without an agent framework
 
+The example client defaults to port 8080. If the proxy selected another port, pass
+`--url http://127.0.0.1:<selected-port>` to both example invocations; find the URL in
+`proxy.json` inside the archive directory.
+
 ```bash
-python examples/chat.py --session cli:orchid:1 --history /tmp/orchid-chat.json \
+python examples/chat.py --session cli:orchid:1 --history orchid-chat.json \
   'Our project code is ORCHID-731. Help me plan a workshop.'
 
 sloth-memory park --session cli:orchid:1
@@ -115,7 +145,7 @@ Stop both services with Ctrl-C, then start them again with exactly the same
 commands. Continue using the same transcript and session:
 
 ```bash
-python examples/chat.py --session cli:orchid:1 --history /tmp/orchid-chat.json \
+python examples/chat.py --session cli:orchid:1 --history orchid-chat.json \
   'What was the project code?'
 
 sloth-memory status
@@ -127,7 +157,8 @@ state. Use a unique transcript file and session ID for each conversation.
 
 ## Integrate your agent
 
-Point chat completions at `http://127.0.0.1:8080/v1`. Add these fields to each
+Point chat completions at the selected proxy URL plus `/v1` (normally
+`http://127.0.0.1:8080/v1`; consult `proxy.json` after startup). Add these fields to each
 foreground request's JSON body:
 
 ```json
@@ -138,7 +169,7 @@ foreground request's JSON body:
 ```
 
 With clients that support it, supply these fields through `extra_body`. They are
-removed before forwarding to llama.cpp. Send `slot_archive_role: "background"`
+removed before forwarding to the backend. Send `slot_archive_role: "background"`
 for detached work. A user/account ID is not a conversation ID.
 
 See the [integration contract](docs/integration.md) for branching, compaction,
@@ -177,8 +208,11 @@ interpreting timing results.
 - Compatible model, runtime, configuration, and prompt prefix are required.
   Changing weights, builds, tools, system prompts, or reasoning settings may
   require a fresh prefill. The transcript remains the source of truth.
-- Only `chat/completions` inference is supported. Responses API, remote backends,
-  multiple slots, model routers, Windows, and macOS are outside this alpha.
+- Only `chat/completions` inference is supported. Responses API, multiple slots,
+  and model routers are outside the current scope. Remote upstreams are supported
+  in routing mode only; disk snapshots require the local managed runtime.
+- CI tests startup/integration and CPU runtime builds on Linux, macOS, and Windows.
+  This does not establish real-model cache reuse or GPU performance on every OS.
 - All generation traffic must go through the proxy. Direct backend requests
   bypass ownership tracking and can invalidate archives.
 - A conversation displaced before its first park cannot be recovered from KV

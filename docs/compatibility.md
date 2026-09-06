@@ -1,7 +1,7 @@
-# Alpha compatibility
+# Runtime compatibility
 
-This page describes published alpha.2. Development-version OS support and the
-capability matrix for other engines are in [backends](backends.md).
+This page describes the current `main` development version. See [backends](backends.md)
+for routing capabilities; published alpha.2 retains its older Linux-only scope.
 
 ## Runtime
 
@@ -10,17 +10,20 @@ The build script pins ggml-org/llama.cpp to
 `patches/llama-slot-resume.patch`. This patch persists hybrid/recurrent context
 checkpoints as well as target, draft, and speculative state. The `.bin.resume`
 companion is mandatory: a stock `.bin` alone cannot be published as a usable
-sloth-memory archive.
+sloth-memory archive in the current implementation. Stock llama.cpp already has
+slot save/restore APIs; the companion requirement is specific to this adapter.
+This persistence patch is separate from the originating project's DFlash2 position
+fix and is not restricted to DFlash2.
 
 This is a local format tied to the exact runtime identity. Do not exchange archive
 files between installations or mix versions. The proxy fingerprints local file
 identities, command arguments, and relevant runtime environment. These are
 replacement checks, not cryptographic hashes of model contents.
 
-| Component | Alpha scope |
+| Component | Current scope |
 | --- | --- |
-| OS | Linux with `/proc`, `flock`, and `ldd` |
-| Python | 3.10+; standard library at runtime |
+| OS | Linux, macOS, Windows; backend hardware support varies |
+| Python | 3.10+; psutil is installed as a runtime dependency |
 | Inference server | Included pinned llama.cpp patch; local single-slot topology |
 | Agent | Any server-side client implementing the session/replay contract |
 | Wire API | Chat completions, including SSE; health and models discovery |
@@ -38,6 +41,10 @@ See [validation](validation.md) for the release's actual evidence.
 
 Default: `python scripts/build_runtime.py`. CMake builds only `llama-server` and
 its dependencies with native CPU tuning disabled. No model downloads occur.
+The CPU CI build adds `--cmake-arg=-DGGML_METAL=OFF`; use this for an initial
+macOS smoke test. Building requires Git, CMake, and a C/C++ toolchain (Xcode Command
+Line Tools on macOS, or the Visual Studio C++ build tools on Windows).
+Use the binary path printed by the script and keep adjacent libraries with it.
 
 To reuse an existing Git checkout containing the pin:
 
@@ -53,6 +60,7 @@ error, or use a new output directory.
 Examples for installed GPU toolchains:
 
 ```bash
+python scripts/build_runtime.py --output runtime-metal --cmake-arg=-DGGML_METAL=ON
 python scripts/build_runtime.py --output runtime-cuda --cmake-arg=-DGGML_CUDA=ON
 python scripts/build_runtime.py --output runtime-vulkan --cmake-arg=-DGGML_VULKAN=ON
 python scripts/build_runtime.py --output runtime-rocm --cmake-arg=-DGGML_HIP=ON
