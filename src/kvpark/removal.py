@@ -11,7 +11,7 @@ from .platforms import lock_file, process_matches
 from .updates import stop_proxy
 
 
-def owned_process(archive, filename):
+def owned_process(archive, filename, *, legacy=False):
     path = archive / filename
     if not path.exists():
         return None
@@ -25,9 +25,10 @@ def owned_process(archive, filename):
     except psutil.Error as exc:
         raise RuntimeError("Cannot inspect the recorded service; stop it through its service owner.") from exc
     if filename == "proxy.json":
-        valid = (argv[1:4] == ["-m", "sloth_memory", "serve"]
-                 or argv[1:5] == ["-I", "-m", "sloth_memory", "serve"]
-                 or len(argv) > 2 and Path(argv[1]).name in {"sloth-memory", "sloth-memory.exe"} and argv[2] == "serve")
+        module, command = ("sloth_memory", "sloth-memory") if legacy else ("kvpark", "kvpark")
+        valid = (argv[1:4] == ["-m", module, "serve"]
+                 or argv[1:5] == ["-I", "-m", module, "serve"]
+                 or len(argv) > 2 and Path(argv[1]).name in {command, command + ".exe"} and argv[2] == "serve")
         flag = "--archive-dir"
     else:
         valid = argv == record.get("argv")
@@ -60,7 +61,7 @@ def stop(archive, *, external=False, managed_backend=True, disconnect=None):
         record = result["proxy"]
         if record:
             status = request(record["base_url"], "status", timeout=5)
-            if (status.get("service") != "sloth-memory" or status.get("control_version", 0) < 4
+            if (status.get("service") != "kvpark" or status.get("control_version", 0) < 4
                     or Path(status.get("archive_dir", "")).resolve() != archive):
                 raise RuntimeError("Proxy cannot drain safely; stop clients and follow the manual uninstall guide.")
             request(record["base_url"], "prepare-update", {}, timeout=90)
@@ -79,7 +80,7 @@ def stop(archive, *, external=False, managed_backend=True, disconnect=None):
                     except psutil.NoSuchProcess:
                         pass
                     except (psutil.Error, RuntimeError) as exc:
-                        raise RuntimeError(f"Could not stop Sloth's {field}; inspect its process before retrying: {exc}") from exc
+                        raise RuntimeError(f"Could not stop kvpark's {field}; inspect its process before retrying: {exc}") from exc
         return result
     except BaseException:
         if prepared and record and process_matches(record):

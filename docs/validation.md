@@ -1,5 +1,10 @@
 # Alpha validation
 
+The observations below were recorded under the former **sloth-memory** name.
+They describe their stated release and environment; they are not new real-model
+acceptance results for the kvpark rename. Current test invocation examples use
+the new package and environment-variable names.
+
 ## Coordinated updates — 0.2.0a1
 
 Local release checks on September 6, 2026:
@@ -93,13 +98,13 @@ the CPU backend and proxy, native park/delete operate on a real conversation,
 unloading Hermes leaves cleanup services running, and reloading attaches without
 duplicate processes. It passed locally with Qwen3-4B and the pinned CPU runtime.
 
-Run the integration tests in Hermes' Python environment with sloth-memory installed:
+Run the integration tests in Hermes' Python environment with kvpark installed:
 
 ```bash
 python tests/hermes/test_integration.py -v
 ```
 
-For the optional real-model test, set `SLOTH_TEST_SERVER` and `SLOTH_TEST_MODEL`
+For the optional real-model test, set `KVPARK_TEST_SERVER` and `KVPARK_TEST_MODEL`
 to absolute local paths. It uses temporary profiles, ports, and archive files,
 and terminates only the processes it launches. The Hermes CI job pins upstream
 `9dd6634c5635321cf38840cc30e9b51226689128` and runs without model downloads.

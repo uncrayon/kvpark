@@ -12,7 +12,7 @@ import shlex
 from .cli import request
 from .hermes_service import Service, defaults, validate_service, target
 
-_command_context = ContextVar("sloth_memory_command_context", default=None)
+_command_context = ContextVar("kvpark_command_context", default=None)
 
 
 def session_value(name):
@@ -65,7 +65,7 @@ class Adapter:
         return "k-" + hashlib.sha256((self.namespace + session_id).encode()).hexdigest()
 
     def capture_command(self, *, command="", session_key=None, **kwargs):
-        _command_context.set(session_key if command.replace("_", "-") in {"sloth", "sloth-memory"} else None)
+        _command_context.set(session_key if command == "kvpark" else None)
 
     def middleware(self, *, request, session_id="", base_url="", api_mode="", **kwargs):
         config = self.settings()
@@ -106,11 +106,11 @@ class Adapter:
             if thread:
                 extra["slot_archive_thread"] = self.namespace + thread
         payload["extra_body"] = extra
-        if os.environ.get("SLOTH_API_KEY"):
+        if os.environ.get("KVPARK_API_KEY"):
             headers = dict(payload.get("extra_headers") or {})
-            headers["Authorization"] = "Bearer " + os.environ["SLOTH_API_KEY"]
+            headers["Authorization"] = "Bearer " + os.environ["KVPARK_API_KEY"]
             payload["extra_headers"] = headers
-        return {"request": payload, "source": "sloth-memory", "reason": "verified conversation archive identity"}
+        return {"request": payload, "source": "kvpark", "reason": "verified conversation archive identity"}
 
     def call(self, action, payload=None):
         if self.settings()["autostart"]:
@@ -119,7 +119,7 @@ class Adapter:
 
     def onboarding(self):
         config = self.settings()
-        lines = ["🦥 sloth-memory setup", "Saved disk snapshots expire after 7 days by default; cleanup checks hourly.",
+        lines = ["🅿️ kvpark setup", "Saved disk snapshots expire after 7 days by default; cleanup checks hourly.",
                  "A 32 GiB budget also limits saved snapshots. Your transcript and live RAM state are kept.",
                  f"Proxy: {config['base_url']}/v1", f"Archive: {config['archive_dir']}",
                  "Starts with Hermes: " + ("on" if config["autostart"] else "off")]
@@ -128,15 +128,15 @@ class Adapter:
             lines.append("Disk resume is unavailable for this adapter; backend-managed caches remain independent.")
         if config["backend"] == "llama.cpp" and not config["external"] and not config["upstream_url"] and not (config["server"] and config["model"]):
             lines += ["Next: configure your patched llama-server and GGUF:",
-                      '/sloth-memory setup --server "/path/to/llama-server" --model "/path/to/model.gguf"']
+                      '/kvpark setup --server "/path/to/llama-server" --model "/path/to/model.gguf"']
         elif not config["model"] and not config["external"]:
-            lines.append('Next: /sloth-memory setup --model "the-exact-model-ID-served-by-your-backend"')
+            lines.append('Next: /kvpark setup --model "the-exact-model-ID-served-by-your-backend"')
         elif config["connected"]:
-            lines.append("Configured. New Hermes sessions use this proxy; send a message, then /sloth-memory park to save it."
+            lines.append("Configured. New Hermes sessions use this proxy; send a message, then /kvpark save to save it."
                          if config["cache_mode"] == "native" else "Configured. New Hermes sessions use this proxy in routing mode.")
         else:
-            lines += ["Next: /sloth-memory start, then /sloth-memory connect to select this route for future sessions."]
-        lines += ["Commands:", "  status | park | delete [k-…] | slots",
+            lines += ["Next: /kvpark start, then /kvpark connect to select this route for future sessions."]
+        lines += ["Commands:", "  save | status | forget [k-…] | slots",
                   "  update check | update | uninstall [confirm]",
                   "  retention 7 | budget 32 | cleanup on|off|now",
                   "  base-url http://127.0.0.1:8080 | autostart on|off",
@@ -154,7 +154,7 @@ class Adapter:
         class Parser(argparse.ArgumentParser):
             def error(self, message):
                 raise ValueError(message)
-        parser = Parser(prog="/sloth-memory setup", add_help=False)
+        parser = Parser(prog="/kvpark setup", add_help=False)
         for key in ("server", "model", "archive-dir", "base-url", "backend-args", "backend", "upstream-url", "cache-mode"):
             parser.add_argument("--" + key)
         parser.add_argument("--upstream-port", type=int)
@@ -184,7 +184,7 @@ class Adapter:
     def current_key(self, explicit=None):
         if explicit:
             if not re.fullmatch(r"k-[0-9a-f]{64}", explicit):
-                raise ValueError("use the exact k-… key from /sloth-memory slots")
+                raise ValueError("use the exact k-… key from /kvpark slots")
             return explicit
         session = session_value("HERMES_SESSION_ID")
         if session:
@@ -199,18 +199,18 @@ class Adapter:
             if len(matches) == 1:
                 return matches[0]
             if not matches:
-                raise ValueError("this conversation has no saved or resident state in sloth-memory yet. "
+                raise ValueError("this conversation has no saved or resident state in kvpark yet. "
                                  "Send a normal message in this conversation, wait for the reply, then run "
-                                 "/sloth-memory park. Restarting the gateway alone does not load its model state.")
-            raise ValueError("this chat has multiple saved conversations; choose an exact key from /sloth-memory slots")
-        raise ValueError("Hermes did not provide this command's conversation identity; use an exact key from /sloth-memory slots")
+                                 "/kvpark save. Restarting the gateway alone does not load its model state.")
+            raise ValueError("this chat has multiple saved conversations; choose an exact key from /kvpark slots")
+        raise ValueError("Hermes did not provide this command's conversation identity; use an exact key from /kvpark slots")
 
     def connect(self):
         self.service.ensure()
         settings = self.settings()
         self.write_route(settings)
         self.ctx.set_config("service", {**settings, "connected": True})
-        return "Hermes now defaults to sloth-memory for new sessions. Restart Hermes and start a new conversation; existing sessions keep their saved route."
+        return "Hermes now defaults to kvpark for new sessions. Restart Hermes and start a new conversation; existing sessions keep their saved route."
 
     def write_route(self, settings):
         # Explicit command selects the default for FUTURE sessions through Hermes'
@@ -225,6 +225,7 @@ class Adapter:
     def handle(self, raw_args):
         args = shlex.split(raw_args)
         action = args[0] if args else "setup"
+        action = {"park": "save", "delete": "forget"}.get(action, action)
         rest = args[1:]
         if action == "uninstall" and rest in ([], ["confirm"]):
             from .hermes_uninstall import run
@@ -233,7 +234,7 @@ class Adapter:
                 self.service.closed.set()
             return result
         if self.settings()["uninstalled"] and action not in {"setup", "onboarding", "help"}:
-            raise RuntimeError("Sloth is disconnected. Restart Hermes; see docs/uninstall.md to reinstall.")
+            raise RuntimeError("kvpark is disconnected. Restart Hermes; see docs/uninstall.md to reinstall.")
         if action == "update" and rest in ([], ["check"]):
             from . import updates
             config = self.settings()
@@ -254,7 +255,7 @@ class Adapter:
             if hermes_config.is_managed():
                 raise PermissionError("updates are managed by your administrator")
             result = updates.apply(config["archive_dir"], hermes_home=self.home, external=config["external"])
-            return f"sloth-memory {result['version']}: {result['note']}"
+            return f"kvpark {result['version']}: {result['note']}"
         if action in {"setup", "onboarding", "help"}:
             return self.configure(rest) if rest and action == "setup" else self.onboarding()
         if action == "base-url" and len(rest) == 1:
@@ -267,7 +268,7 @@ class Adapter:
             return "Start with Hermes: " + rest[0] + ". Already running services are left running."
         if action == "start" and not rest:
             self.service.ensure()
-            return "sloth-memory is running. " + json.dumps(self.call("doctor"))
+            return "kvpark is running. " + json.dumps(self.call("doctor"))
         if action == "connect" and not rest:
             return self.connect()
         if action in {"retention", "budget"} and len(rest) == 1:
@@ -278,12 +279,12 @@ class Adapter:
         if action == "cleanup" and rest in (["on"], ["off"], ["now"]):
             result = self.call("cleanup", {}) if rest == ["now"] else self.call("settings", {"cleanup_enabled": rest == ["on"]})
             return "Cleanup: " + json.dumps(result) + ". Snapshot files only; live RAM and transcripts are unchanged."
-        if action in {"park", "delete"} and len(rest) <= 1:
-            result = self.call("park" if action == "park" else "forget", {"key": self.current_key(rest[0] if rest else None)})
-            return (f"Parked {result['tokens']:,} tokens. " if action == "park" else "Deleted saved snapshot. ") + result["note"]
+        if action in {"save", "forget"} and len(rest) <= 1:
+            result = self.call(action, {"key": self.current_key(rest[0] if rest else None)})
+            return (f"Parked {result['tokens']:,} tokens. " if action == "save" else "Deleted saved snapshot. ") + result["note"]
         if action in {"status", "slots"} and not rest:
             status = self.call("status")
-            lines = [f"🦥 {status['archived']} saved slots · {status['total_gib']} / {status['max_gib']} GiB",
+            lines = [f"🅿️ {status['archived']} saved slots · {status['total_gib']} / {status['max_gib']} GiB",
                      f"Cleanup {'on' if status['cleanup_enabled'] else 'off'} · expires {status['ttl_days']} days after saving · checks hourly",
                      "Model: " + status["activity"]["phase"]]
             if status.get("runtime_error"):
@@ -293,7 +294,7 @@ class Adapter:
             for entry in status["entries"]:
                 lines.append(f"{entry['key']} — {entry['tokens']:,} tokens, {entry['gib']} GiB, {entry['age_days']} days old")
             return "\n".join(lines)
-        raise ValueError("Unknown command or arguments. Use /sloth-memory setup for available commands.")
+        raise ValueError("Unknown command or arguments. Use /kvpark setup for available commands.")
 
     async def command(self, raw_args):
         try:
@@ -301,7 +302,7 @@ class Adapter:
             if shlex.split(raw_args) == ["update"]:
                 from importlib.metadata import version
                 from . import __version__
-                if version("sloth-memory") != __version__ and self.gateway is not None:
+                if version("kvpark") != __version__ and self.gateway is not None:
                     from gateway.restart import is_container_restart_context, is_gateway_supervisor_process
                     supervised = is_gateway_supervisor_process() or is_container_restart_context()
                     # Let the command response be sent before Hermes drains and
@@ -311,17 +312,16 @@ class Adapter:
                     result += " Hermes will restart shortly to load the new adapter."
             return result
         except (OSError, ValueError, RuntimeError) as exc:
-            return "sloth-memory: " + str(exc)
+            return "kvpark: " + str(exc)
         finally:
             _command_context.set(None)
 
 
 def register(ctx):
     adapter = Adapter(ctx)
-    for name in ("sloth", "sloth-memory"):
-        ctx.register_command(name, adapter.command,
-                             description="Set up conversation slots, park, delete, and configure cleanup",
-                             args_hint="setup | status | park | delete | cleanup | retention | base-url | update | uninstall", argument_mode="text")
+    ctx.register_command("kvpark", adapter.command,
+                         description="Park model state, resume conversations, and manage saved caches",
+                         args_hint="setup | save | status | forget | cleanup | retention | base-url | update | uninstall", argument_mode="text")
     ctx.register_hook("pre_gateway_dispatch", adapter.capture_gateway)
     ctx.register_hook("pre_command", adapter.capture_command)
     ctx.register_middleware("llm_request", adapter.middleware)

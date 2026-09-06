@@ -23,31 +23,31 @@ from .platforms import fsync_directory, process_matches
 from .runtime import directory
 from . import __version__
 
-LISTEN_HOST = os.environ.get("SLOTH_HOST", "127.0.0.1")
-LISTEN_PORT = int(os.environ.get("SLOTH_PORT", "8080"))
-UPSTREAM_HOST = os.environ.get("SLOTH_UPSTREAM_HOST", "127.0.0.1")
-UPSTREAM_PORT = int(os.environ.get("SLOTH_UPSTREAM_PORT", "8090"))
+LISTEN_HOST = os.environ.get("KVPARK_HOST", "127.0.0.1")
+LISTEN_PORT = int(os.environ.get("KVPARK_PORT", "8080"))
+UPSTREAM_HOST = os.environ.get("KVPARK_UPSTREAM_HOST", "127.0.0.1")
+UPSTREAM_PORT = int(os.environ.get("KVPARK_UPSTREAM_PORT", "8090"))
 ARCHIVE = directory()
-RUNTIME = Path(os.environ.get("SLOTH_RUNTIME", str(ARCHIVE / "runtime.json")))
-MIN_ARCHIVE_TOKENS = int(os.environ.get("SLOTH_MIN_TOKENS", "8192"))
-RESAVE_GROWTH_TOKENS = int(os.environ.get("SLOTH_RESAVE_GROWTH", "4096"))
-AUTO_SAVE = os.environ.get("SLOTH_AUTO_SAVE", "0") == "1"
-TTL_DAYS = float(os.environ.get("SLOTH_TTL_DAYS", "7"))
-MAX_ARCHIVE_GB = float(os.environ.get("SLOTH_MAX_GB", "32"))
+RUNTIME = Path(os.environ.get("KVPARK_RUNTIME", str(ARCHIVE / "runtime.json")))
+MIN_ARCHIVE_TOKENS = int(os.environ.get("KVPARK_MIN_TOKENS", "8192"))
+RESAVE_GROWTH_TOKENS = int(os.environ.get("KVPARK_RESAVE_GROWTH", "4096"))
+AUTO_SAVE = os.environ.get("KVPARK_AUTO_SAVE", "0") == "1"
+TTL_DAYS = float(os.environ.get("KVPARK_TTL_DAYS", "7"))
+MAX_ARCHIVE_GB = float(os.environ.get("KVPARK_MAX_GB", "32"))
 CHAT_PATHS = {"/v1/chat/completions", "/chat/completions"}
 GENERATION_PATHS = CHAT_PATHS
-CONTROL_PREFIX = "/_sloth/"
+CONTROL_PREFIX = "/_kvpark/"
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
               "te", "trailer", "trailers", "transfer-encoding", "upgrade"}
 log = logging.getLogger("slot-proxy")
-API_KEY = os.environ.get("SLOTH_API_KEY")
+API_KEY = os.environ.get("KVPARK_API_KEY")
 MAX_REQUEST_BYTES = 64 * 1024**2
 
 
 def backend():
-    name = os.environ.get("SLOTH_BACKEND", "llama.cpp")
-    return Backend(name, os.environ.get("SLOTH_UPSTREAM_URL", f"http://{UPSTREAM_HOST}:{UPSTREAM_PORT}"),
-                   os.environ.get("SLOTH_CACHE_MODE", "native" if name == "llama.cpp" else "routing"))
+    name = os.environ.get("KVPARK_BACKEND", "llama.cpp")
+    return Backend(name, os.environ.get("KVPARK_UPSTREAM_URL", f"http://{UPSTREAM_HOST}:{UPSTREAM_PORT}"),
+                   os.environ.get("KVPARK_CACHE_MODE", "native" if name == "llama.cpp" else "routing"))
 
 
 class UnsafeRestoreError(RuntimeError):
@@ -115,7 +115,7 @@ class Archive:
         self.current_prompt = None
         self.activity = {"phase": "idle", "key": None}
         self.runtime_error = None
-        self.maintenance_until = time.monotonic() + 300 if os.environ.get("SLOTH_UPDATE_START") == "1" else 0
+        self.maintenance_until = time.monotonic() + 300 if os.environ.get("KVPARK_UPDATE_START") == "1" else 0
         self.displaced = {}
         self._snapshot = {}
         self.entries = {}
@@ -123,7 +123,7 @@ class Archive:
         from .retention import Retention
         self.retention = Retention(ARCHIVE / "retention.json", lambda: dict(
             ttl_days=TTL_DAYS, max_gib=MAX_ARCHIVE_GB, cleanup_enabled=True))
-        overrides = os.environ.get("SLOTH_POLICY_OVERRIDES")
+        overrides = os.environ.get("KVPARK_POLICY_OVERRIDES")
         if overrides:
             self.retention.update(json.loads(overrides))
         self.gc_wakeup = threading.Event()
@@ -178,7 +178,7 @@ class Archive:
         try:
             payload = json.dumps(body).encode() if body is not None else None
             headers = {"Content-Type": "application/json", "Connection": "close"}
-            key_file = os.environ.get("SLOTH_UPSTREAM_KEY_FILE")
+            key_file = os.environ.get("KVPARK_UPSTREAM_KEY_FILE")
             if key_file:
                 headers["Authorization"] = "Bearer " + Path(key_file).read_text().strip()
             conn.request(method, path, payload, headers)
@@ -358,7 +358,7 @@ class Archive:
                     upstream=backend().url.split("://", 1)[1], archive_dir=str(ARCHIVE),
                     archived=len(entries), entries=entries,
                     total_gib=round(sum(v["bytes"] for v in snapshot["entries"].values()) / 1024**3, 3),
-                    service="sloth-memory", version=__version__, control_version=4, upstream_url=backend().url,
+                    service="kvpark", version=__version__, control_version=4, upstream_url=backend().url,
                     maintenance=self.maintenance_until > time.monotonic(),
                     capabilities=backend().capabilities(),
                     ttl_days=snapshot["retention"]["ttl_days"], max_gib=snapshot["retention"]["max_gib"],
@@ -529,7 +529,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if (method != "GET" and ARCHIVE_STATE.maintenance_until > time.monotonic()
                     and path not in {CONTROL_PREFIX + "cancel-update", CONTROL_PREFIX + "prepare-update"}):
-                raise RuntimeError("sloth-memory is updating; retry shortly")
+                raise RuntimeError("kvpark is updating; retry shortly")
             if method == "GET" and path == CONTROL_PREFIX + "status":
                 payload = ARCHIVE_STATE.status()
             elif method == "GET" and path == CONTROL_PREFIX + "doctor":
@@ -551,7 +551,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(req, dict):
                     raise ValueError("control body must be a JSON object")
                 payload = ARCHIVE_STATE.forget(req.get("key"))
-            elif method == "POST" and path in {CONTROL_PREFIX + "park", CONTROL_PREFIX + "simulate-gap"}:
+            elif method == "POST" and path in {CONTROL_PREFIX + "save", CONTROL_PREFIX + "park", CONTROL_PREFIX + "simulate-gap"}:
                 if not backend().snapshots:
                     raise ValueError(backend().capabilities()["note"])
                 req = json.loads(body or b"{}")
@@ -633,7 +633,7 @@ class Handler(BaseHTTPRequestHandler):
         started_at = time.monotonic()
         with lock:
             if generation and ARCHIVE_STATE.maintenance_until > time.monotonic():
-                self.send_error(503, "sloth-memory is updating; retry shortly")
+                self.send_error(503, "kvpark is updating; retry shortly")
                 return
             archive_ready = backend().snapshots
             if generation and archive_ready:
@@ -669,7 +669,7 @@ class Handler(BaseHTTPRequestHandler):
         headers["Content-Length"] = str(len(body))
         headers["Connection"] = "close"
         # Proxy authentication and backend authentication are separate credentials.
-        key_file = os.environ.get("SLOTH_UPSTREAM_KEY_FILE")
+        key_file = os.environ.get("KVPARK_UPSTREAM_KEY_FILE")
         if key_file:
             headers["Authorization"] = "Bearer " + Path(key_file).read_text().strip()
         started = False
@@ -728,7 +728,7 @@ def gc_loop():
 
 
 def main():
-    logging.basicConfig(level=os.environ.get("SLOTH_LOG", "INFO"),
+    logging.basicConfig(level=os.environ.get("KVPARK_LOG", "INFO"),
                         format="%(asctime)s %(levelname)s %(message)s")
     if LISTEN_HOST != "127.0.0.1":
         raise SystemExit("the proxy listens on localhost only")
@@ -749,7 +749,7 @@ def main():
     atomic_json(ARCHIVE / "proxy.json", dict(**process_identity(os.getpid()),
                 archive_dir=str(ARCHIVE),
                 python_prefix=str(Path(sys.prefix).resolve()),
-                launch_token=os.environ.get("SLOTH_LAUNCH_TOKEN"),
+                launch_token=os.environ.get("KVPARK_LAUNCH_TOKEN"),
                 base_url=f"http://{LISTEN_HOST}:{server.server_port}", upstream_url=backend().url,
                 backend=backend().name, cache_mode=backend().cache_mode))
     log.info("Proxy listening at http://%s:%s → %s (%s)", LISTEN_HOST, server.server_port, backend().url, backend().cache_mode)

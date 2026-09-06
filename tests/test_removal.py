@@ -10,16 +10,16 @@ from unittest.mock import patch
 
 import psutil
 
-from sloth_memory import removal
-from sloth_memory.hermes_uninstall import restored_config
-from sloth_memory.platforms import process_identity
+from kvpark import removal
+from kvpark.hermes_uninstall import restored_config
+from kvpark.platforms import process_identity
 
 
 class RestoreTests(unittest.TestCase):
     def profile(self):
         applied = dict(provider="custom", default="gemma", base_url="http://127.0.0.1:8080/v1", api_mode="chat_completions")
         return dict(model={**applied, "context_length": 12345}, agent={"max_turns": 8}, plugins=dict(
-            enabled=["other", "sloth-memory"], entries={"sloth-memory": {"settings": {
+            enabled=["other", "kvpark"], entries={"kvpark": {"settings": {
                 "service": {"connected": True}, "route_applied": applied,
                 "route_backup": {"provider": "custom", "default": "gemma", "base_url": "http://127.0.0.1:11434/v1"}}}}))
 
@@ -32,7 +32,7 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual(result["model"]["context_length"], 12345)
         self.assertEqual(result["agent"], original["agent"])
         self.assertEqual(result["plugins"]["enabled"], ["other"])
-        self.assertIn("sloth-memory", result["plugins"]["disabled"])
+        self.assertIn("kvpark", result["plugins"]["disabled"])
         self.assertFalse(settings["autostart"])
         self.assertTrue(settings["uninstalled"])
         self.assertEqual(original["model"]["base_url"], "http://127.0.0.1:8080/v1")
@@ -42,7 +42,7 @@ class RestoreTests(unittest.TestCase):
 
     def test_changed_route_is_preserved_and_missing_backup_fails_closed(self):
         profile = self.profile()
-        profile["plugins"]["entries"]["sloth-memory"]["settings"].pop("route_backup")
+        profile["plugins"]["entries"]["kvpark"]["settings"].pop("route_backup")
         with self.assertRaisesRegex(ValueError, "no original"):
             restored_config(profile)
         profile["model"]["base_url"] = "http://127.0.0.1:9999/v1"
@@ -123,7 +123,7 @@ class RemovalTests(unittest.TestCase):
     def test_failed_drain_never_disconnects_or_stops_processes(self):
         record = dict(pid=123, base_url="http://127.0.0.1:8080")
         result = dict(proxy=record, backend=None)
-        status = dict(service="sloth-memory", control_version=4, archive_dir=str(self.archive))
+        status = dict(service="kvpark", control_version=4, archive_dir=str(self.archive))
         with patch.object(removal, "plan", return_value=result), \
                 patch.object(removal, "request", side_effect=[status, RuntimeError("busy")]), \
                 patch.object(removal, "stop_proxy") as stop, \
@@ -137,7 +137,7 @@ class RemovalTests(unittest.TestCase):
 
     def test_config_failure_reopens_proxy_without_stopping_it(self):
         record = dict(pid=123, base_url="http://127.0.0.1:8080")
-        status = dict(service="sloth-memory", control_version=4, archive_dir=str(self.archive))
+        status = dict(service="kvpark", control_version=4, archive_dir=str(self.archive))
         def disconnect():
             raise RuntimeError("configuration changed")
         with patch.object(removal, "plan", return_value=dict(proxy=record, backend=None)), \

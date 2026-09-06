@@ -1,7 +1,7 @@
 # Attribution
 
-sloth-memory originated as a local Qwen conversation slot archive integrated with
-Hermes. Its standalone proxy and CLI are MIT licensed.
+kvpark originated as a local Qwen conversation slot archive integrated with
+Hermes and was first released as sloth-memory. Its standalone proxy and CLI are MIT licensed.
 
 The included patch modifies llama.cpp, Copyright (c) 2023–2026 The ggml authors,
 under the MIT license. The upstream license is reproduced in

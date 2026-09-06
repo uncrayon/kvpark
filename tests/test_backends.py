@@ -13,10 +13,10 @@ import threading
 import time
 import unittest
 
-from sloth_memory.backends import Backend
-from sloth_memory.cli import request
-from sloth_memory.hermes_service import Service, defaults
-from sloth_memory.network import proxy_record
+from kvpark.backends import Backend
+from kvpark.cli import request
+from kvpark.hermes_service import Service, defaults
+from kvpark.network import proxy_record
 
 
 class Upstream(BaseHTTPRequestHandler):
@@ -75,10 +75,10 @@ class RoutingTests(unittest.TestCase):
 
     def start(self, backend):
         archive = self.root / backend
-        env = {key: value for key, value in os.environ.items() if not key.startswith("SLOTH_")}
+        env = {key: value for key, value in os.environ.items() if not key.startswith("KVPARK_")}
         log = self.root / (backend + ".log")
         with log.open("wb") as output:
-            process = subprocess.Popen([sys.executable, "-m", "sloth_memory", "serve", "--backend", backend,
+            process = subprocess.Popen([sys.executable, "-m", "kvpark", "serve", "--backend", backend,
                 "--cache-mode", "routing", "--upstream-url", self.upstream_url, "--port", str(self.preferred),
                 "--archive-dir", str(archive)], env=env, stdout=output, stderr=subprocess.STDOUT)
         self.children.append(process)
@@ -91,7 +91,7 @@ class RoutingTests(unittest.TestCase):
         self.fail("proxy did not publish its bound address: " + log.read_text(errors="replace"))
 
     def test_uninstall_stops_each_proxy_and_keeps_existing_backend_available(self):
-        from sloth_memory import removal
+        from kvpark import removal
         from urllib.request import urlopen
         for name in ("llama.cpp", "ollama", "vllm", "mlx"):
             with self.subTest(backend=name):
@@ -137,7 +137,7 @@ class RoutingTests(unittest.TestCase):
                     self.assertEqual(headers["Authorization"], "Bearer backend-key")
                     self.assertEqual(headers["Host"], self.upstream_url.removeprefix("http://"))
                 conn.close()
-                result = subprocess.run([sys.executable, "-m", "sloth_memory", "status", "--archive-dir", str(archive)], capture_output=True, text=True)
+                result = subprocess.run([sys.executable, "-m", "kvpark", "status", "--archive-dir", str(archive)], capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(result.stdout)["capabilities"]["backend"], name)
 

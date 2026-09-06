@@ -21,8 +21,8 @@ def main():
     payload = dict(model="local", messages=messages, max_tokens=256,
                    slot_archive_role="foreground", slot_archive_key=args.session)
     headers = {"Content-Type": "application/json"}
-    if os.environ.get("SLOTH_API_KEY"):
-        headers["Authorization"] = "Bearer " + os.environ["SLOTH_API_KEY"]
+    if os.environ.get("KVPARK_API_KEY"):
+        headers["Authorization"] = "Bearer " + os.environ["KVPARK_API_KEY"]
     with urlopen(Request(args.url.rstrip("/") + "/v1/chat/completions", data=json.dumps(payload).encode(),
                          headers=headers), timeout=1800) as response:
         message = json.load(response)["choices"][0]["message"]

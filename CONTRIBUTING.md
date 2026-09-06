@@ -13,8 +13,7 @@ python -m pip install -e .
 python -m unittest discover -s tests -v
 ```
 
-Keep the Python runtime dependency-free unless a dependency solves a concrete
-problem. Preserve session ownership, atomic archive publication, runtime identity
+Keep runtime dependencies small; add one only when it solves a concrete problem. Preserve session ownership, atomic archive publication, runtime identity
 checks, and honest metrics. Add regression tests for behavior changes.
 
 Runtime changes need a fresh build and a real-model restart acceptance run.

@@ -1,4 +1,4 @@
-"""Start or attach to local sloth-memory services when Hermes loads its plugin."""
+"""Start or attach to local kvpark services when Hermes loads its plugin."""
 
 import json
 import os
@@ -84,7 +84,7 @@ class Service:
         with self.lock:
             if self.closed.is_set() or self.worker and self.worker.is_alive():
                 return
-            self.worker = threading.Thread(target=self._start, name="sloth-memory-start", daemon=True)
+            self.worker = threading.Thread(target=self._start, name="kvpark-start", daemon=True)
             self.worker.start()
 
     def _start(self):
@@ -99,7 +99,7 @@ class Service:
             status = request(config["base_url"], "status", timeout=2)
         except (URLError, RuntimeError, ValueError, TimeoutError):
             return None
-        if not isinstance(status, dict) or status.get("service") != "sloth-memory" or status.get("control_version", 0) < 2:
+        if not isinstance(status, dict) or status.get("service") != "kvpark" or status.get("control_version", 0) < 2:
             return None
         if config["external"]:
             return status
@@ -122,7 +122,7 @@ class Service:
 
     def ensure(self):
         if self.settings().get("uninstalled", False):
-            raise RuntimeError("Sloth was uninstalled; follow docs/uninstall.md to reinstall")
+            raise RuntimeError("kvpark was uninstalled; follow docs/uninstall.md to reinstall")
         config = validate_service(self.settings())
         if self.closed.is_set():
             raise RuntimeError("Hermes adapter has been unloaded")
@@ -135,7 +135,7 @@ class Service:
         archive = Path(config["archive_dir"])
         with file_lock(archive / ".hermes-start.lock"):
             if self.closed.is_set() or self.settings().get("uninstalled", False):
-                raise RuntimeError("Sloth startup was disabled while waiting for the archive")
+                raise RuntimeError("kvpark startup was disabled while waiting for the archive")
             # The process that won startup publishes the actual bound address.
             # Read it again under the interprocess lock, including after a reboot.
             record = proxy_record(archive)
@@ -163,7 +163,7 @@ class Service:
                 raise RuntimeError("the archive's proxy is running but unavailable; inspect hermes-proxy.log")
             managed = config["backend"] == "llama.cpp" and not config["upstream_url"]
             if managed and (not config["server"] or not config["model"]):
-                raise ValueError("Run /sloth-memory setup --server /path/to/llama-server --model /path/to/model.gguf")
+                raise ValueError("Run /kvpark setup --server /path/to/llama-server --model /path/to/model.gguf")
             if not managed and not config["model"]:
                 raise ValueError("Set --model to the model name served by your backend")
             if managed:
@@ -231,15 +231,15 @@ class Service:
         if log.exists() and log.stat().st_size > 1024**2:
             log.replace(log.with_suffix(".previous.log"))
         with log.open("ab") as output:
-            process = subprocess.Popen([sys.executable, "-m", "sloth_memory", *argv], stdin=subprocess.DEVNULL,
+            process = subprocess.Popen([sys.executable, "-m", "kvpark", *argv], stdin=subprocess.DEVNULL,
                 stdout=output, stderr=subprocess.STDOUT, **detached_options())
-        threading.Thread(target=process.wait, name="sloth-memory-reaper", daemon=True).start()
+        threading.Thread(target=process.wait, name="kvpark-reaper", daemon=True).start()
         return process
 
     @staticmethod
     def _probe(backend):
         headers = {}
-        key_file = os.environ.get("SLOTH_UPSTREAM_KEY_FILE")
+        key_file = os.environ.get("KVPARK_UPSTREAM_KEY_FILE")
         if key_file:
             headers["Authorization"] = "Bearer " + Path(key_file).read_text().strip()
         with urlopen(Request(backend.url + backend.health_path, headers=headers), timeout=5) as response:

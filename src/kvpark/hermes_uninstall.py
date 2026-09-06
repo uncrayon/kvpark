@@ -11,7 +11,7 @@ FIELDS = ("provider", "default", "base_url", "api_mode")
 def editable():
     from hermes_cli import config, managed_scope
     paths = ["model." + field for field in FIELDS]
-    paths += ["plugins.enabled", "plugins.disabled", "plugins.entries.sloth-memory"]
+    paths += ["plugins.enabled", "plugins.disabled", "plugins.entries.kvpark"]
     managed = managed_scope.managed_config_keys()
     overlaps = any(key == path or key.startswith(path + ".") or path.startswith(key + ".")
                    for key in managed for path in paths)
@@ -25,7 +25,7 @@ def save_route(settings, model):
     editable()
     with _locked_plugin_state(config.get_config_path()), config._CONFIG_LOCK:
         raw = config.read_user_config_raw()
-        entry = raw.get("plugins", {}).get("entries", {}).get("sloth-memory", {})
+        entry = raw.get("plugins", {}).get("entries", {}).get("kvpark", {})
         backup = entry.get("settings", {}).get("route_backup")
         applied = entry.get("settings", {}).get("route_applied", {})
         current = raw.get("model", {})
@@ -36,12 +36,12 @@ def save_route(settings, model):
         current_url = current.get("base_url", "").rstrip("/")
         # A refused preferred port can belong to the user's original backend.
         # Only an applied route (or an already-connected legacy install) proves
-        # that an address in previous_urls actually belonged to Sloth.
+        # that an address in previous_urls actually belonged to kvpark.
         owned_route = (bool(applied) and current_url == applied.get("base_url", "").rstrip("/"))
         legacy_route = not applied and settings["connected"] and current_url in urls
         if not owned_route and not legacy_route:
             backup = {field: copy.deepcopy(current[field]) for field in FIELDS if field in current}
-        saved = raw.setdefault("plugins", {}).setdefault("entries", {}).setdefault("sloth-memory", {}).setdefault("settings", {})
+        saved = raw.setdefault("plugins", {}).setdefault("entries", {}).setdefault("kvpark", {}).setdefault("settings", {})
         saved.update(route_backup=backup, route_applied=model)
         raw.setdefault("model", {}).update(model)
         config.save_config(raw)
@@ -50,14 +50,14 @@ def save_route(settings, model):
 def restored_config(raw):
     result = copy.deepcopy(raw)
     plugins = result.setdefault("plugins", {})
-    entry = plugins.setdefault("entries", {}).setdefault("sloth-memory", {})
+    entry = plugins.setdefault("entries", {}).setdefault("kvpark", {})
     settings = entry.setdefault("settings", {})
     service = {**defaults(), **settings.get("service", entry.get("config", {}).get("service", {}))}
     model = result.get("model", {})
     # Hermes also accepts the legacy shorthand model: "provider/model".
     route_model = {"default": model} if isinstance(model, str) else model
     applied = settings.get("route_applied", {})
-    # Historical preferred ports may belong to upstream servers, not Sloth.
+    # Historical preferred ports may belong to upstream servers, not kvpark.
     urls = {applied["base_url"].rstrip("/")} if applied.get("base_url") else {service["base_url"].rstrip("/") + "/v1"}
     restore = route_model.get("base_url", "").rstrip("/") in urls
     if restore:
@@ -74,8 +74,8 @@ def restored_config(raw):
                 model[field] = copy.deepcopy(backup[field])
     service.update(autostart=False, connected=False, uninstalled=True)
     settings["service"] = service
-    plugins["enabled"] = [name for name in plugins.get("enabled", []) if name != "sloth-memory"]
-    plugins["disabled"] = list(dict.fromkeys([*plugins.get("disabled", []), "sloth-memory"]))
+    plugins["enabled"] = [name for name in plugins.get("enabled", []) if name != "kvpark"]
+    plugins["disabled"] = list(dict.fromkeys([*plugins.get("disabled", []), "kvpark"]))
     return result, service, restore
 
 
@@ -92,13 +92,13 @@ def run(*, confirm=False):
              "Disable the plugin and its automatic startup."]
     for field in ("proxy", "backend"):
         if processes[field]:
-            lines.append(f"Stop Sloth's {field} (PID {processes[field]['pid']}).")
+            lines.append(f"Stop kvpark's {field} (PID {processes[field]['pid']}).")
     if settings["external"]:
         lines.append("The externally managed proxy remains running.")
     lines += ["Keep saved snapshots, model weights, runtime builds, and transcripts.",
               "Archive: " + settings["archive_dir"]]
     if not confirm:
-        return "Uninstall preview (no changes made):\n" + "\n".join(lines) + "\nFinish other turns first, then run /sloth uninstall confirm."
+        return "Uninstall preview (no changes made):\n" + "\n".join(lines) + "\nFinish other turns first, then run /kvpark uninstall confirm."
 
     def disconnect():
         # Re-read under the same locks as Hermes' native plugin config writer.
@@ -111,9 +111,9 @@ def run(*, confirm=False):
             config.save_config(restored)
 
     removal.stop(settings["archive_dir"], disconnect=disconnect, **options)
-    return ("Sloth disconnected; owned services stopped and automatic startup disabled. "
+    return ("kvpark disconnected; owned services stopped and automatic startup disabled. "
             "Restart Hermes and start a new conversation to use your restored route. "
             "Existing conversations can retain the old proxy URL.\n"
             "Snapshots and runtime builds are kept. Archive: " + settings["archive_dir"] + "\n"
             "After closing every Hermes process using this Python environment, remove the package in a terminal:\n"
-            "python -m pip uninstall sloth-memory\nUse the same Python environment that runs Hermes.")
+            "python -m pip uninstall kvpark\nUse the same Python environment that runs Hermes.")

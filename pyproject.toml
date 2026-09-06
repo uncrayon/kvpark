@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sloth-memory"
-version = "0.2.0a2"
-description = "Let your local AI nap. Resume long conversations from saved inference state."
+name = "kvpark"
+version = "0.3.0a1"
+description = "Park and restore model KV caches for local AI agents."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["psutil>=5.9", "packaging>=23"]
@@ -22,17 +22,17 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/uncrayon/sloth-memory"
-Issues = "https://github.com/uncrayon/sloth-memory/issues"
+Homepage = "https://github.com/uncrayon/kvpark"
+Issues = "https://github.com/uncrayon/kvpark/issues"
 
 [project.scripts]
-sloth-memory = "sloth_memory.cli:main"
+kvpark = "kvpark.cli:main"
 
 [project.entry-points."hermes_agent.plugins"]
-sloth-memory = "sloth_memory.hermes"
+kvpark = "kvpark.hermes"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-sloth_memory = ["update_compat.json"]
+kvpark = ["update_compat.json"]

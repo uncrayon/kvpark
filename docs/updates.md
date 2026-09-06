@@ -1,10 +1,11 @@
 # Updates and recovery
 
-Use these commands after installing `0.2.0a1` or newer:
+Use these commands after installing **kvpark `0.3.0a1` or newer**. If you still
+have sloth-memory installed, first follow the [rename migration](#migrate-from-sloth-memory).
 
 ```text
-/sloth update check
-/sloth update
+/kvpark update check
+/kvpark update
 ```
 
 `check` is read-only. It reports the installed package, the adapter loaded in this
@@ -40,68 +41,164 @@ native draining restart, as `/restart` does. In an interactive Hermes CLI, or
 when the gateway restart hook is unavailable, the reply tells you to restart
 Hermes yourself. Reopen an interactive CLI after updating it. If several agents
 or profiles share the Python environment, restart their other adapters and
-update their proxies separately. `/sloth update check` shows a pending restart
+update their proxies separately. `/kvpark update check` shows a pending restart
 until this adapter has loaded the installed version.
 
 From a terminal, with the same environment activated:
 
 ```bash
-python -m sloth_memory update check
-python -m sloth_memory update
+python -m kvpark update check
+python -m kvpark update
 ```
 
 Pass `--archive-dir /your/archive` to either command for a custom archive. The
-module invocation also works on Windows, where an active `sloth-memory.exe`
+module invocation also works on Windows, where an active `kvpark.exe`
 launcher cannot safely replace itself. Externally managed proxies must be
-updated through their service owner. On shared bots, keep `/sloth` and
-`/sloth-memory` restricted to administrators using Hermes' slash-command access
+updated through their service owner. On shared bots, keep `/kvpark` restricted to administrators using Hermes' slash-command access
 settings: these commands can install code in the bot's Python environment.
 
-## One-time upgrade from older alphas or development installs
+## Migrate from sloth-memory
 
-Old installations do not contain an updater or a proxy drain endpoint. A
-package reinstall alone leaves their old proxy process running. To bootstrap:
+`kvpark` is the new repository, Python package/module, CLI, and Hermes plugin
+name. **The old `/sloth update` cannot cross package names.** Installing kvpark
+alongside sloth-memory does not automatically stop the old proxy or transfer its
+profile settings. Use this explicit migration once per Hermes profile.
 
-1. Stop Hermes and other clients of this proxy. For a managed Hermes gateway,
-   run `hermes gateway stop` from a separate terminal; close interactive clients.
-2. Activate the Python environment that runs Hermes and install the release:
+The migration preserves the original archive directory, snapshot files and keys,
+cleanup policy, model settings, and original Hermes route backup. It does not
+move data, rebuild a patched runtime, or stop the model backend. Keep the archive
+path and runtime build unchanged: they are part of snapshot compatibility. A
+migrated directory can retain `sloth-memory` in its name.
+
+### Hermes migration sequence
+
+1. Finish active turns. Stop the Hermes gateway and close all interactive Hermes
+   sessions and other clients sharing the proxy. Leave the backend and old proxy
+   running so migration can save resident state safely:
 
    ```bash
-   python -m pip install --upgrade https://github.com/uncrayon/sloth-memory/releases/download/v0.2.0a2/sloth_memory-0.2.0a2-py3-none-any.whl
+   hermes gateway stop
    ```
 
-3. With all inference clients still stopped, save any resident state and stop
-   the old proxy. Set `archive` explicitly if you use a custom archive directory.
-   Use the proxy's `SLOTH_API_KEY` environment setting if authentication is enabled.
+2. Activate the **same Python environment that runs Hermes** and select the same
+   Hermes profile (`HERMES_HOME` when set). Install the new package alongside the
+   old one:
 
-   ```python
-   from sloth_memory.cli import request
-   from sloth_memory.network import proxy_record
-   from sloth_memory.runtime import directory
-   from sloth_memory.updates import stop_proxy
-
-   archive = directory()
-   record = proxy_record(archive)
-   if record:
-       status = request(record["base_url"], "status")
-       if status["activity"]["phase"] != "idle":
-           raise RuntimeError("Wait for inference to finish before upgrading")
-       if status.get("resident_key"):
-           request(record["base_url"], "park", {"key": status["resident_key"]})
-       stop_proxy(record)
+   ```bash
+   python -m pip install https://github.com/uncrayon/kvpark/releases/download/v0.3.0a1/kvpark-0.3.0a1-py3-none-any.whl
+   python -m kvpark --version
    ```
 
-   Run this Python snippet with the same environment's interpreter. It validates
-   the recorded process identity before stopping it. Do not kill arbitrary
-   listeners on port 8080 or stop the model backend.
+   The version should be `0.3.0a1`. Keep `sloth-memory` installed until the new
+   integration has been checked. Do not separately enable kvpark yet.
 
-   The oldest alpha.2 proxy did not publish `proxy.json`. Stop that proxy through
-   the terminal or service that launched it after parking the conversation; an
-   absent record does not prove that an older proxy is stopped.
+3. Preview the profile migration:
 
-4. Start Hermes again (`hermes gateway start` for a managed gateway). The enabled
-   plugin starts the new proxy and discovers its selected port. Run
-   `/sloth update check`; installed, loaded, and proxy versions should agree.
+   ```bash
+   python -m kvpark migrate --hermes
+   ```
+
+   Check the printed profile, archive directory, and proxy before applying it.
+   The command reads the archive location from the old plugin entry; no
+   `--archive-dir` is needed. An externally managed legacy proxy is refused;
+   its service owner must coordinate replacement.
+
+4. With clients still stopped, apply the preview:
+
+   ```bash
+   python -m kvpark migrate --hermes --confirm
+   ```
+
+   Migration backs up the profile, drains inference, saves verified resident
+   foreground state in native mode, and stops only the verified old proxy. It
+   copies plugin settings and route backups to the `kvpark` entry, enables
+   kvpark, and disables sloth-memory. Routing mode keeps the existing backend
+   process and its engine-managed cache. A failure to drain or save aborts the
+   migration; follow any recovery details printed by the command.
+
+   **This command does not launch or validate the new proxy, or restart Hermes.**
+   A successful migration means the profile is ready for the next step.
+
+5. Start Hermes and verify the new integration:
+
+   ```bash
+   hermes gateway start
+   ```
+
+   In Hermes, run:
+
+   ```text
+   /kvpark status
+   /kvpark update check
+   ```
+
+   Confirm that the expected backend, archive path, saved slots, and new versions
+   are shown. With autostart enabled, loading Hermes starts the new proxy and
+   reuses the managed backend. If autostart was deliberately off, it stays off;
+   use `/kvpark start` to start the service explicitly. In native mode, send a
+   normal message in the same compatible conversation and check reuse, then use
+   `/kvpark save`. A rename does not make incompatible snapshots restorable.
+
+6. Only after those checks pass, stop Hermes processes using this environment
+   again, remove the old package, and start Hermes:
+
+   ```bash
+   hermes gateway stop
+   python -m pip uninstall sloth-memory
+   hermes gateway start
+   ```
+
+   Close interactive clients too. Other profiles sharing this Python environment
+   must be migrated and checked before removing the old package. Keep the profile
+   backup until you are satisfied with the new installation.
+
+New configuration uses `KVPARK_*`. Legacy `SLOTH_*` environment settings are
+accepted during migration, including authentication settings; keep required
+credentials available to both the migration command and Hermes startup. Prefer
+new names when you next edit the profile or service environment. Never copy
+credentials into command output, issues, or committed files.
+
+Use `/kvpark` on Discord and Telegram. Replace any manually configured old
+command-menu priority or access-control entries with the new command name,
+preserving administrator restrictions. Restarting the gateway republishes its
+command catalog; clients may cache the old menu temporarily.
+
+### Earlier or custom installations
+
+The automated migration needs an identifiable legacy profile and a proxy with
+coordinated drain support (sloth-memory `0.2.0a1` or newer). If it refuses an older
+proxy, do not kill a guessed port or PID. Stop clients, save through the old
+integration if supported, and stop that proxy through its original terminal or
+service owner. Keep a private profile backup and follow the old release's
+recovery instructions before retrying. An absent `proxy.json` does not prove
+that a very old proxy is stopped.
+
+For qwen-slot or a custom integration, use the separate
+[custom-integration guide](hermes.md#migrate-an-existing-custom-integration).
+That integration has a different ownership contract from sloth-memory.
+
+Standalone users must coordinate their agent's configuration themselves. With
+clients stopped and the new package installed, preview and drain an owned legacy
+proxy using the original archive path:
+
+```bash
+python -m kvpark migrate --archive-dir /your/existing/archive
+python -m kvpark migrate --archive-dir /your/existing/archive --confirm
+```
+
+Start kvpark with the **same explicit `--archive-dir`**, backend, cache mode, and
+upstream URL, then point the agent at the new proxy's selected address. Keep the
+model backend running and verify status before removing the old package. If a
+supervisor owns the old proxy, coordinate replacement through that owner so it
+cannot restart the old process. Standalone migration does not edit agent routes;
+`migrate --hermes` additionally migrates the active Hermes profile.
+
+If new startup fails after a successful migration, keep clients stopped and
+inspect `hermes-proxy.log` in the unchanged archive. Retain the old package and
+migration backup for recovery. Stop any new proxy through its owner before
+restoring the saved profile and restarting the old integration; never run both
+against the same archive. Do not overwrite newer unrelated profile changes with
+an old backup.
 
 ## If an update fails
 
@@ -123,9 +220,10 @@ rollback. From the same Python environment, reinstall the previous wheel named
 in the backup directory, then restart Hermes:
 
 ```bash
-python -m pip install --no-index --no-deps --force-reinstall /path/to/backup/sloth_memory-PREVIOUS-py3-none-any.whl
+python -m pip install --no-index --no-deps --force-reinstall /path/to/backup/kvpark-PREVIOUS-py3-none-any.whl
 ```
 
-This alpha does not apply configuration or snapshot-format migrations. A release
-requiring them is refused with a pointer to its release notes rather than
-silently invalidating saved state.
+The release updater does not apply configuration or snapshot-format migrations.
+The explicit sloth-memory rename migration above is separate and retains the
+snapshot format. A release requiring an unsupported compatibility change is
+refused with a pointer to its release notes.

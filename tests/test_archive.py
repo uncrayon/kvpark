@@ -11,7 +11,7 @@ from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import http.client
 
-from sloth_memory import proxy as p
+from kvpark import proxy as p
 
 
 class ArchiveTests(unittest.TestCase):
@@ -334,7 +334,7 @@ class RelayTests(unittest.TestCase):
             self.assertIn(b"first", resp.read1(8192))
             status_conn = http.client.HTTPConnection("127.0.0.1", proxy.server_port, timeout=1)
             self.addCleanup(status_conn.close)
-            status_conn.request("GET", "/_sloth/status")
+            status_conn.request("GET", "/_kvpark/status")
             status_resp = status_conn.getresponse()
             self.assertEqual(status_resp.status, 200)
             self.assertEqual(json.loads(status_resp.read())["activity"]["phase"], "generating")
@@ -388,7 +388,7 @@ class RuntimeTests(unittest.TestCase):
             model = Path(tmp) / "model.gguf"
             model.write_bytes(b"weights")
             st = model.stat()
-            from sloth_memory.platforms import process_identity
+            from kvpark.platforms import process_identity
             data = dict(**process_identity(os.getpid()), run_id="new", identity="id",
                         files={str(model): [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]})
             manifest = Path(tmp) / "runtime.json"

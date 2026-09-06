@@ -13,13 +13,13 @@ from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 from packaging.version import InvalidVersion, Version
 
-REPOSITORY = "https://github.com/uncrayon/sloth-memory"
-RELEASES_API = "https://api.github.com/repos/uncrayon/sloth-memory/releases?per_page=100"
+REPOSITORY = "https://github.com/uncrayon/kvpark"
+RELEASES_API = "https://api.github.com/repos/uncrayon/kvpark/releases?per_page=100"
 MAX_DOWNLOAD = 25 * 1024**2
 
 
 def fetch(url, limit=MAX_DOWNLOAD):
-    req = Request(url, headers={"User-Agent": "sloth-memory-updater", "Accept": "application/vnd.github+json"})
+    req = Request(url, headers={"User-Agent": "kvpark-updater", "Accept": "application/vnd.github+json"})
     with urlopen(req, timeout=30) as response:
         data = response.read(limit + 1)
     if len(data) > limit:
@@ -39,7 +39,7 @@ def latest(installed):
             continue
         if version.is_prerelease and not Version(installed).is_prerelease:
             continue
-        name = f"sloth_memory-{version}-py3-none-any.whl"
+        name = f"kvpark-{version}-py3-none-any.whl"
         for asset in release.get("assets", []):
             url = f"{REPOSITORY}/releases/download/{tag}/{name}"
             digest = asset.get("digest") or ""
@@ -66,10 +66,10 @@ def download(release, destination):
 def validate_wheel(path, version):
     from email.parser import BytesParser
     with zipfile.ZipFile(path) as wheel:
-        info = BytesParser().parsebytes(wheel.read(f"sloth_memory-{version}.dist-info/METADATA"))
-        if info["Name"] != "sloth-memory" or Version(info["Version"]) != Version(version):
+        info = BytesParser().parsebytes(wheel.read(f"kvpark-{version}.dist-info/METADATA"))
+        if info["Name"] != "kvpark" or Version(info["Version"]) != Version(version):
             raise ValueError("release package identity mismatch")
-        compatibility = json.loads(wheel.read("sloth_memory/update_compat.json"))
+        compatibility = json.loads(wheel.read("kvpark/update_compat.json"))
         if compatibility != {"updater_protocol": 1, "snapshot_format": 2, "control_version": 4}:
             raise ValueError("this release requires a manual compatibility upgrade; see its release notes")
         current_python = ".".join(map(str, sys.version_info[:3]))

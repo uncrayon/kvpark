@@ -17,7 +17,7 @@ from .platforms import data_directory, lock_file, process_identity
 
 def directory(value=None):
     root = data_directory()
-    return Path(value or os.environ.get("SLOTH_ARCHIVE_DIR", root / "sloth-memory")).expanduser().resolve()
+    return Path(value or os.environ.get("KVPARK_ARCHIVE_DIR", root / "kvpark")).expanduser().resolve()
 
 
 def lock_directory(path, name):
@@ -83,7 +83,7 @@ def backend_command(server, model, archive, port, extra):
                 "--alias", "-a", "--mmproj-url", "--lora", "--lora-scaled"}
     for arg in extra:
         if arg.split("=", 1)[0] in reserved:
-            raise ValueError(f"{arg} is managed by sloth-memory or unsupported in this alpha")
+            raise ValueError(f"{arg} is managed by kvpark or unsupported in this alpha")
     implicit = sorted(k for k in os.environ if k.startswith("LLAMA_ARG_"))
     if implicit:
         raise ValueError("unset LLAMA_ARG_* variables and pass backend settings explicitly: " + ", ".join(implicit))
