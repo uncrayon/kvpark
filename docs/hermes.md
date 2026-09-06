@@ -155,6 +155,24 @@ To delete another saved slot, copy its full key from `slots`:
 
 Resume by sending a normal message in the same compatible session.
 
+## Discord command picker
+
+The enabled plugin registers `/sloth-memory` with Hermes' native Discord command
+list. In the picker, select it and enter `setup`, `status`, `park`, or another
+subcommand in the optional **args** field. Typing the complete text command also
+works.
+
+If text commands work but the picker is missing the command, check the gateway
+logs for Discord slash-command synchronization errors. Discord can rate-limit
+registration independently of chat traffic. On the tested Hermes version, a
+restart during the recorded cooldown skips synchronization; wait for the logged
+cooldown to expire before restarting the gateway to retry. Repeated restarts
+during that window do not make registration complete sooner.
+
+After registration succeeds, close and reopen the Discord picker or refresh the
+client. A functioning text command proves local dispatch, not that Discord has
+accepted the application's command catalog.
+
 ## Preferences
 
 ```text
