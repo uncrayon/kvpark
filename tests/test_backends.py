@@ -90,6 +90,23 @@ class RoutingTests(unittest.TestCase):
             time.sleep(.05)
         self.fail("proxy did not publish its bound address: " + log.read_text(errors="replace"))
 
+    def test_uninstall_stops_each_proxy_and_keeps_existing_backend_available(self):
+        from sloth_memory import removal
+        from urllib.request import urlopen
+        for name in ("llama.cpp", "ollama", "vllm", "mlx"):
+            with self.subTest(backend=name):
+                record, archive = self.start(name)
+                snapshot = archive / "saved-test.bin"
+                snapshot.write_bytes(b"preserve")
+                self.assertEqual(removal.plan(archive)["proxy"]["pid"], record["pid"])
+                self.assertTrue(request(record["base_url"], "doctor")["ok"])
+                removal.stop(archive, managed_backend=False)
+                self.assertIsNone(proxy_record(archive))
+                with urlopen(self.upstream_url + "/v1/models", timeout=5) as response:
+                    self.assertEqual(response.status, 200)
+                self.assertEqual(snapshot.read_bytes(), b"preserve")
+                self.assertIsNone(removal.stop(archive, managed_backend=False)["proxy"])
+
     def test_four_backends_forward_models_streaming_tools_and_report_capabilities(self):
         for name in ("llama.cpp", "ollama", "vllm", "mlx"):
             with self.subTest(backend=name):

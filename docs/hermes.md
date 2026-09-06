@@ -1,6 +1,6 @@
 # Hermes adapter and onboarding
 
-These instructions install alpha `0.2.0a1`, including portable startup, automatic
+These instructions install alpha `0.2.0a2`, including portable startup, automatic
 port selection, and release updates. See [backend setup](backends.md) for capabilities.
 
 The adapter ships inside sloth-memory as a native Hermes plugin. It uses plugin
@@ -13,7 +13,7 @@ Install into **the same Python environment that runs Hermes**:
 
 ```bash
 # With your Hermes virtual environment activated:
-git clone --branch v0.2.0a1 https://github.com/uncrayon/sloth-memory.git
+git clone --branch v0.2.0a2 https://github.com/uncrayon/sloth-memory.git
 cd sloth-memory
 python -m pip install --upgrade .
 hermes plugins enable sloth-memory
@@ -26,7 +26,7 @@ Use `hermes plugins list --plain --no-bundled` to check that it is enabled.
 For an existing installation, follow [updates and recovery](updates.md). Versions
 older than `0.2.0a1` need a one-time package installation and proxy replacement;
 subsequent releases can use `/sloth update`. Run `sloth-memory --version` in
-Hermes' environment to confirm `0.2.0a1`. Restart Hermes after installation to
+Hermes' environment to confirm `0.2.0a2`. Restart Hermes after installation to
 load the entry point. The adapter is tested against Hermes
 0.21.0, upstream commit `9dd6634c5635321cf38840cc30e9b51226689128`.
 Use Python 3.11–3.13 for Hermes; the standalone service also supports 3.10/3.14.
@@ -55,6 +55,10 @@ printed by the build; Windows typically places `llama-server.exe` under
 backend. Connecting an existing server in routing mode requires no build.
 
 ## Persistence and updates
+
+To remove the integration and return to your original model server, see
+[uninstall and recovery](uninstall.md). Existing servers and model weights are
+kept. The guide also includes manual removal for older versions.
 
 The installed package, plugin enablement, profile configuration, and saved slots
 persist across a computer restart. When Hermes launches, the enabled plugin

@@ -21,7 +21,7 @@ from .runtime import directory
 def defaults():
     return dict(base_url="http://127.0.0.1:8080", upstream_port=8090, archive_dir=str(directory()),
                 autostart=True, external=False, server="", model="", backend="llama.cpp",
-                upstream_url="", cache_mode="native", connected=False, previous_urls=[],
+                upstream_url="", cache_mode="native", connected=False, uninstalled=False, previous_urls=[],
                 backend_args=["--ctx-size", "8192", "--cache-ram", "0", "--ctx-checkpoints", "8",
                               "--checkpoint-min-step", "128", "--jinja"])
 
@@ -45,7 +45,7 @@ def validate_service(values):
         parsed_previous = urlsplit(normalize_url(url))
         if parsed_previous.scheme != "http" or parsed_previous.hostname != "127.0.0.1":
             raise ValueError("previous proxy URLs must be local")
-    for key in ("autostart", "external", "connected"):
+    for key in ("autostart", "external", "connected", "uninstalled"):
         if type(result[key]) is not bool:
             raise ValueError(f"{key} must be true or false")
     for key in ("model", "server"):
@@ -121,6 +121,8 @@ class Service:
         self.error = None
 
     def ensure(self):
+        if self.settings().get("uninstalled", False):
+            raise RuntimeError("Sloth was uninstalled; follow docs/uninstall.md to reinstall")
         config = validate_service(self.settings())
         if self.closed.is_set():
             raise RuntimeError("Hermes adapter has been unloaded")
@@ -132,6 +134,8 @@ class Service:
             return existing
         archive = Path(config["archive_dir"])
         with file_lock(archive / ".hermes-start.lock"):
+            if self.closed.is_set() or self.settings().get("uninstalled", False):
+                raise RuntimeError("Sloth startup was disabled while waiting for the archive")
             # The process that won startup publishes the actual bound address.
             # Read it again under the interprocess lock, including after a reboot.
             record = proxy_record(archive)

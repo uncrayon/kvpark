@@ -1,6 +1,6 @@
 # Runtime compatibility
 
-This page describes alpha `0.2.0a1`. See [backends](backends.md) for routing
+This page describes alpha `0.2.0a2`. See [backends](backends.md) for routing
 capabilities. Older alpha.2 installations retain their original Linux-only scope.
 
 ## Runtime

@@ -6,11 +6,11 @@ sloth-memory saves a local model's conversation inference state to disk and rest
 it when you return. Built for people running open-weight models on their own hardware.
 MIT licensed. No cloud service or account. The portable runtime uses psutil.
 
-**Alpha release `0.2.0a1`.** Supports Linux, macOS, and
+**Alpha release `0.2.0a2`.** Supports Linux, macOS, and
 Windows startup, automatic free-port selection, and routing adapters for llama.cpp,
 Ollama, vLLM, and MLX-LM. Disk park/resume through this adapter still requires the
 managed patched llama.cpp runtime and one slot. See [backend capabilities](docs/backends.md).
-Download the [current alpha](https://github.com/uncrayon/sloth-memory/releases/tag/v0.2.0a1).
+Download the [current alpha](https://github.com/uncrayon/sloth-memory/releases/tag/v0.2.0a2).
 Existing users: follow the [update guide](docs/updates.md), including the one-time
 proxy replacement for installations older than this release.
 The service is independent of Hermes. A native Hermes adapter provides startup,
@@ -37,7 +37,7 @@ Your agent → sloth-memory (local proxy) → inference server
               local archive files
 ```
 
-## Install from main
+## Install the latest alpha
 
 Requirements: Linux, macOS, or Windows, Python 3.10+, and Git. Building the managed
 llama.cpp runtime also needs CMake, a C/C++ toolchain, and your own supported GGUF
@@ -50,7 +50,7 @@ instead of creating the standalone environment below.
 Standalone installation on macOS/Linux:
 
 ```bash
-git clone --branch v0.2.0a1 https://github.com/uncrayon/sloth-memory.git
+git clone --branch v0.2.0a2 https://github.com/uncrayon/sloth-memory.git
 cd sloth-memory
 python3 -m venv .venv
 source .venv/bin/activate
@@ -111,6 +111,9 @@ For terminal use on any OS: `python -m sloth_memory update check` and
 `python -m sloth_memory update`. See [updates and recovery](docs/updates.md).
 
 ## Use with Hermes
+
+Before trying the plugin, read [uninstall and return to your original backend](docs/uninstall.md).
+It covers `/sloth uninstall`, package removal, and optional archive/build cleanup.
 
 Install sloth-memory in Hermes' Python environment, enable it with
 `hermes plugins enable sloth-memory`, and restart Hermes. Then run:

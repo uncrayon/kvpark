@@ -747,6 +747,7 @@ def main():
     from .platforms import process_identity
     server = bind_server(Handler, LISTEN_PORT, backend().url)
     atomic_json(ARCHIVE / "proxy.json", dict(**process_identity(os.getpid()),
+                archive_dir=str(ARCHIVE),
                 python_prefix=str(Path(sys.prefix).resolve()),
                 launch_token=os.environ.get("SLOTH_LAUNCH_TOKEN"),
                 base_url=f"http://{LISTEN_HOST}:{server.server_port}", upstream_url=backend().url,
