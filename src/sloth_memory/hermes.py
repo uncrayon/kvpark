@@ -123,6 +123,8 @@ class Adapter:
         if config["backend"] == "llama.cpp" and not config["external"] and not config["upstream_url"] and not (config["server"] and config["model"]):
             lines += ["Next: configure your patched llama-server and GGUF:",
                       '/sloth-memory setup --server "/path/to/llama-server" --model "/path/to/model.gguf"']
+        elif not config["model"] and not config["external"]:
+            lines.append('Next: /sloth-memory setup --model "the-exact-model-ID-served-by-your-backend"')
         else:
             lines += ["Next: /sloth-memory start, then /sloth-memory connect to select this route for future sessions."]
         lines += ["Commands:", "  status | park | delete [k-…] | slots",
@@ -147,6 +149,11 @@ class Adapter:
         parser.add_argument("--external", action=argparse.BooleanOptionalAction, default=None)
         parsed = vars(parser.parse_args(args))
         updates = {key: value for key, value in parsed.items() if value is not None}
+        if "backend" in updates and updates["backend"] != self.settings()["backend"]:
+            # A model ID and endpoint belong to one backend. Reusing them while
+            # changing engines can silently route to the previous engine.
+            for key in ("model", "server", "upstream_url"):
+                updates.setdefault(key, "")
         if "backend" in updates and "cache_mode" not in updates:
             updates["cache_mode"] = "native" if updates["backend"] == "llama.cpp" else "routing"
         if "backend_args" in updates:
