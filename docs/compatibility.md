@@ -1,7 +1,7 @@
 # Runtime compatibility
 
-This page describes the current `main` development version. See [backends](backends.md)
-for routing capabilities; published alpha.2 retains its older Linux-only scope.
+This page describes alpha `0.2.0a1`. See [backends](backends.md) for routing
+capabilities. Older alpha.2 installations retain their original Linux-only scope.
 
 ## Runtime
 

@@ -15,6 +15,34 @@ from sloth_memory import proxy as p
 
 
 class ArchiveTests(unittest.TestCase):
+    def test_update_saves_resident_state_and_gates_new_requests(self):
+        self.assertTrue(self.a.prepare_update()["ok"])
+        self.assertIn(self.a.current_key, self.a.entries)
+        self.assertTrue(self.a.status()["maintenance"])
+
+    def test_update_save_failure_reopens_inference(self):
+        self.resume = False
+        with self.assertRaises(OSError):
+            self.a.prepare_update()
+        self.assertFalse(self.a.status()["maintenance"])
+        self.assertFalse(self.a.entries)
+
+    def test_update_wait_timeout_does_not_interrupt_generation(self):
+        held, release = threading.Event(), threading.Event()
+        def generation():
+            with self.a.lock:
+                held.set()
+                release.wait(5)
+        thread = threading.Thread(target=generation)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(release.set)
+        self.assertTrue(held.wait(1))
+        with self.assertRaisesRegex(RuntimeError, "still active"):
+            self.a.prepare_update(timeout=.01)
+        self.assertFalse(self.a.status()["maintenance"])
+        self.assertTrue(thread.is_alive())
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -245,6 +273,23 @@ class ArchiveTests(unittest.TestCase):
 
 
 class RelayTests(unittest.TestCase):
+    def test_maintenance_rejects_generation_before_contacting_backend(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(p, "ARCHIVE", Path(tmp)):
+            state = p.Archive()
+        state.maintenance_until = time.monotonic() + 60
+        server = ThreadingHTTPServer(("127.0.0.1", 0), p.Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        with patch.object(p, "ARCHIVE_STATE", state, create=True), patch.object(p.Handler, "forward") as forward:
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+            self.addCleanup(conn.close)
+            conn.request("POST", "/v1/chat/completions", json.dumps({"messages": []}))
+            response = conn.getresponse()
+            self.assertEqual(response.status, 503)
+            response.read()
+            forward.assert_not_called()
+
     def test_streaming_and_concurrent_requests_keep_slot_owned_until_eof(self):
         first_sent, release = threading.Event(), threading.Event()
         backend_order = []

@@ -6,12 +6,13 @@ sloth-memory saves a local model's conversation inference state to disk and rest
 it when you return. Built for people running open-weight models on their own hardware.
 MIT licensed. No cloud service or account. The portable runtime uses psutil.
 
-**Current `main` · development version `0.2.0.dev0`.** Supports Linux, macOS, and
+**Alpha release `0.2.0a1`.** Supports Linux, macOS, and
 Windows startup, automatic free-port selection, and routing adapters for llama.cpp,
 Ollama, vLLM, and MLX-LM. Disk park/resume through this adapter still requires the
 managed patched llama.cpp runtime and one slot. See [backend capabilities](docs/backends.md).
-The published [alpha.2](https://github.com/uncrayon/sloth-memory/releases/tag/v0.1.0-alpha.2)
-is the older Linux version; install from `main` below to test the merged changes.
+Download the [current alpha](https://github.com/uncrayon/sloth-memory/releases/tag/v0.2.0a1).
+Existing users: follow the [update guide](docs/updates.md), including the one-time
+proxy replacement for installations older than this release.
 The service is independent of Hermes. A native Hermes adapter provides startup,
 slash-command onboarding, and cleanup controls. Other agents integrate through
 an HTTP proxy and explicit session metadata; a plain Python example is included.
@@ -49,7 +50,7 @@ instead of creating the standalone environment below.
 Standalone installation on macOS/Linux:
 
 ```bash
-git clone --branch main https://github.com/uncrayon/sloth-memory.git
+git clone --branch v0.2.0a1 https://github.com/uncrayon/sloth-memory.git
 cd sloth-memory
 python3 -m venv .venv
 source .venv/bin/activate
@@ -98,6 +99,16 @@ Storage defaults to `~/Library/Application Support/sloth-memory` on macOS,
 `~/.local/share/sloth-memory` on Linux, or `%LOCALAPPDATA%\sloth-memory` on Windows;
 `XDG_DATA_HOME` overrides these. To change it, pass the **same** `--archive-dir` to
 the backend, proxy, and control commands.
+
+## Updates
+
+In Hermes, use `/sloth update check` to compare installed, loaded, and running
+versions, then `/sloth update` to install a published release. The updater saves
+resident state, replaces its proxy, verifies health, and attempts rollback on
+failure. Hermes gateways restart through their native restart lifecycle.
+
+For terminal use on any OS: `python -m sloth_memory update check` and
+`python -m sloth_memory update`. See [updates and recovery](docs/updates.md).
 
 ## Use with Hermes
 

@@ -46,6 +46,10 @@ class Adapter:
         self.home = Path(get_hermes_home()).resolve()
         self.namespace = "hermes:" + hashlib.sha256(str(self.home).encode()).hexdigest()[:16] + ":"
         self.service = Service(self.settings, self.persist_service)
+        self.gateway = None
+
+    def capture_gateway(self, *, gateway=None, **kwargs):
+        self.gateway = gateway
 
     def persist_service(self, config):
         previous = self.settings()
@@ -131,6 +135,7 @@ class Adapter:
         else:
             lines += ["Next: /sloth-memory start, then /sloth-memory connect to select this route for future sessions."]
         lines += ["Commands:", "  status | park | delete [k-…] | slots",
+                  "  update check | update",
                   "  retention 7 | budget 32 | cleanup on|off|now",
                   "  base-url http://127.0.0.1:8080 | autostart on|off",
                   "Setup also accepts --backend llama.cpp|ollama|vllm|mlx, --upstream-url, --model, --cache-mode native|routing,",
@@ -223,6 +228,27 @@ class Adapter:
         args = shlex.split(raw_args)
         action = args[0] if args else "setup"
         rest = args[1:]
+        if action == "update" and rest in ([], ["check"]):
+            from . import updates
+            config = self.settings()
+            if rest:
+                result = updates.check(config["archive_dir"], url=config["base_url"] if config["external"] else None)
+                lines = [f"Installed: {result['installed']} · Hermes loaded: {result['loaded']} · Proxy: {result['proxy']}"]
+                if result.get("check_error"):
+                    lines.append("Release check unavailable: " + result["check_error"])
+                else:
+                    lines.append("Available: " + result["latest"] if result["available"] else "No newer compatible published release.")
+                if result.get("last_update"):
+                    state = result["last_update"]
+                    lines.append("Last update: " + state["state"] + ". " + state.get("note", ""))
+                if result["loaded"] != result["installed"]:
+                    lines.append("Restart Hermes to load the installed adapter.")
+                return "\n".join(lines)
+            from hermes_cli import config as hermes_config
+            if hermes_config.is_managed():
+                raise PermissionError("updates are managed by your administrator")
+            result = updates.apply(config["archive_dir"], hermes_home=self.home, external=config["external"])
+            return f"sloth-memory {result['version']}: {result['note']}"
         if action in {"setup", "onboarding", "help"}:
             return self.configure(rest) if rest and action == "setup" else self.onboarding()
         if action == "base-url" and len(rest) == 1:
@@ -265,7 +291,19 @@ class Adapter:
 
     async def command(self, raw_args):
         try:
-            return await asyncio.to_thread(self.handle, raw_args)
+            result = await asyncio.to_thread(self.handle, raw_args)
+            if shlex.split(raw_args) == ["update"]:
+                from importlib.metadata import version
+                from . import __version__
+                if version("sloth-memory") != __version__ and self.gateway is not None:
+                    from gateway.restart import is_container_restart_context, is_gateway_supervisor_process
+                    supervised = is_gateway_supervisor_process() or is_container_restart_context()
+                    # Let the command response be sent before Hermes drains and
+                    # restarts through the same lifecycle used by /restart.
+                    asyncio.get_running_loop().call_later(2, lambda: self.gateway.request_restart(
+                        detached=not supervised, via_service=supervised))
+                    result += " Hermes will restart shortly to load the new adapter."
+            return result
         except (OSError, ValueError, RuntimeError) as exc:
             return "sloth-memory: " + str(exc)
         finally:
@@ -277,7 +315,8 @@ def register(ctx):
     for name in ("sloth", "sloth-memory"):
         ctx.register_command(name, adapter.command,
                              description="Set up conversation slots, park, delete, and configure cleanup",
-                             args_hint="setup | status | park | delete | cleanup | retention | base-url", argument_mode="text")
+                             args_hint="setup | status | park | delete | cleanup | retention | base-url | update", argument_mode="text")
+    ctx.register_hook("pre_gateway_dispatch", adapter.capture_gateway)
     ctx.register_hook("pre_command", adapter.capture_command)
     ctx.register_middleware("llm_request", adapter.middleware)
     ctx.on_unload(adapter.service.closed.set)

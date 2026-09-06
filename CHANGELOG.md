@@ -1,6 +1,13 @@
 # Changelog
 
-## 0.2.0.dev0 — unreleased
+## 0.2.0a1 — coordinated release updates
+
+- Add `/sloth update check` and `/sloth update`, plus equivalent terminal commands.
+- Verify official GitHub release wheel hashes and compatibility before installation; retain a rollback wheel and configuration backups.
+- Drain inference and save resident state before proxy replacement, keep the model backend running, and verify the replacement before reopening inference.
+- Roll back package and proxy on handled installation/startup failures; report recovery paths when rollback fails.
+- Restart supported Hermes gateways through their native lifecycle after a successful package update; show installed, loaded, and running versions.
+- Add isolated real-package upgrade and failed-start rollback acceptance.
 
 - Add the portable `/sloth` alias, preserve Telegram chat identity when parking, and document Telegram menu priority; cover dispatch and menu visibility in Hermes integration tests.
 

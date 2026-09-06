@@ -85,7 +85,7 @@ Never publish keys, transcript files, or archive directories.
 `POST /_sloth/settings` atomically persists any subset of those settings.
 `POST /_sloth/cleanup` runs a manual sweep with the saved age/budget rules.
 Unknown keys, invalid booleans, negative ages, and nonpositive budgets are refused.
-Status includes `service: "sloth-memory"` and `control_version: 2` for adapters.
+Status includes the running package `version`, `maintenance`, `service: "sloth-memory"` and `control_version: 4` for adapters.
 
 ## Hermes
 

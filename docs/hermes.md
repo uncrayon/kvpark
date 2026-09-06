@@ -1,8 +1,7 @@
 # Hermes adapter and onboarding
 
-These instructions install the current `main` development version (`0.2.0.dev0`),
-including portable startup and automatic port selection. The published alpha.2
-does not contain those changes. See [backend setup](backends.md) for capabilities.
+These instructions install alpha `0.2.0a1`, including portable startup, automatic
+port selection, and release updates. See [backend setup](backends.md) for capabilities.
 
 The adapter ships inside sloth-memory as a native Hermes plugin. It uses plugin
 discovery, request middleware, commands, and profile settings. It does not patch
@@ -14,7 +13,7 @@ Install into **the same Python environment that runs Hermes**:
 
 ```bash
 # With your Hermes virtual environment activated:
-git clone --branch main https://github.com/uncrayon/sloth-memory.git
+git clone --branch v0.2.0a1 https://github.com/uncrayon/sloth-memory.git
 cd sloth-memory
 python -m pip install --upgrade .
 hermes plugins enable sloth-memory
@@ -24,10 +23,11 @@ If Hermes asks whether the plugin may replace built-in tools, answer **No**.
 sloth-memory registers commands and middleware; it needs no tool overrides.
 Use `hermes plugins list --plain --no-bundled` to check that it is enabled.
 
-For an existing checkout, use `git pull --ff-only origin main` on its `main`
-branch, then repeat the pip install command. Run `sloth-memory --version` in
-Hermes' environment to confirm `0.2.0.dev0`. Restart Hermes after installation or
-upgrade to load the entry point. The adapter is tested against Hermes
+For an existing installation, follow [updates and recovery](updates.md). Versions
+older than `0.2.0a1` need a one-time package installation and proxy replacement;
+subsequent releases can use `/sloth update`. Run `sloth-memory --version` in
+Hermes' environment to confirm `0.2.0a1`. Restart Hermes after installation to
+load the entry point. The adapter is tested against Hermes
 0.21.0, upstream commit `9dd6634c5635321cf38840cc30e9b51226689128`.
 Use Python 3.11–3.13 for Hermes; the standalone service also supports 3.10/3.14.
 
@@ -53,6 +53,19 @@ This starts with a CPU build, including on macOS. Use the absolute binary path
 printed by the build; Windows typically places `llama-server.exe` under
 `runtime/build/bin/Release`. Onboarding does not download weights or compile a
 backend. Connecting an existing server in routing mode requires no build.
+
+## Persistence and updates
+
+The installed package, plugin enablement, profile configuration, and saved slots
+persist across a computer restart. When Hermes launches, the enabled plugin
+starts its managed services if autostart is on. Starting Hermes itself at boot or
+login is a separate Hermes service setting. The cleanup policy still expires old
+snapshots; rebooting does not reset their age.
+
+A gateway restart reuses an existing compatible proxy so it does not interrupt
+shared inference. It does not automatically replace that proxy's Python code.
+Use `/sloth update check` to see all three versions and `/sloth update` for the
+coordinated release update. See [updates and recovery](updates.md).
 
 ## Guided setup
 

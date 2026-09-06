@@ -32,6 +32,9 @@ def main():
     parser = argparse.ArgumentParser(description="Let your local AI nap. Save its work for later.")
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command", required=True)
+    update = sub.add_parser("update", help="check or install an official release, retaining rollback files")
+    update.add_argument("action", nargs="?", choices=("check",))
+    update.add_argument("--archive-dir")
     serve = sub.add_parser("serve", help="start the localhost inference proxy")
     serve.add_argument("--archive-dir")
     serve.add_argument("--port", type=int, default=8080)
@@ -62,7 +65,12 @@ def main():
             cmd.add_argument("--cleanup", action=argparse.BooleanOptionalAction, default=None)
     args = parser.parse_args()
     try:
-        if args.command == "serve":
+        if args.command == "update":
+            from . import updates
+            archive = directory(args.archive_dir)
+            result = updates.check(archive) if args.action == "check" else updates.apply(archive)
+            print(json.dumps(result, indent=2))
+        elif args.command == "serve":
             if not 1 <= args.port <= 65535 or not 1 <= args.upstream_port <= 65535:
                 parser.error("ports must be between 1 and 65535")
             from .retention import validate

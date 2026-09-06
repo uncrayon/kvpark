@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sloth-memory"
-version = "0.2.0.dev0"
+version = "0.2.0a1"
 description = "Let your local AI nap. Resume long conversations from saved inference state."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["psutil>=5.9"]
+dependencies = ["psutil>=5.9", "packaging>=23"]
 license = {text = "MIT"}
 authors = [{name = "Ulises Rayon"}]
 keywords = ["llama.cpp", "kv-cache", "local-ai", "open-weights", "agents"]
@@ -33,3 +33,6 @@ sloth-memory = "sloth_memory.hermes"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+sloth_memory = ["update_compat.json"]
