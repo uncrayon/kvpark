@@ -1,7 +1,9 @@
 # Runtime compatibility
 
-This page describes alpha `0.2.0a2`. See [backends](backends.md) for routing
-capabilities. Older alpha.2 installations retain their original Linux-only scope.
+This page describes alpha `0.3.0a1`. See [backends](backends.md) for routing
+capabilities. The rename from sloth-memory preserves snapshot format 2; the
+[migration](updates.md#migrate-from-sloth-memory) keeps the archive path and runtime
+unchanged so existing compatible snapshots remain usable.
 
 ## Runtime
 
@@ -10,7 +12,7 @@ The build script pins ggml-org/llama.cpp to
 `patches/llama-slot-resume.patch`. This patch persists hybrid/recurrent context
 checkpoints as well as target, draft, and speculative state. The `.bin.resume`
 companion is mandatory: a stock `.bin` alone cannot be published as a usable
-sloth-memory archive in the current implementation. Stock llama.cpp already has
+kvpark archive in the current implementation. Stock llama.cpp already has
 slot save/restore APIs; the companion requirement is specific to this adapter.
 This persistence patch is separate from the originating project's DFlash2 position
 fix and is not restricted to DFlash2.
@@ -67,7 +69,7 @@ python scripts/build_runtime.py --output runtime-rocm --cmake-arg=-DGGML_HIP=ON
 ```
 
 These switches select upstream backends, not verified support for your GPU.
-Use the resulting binary path with `sloth-memory backend` and pass any device
+Use the resulting binary path with `kvpark backend` and pass any device
 settings after `--`. Use explicit local file paths and long-form model/draft/
 projector arguments. `LLAMA_ARG_*` environment defaults are refused to keep the
 runtime identity reproducible. Other kernel environment settings are fingerprinted.
@@ -85,7 +87,7 @@ also cleaned; arbitrary files, symlinks, and live RAM state are not swept.
 
 `settings --ttl-days 7 --max-gib 32 --cleanup` changes and persists preferences.
 `--no-cleanup` disables scheduled deletion and age expiry on restore;
-`--ttl-days 0` disables age expiry only. `sloth-memory cleanup` runs a manual sweep.
+`--ttl-days 0` disables age expiry only. `kvpark cleanup` runs a manual sweep.
 Explicit `serve --ttl-days … --max-gib … --[no-]cleanup` flags override saved
 preferences; omitted flags preserve them.
 

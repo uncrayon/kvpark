@@ -7,8 +7,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from sloth_memory import runtime
-from sloth_memory import proxy
+from kvpark import runtime
+from kvpark import proxy
 
 
 class LauncherTests(unittest.TestCase):
@@ -54,7 +54,7 @@ class LauncherTests(unittest.TestCase):
                 os.close(fd)
 
     def test_cli_requires_explicit_identity(self):
-        result = subprocess.run([sys.executable, "-m", "sloth_memory", "park"], capture_output=True, text=True)
+        result = subprocess.run([sys.executable, "-m", "kvpark", "park"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 2)
         self.assertIn("--session", result.stderr)
 
@@ -111,7 +111,7 @@ class HTTPBoundaryTests(unittest.TestCase):
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
 
-    def call(self, method="GET", path="/_sloth/status", body=None, headers=None):
+    def call(self, method="GET", path="/_kvpark/status", body=None, headers=None):
         import http.client
         conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=2)
         try:
@@ -124,7 +124,7 @@ class HTTPBoundaryTests(unittest.TestCase):
     def test_auth_protects_status_and_mutations(self):
         with patch.object(proxy, "API_KEY", "test-secret"):
             self.assertEqual(self.call()[0], 401)
-            self.assertEqual(self.call("POST", "/_sloth/park", b"{}")[0], 401)
+            self.assertEqual(self.call("POST", "/_kvpark/park", b"{}")[0], 401)
             self.assertEqual(self.call(headers={"Authorization": "Bearer test-secret"})[0], 200)
 
     def test_browser_origins_cannot_control_local_service(self):

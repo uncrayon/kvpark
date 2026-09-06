@@ -1,11 +1,11 @@
 # Backends and operating systems
 
-This describes alpha `0.2.0a2`. Older alpha.2 installations retain their original
-Linux-only scope until upgraded.
+This describes kvpark alpha `0.3.0a1`. Existing sloth-memory users should follow
+the [rename migration](updates.md#migrate-from-sloth-memory).
 
 ## Capability contract
 
-| Backend | Chat proxy and Hermes routing | sloth-memory disk park/resume |
+| Backend | Chat proxy and Hermes routing | kvpark disk park/resume |
 | --- | --- | --- |
 | Patched llama.cpp, managed locally | Yes | Yes; validate each model/build |
 | Stock llama.cpp, existing server | Yes, `--cache-mode routing` | Unavailable |
@@ -17,7 +17,7 @@ Routing preserves the served model name, messages, tool calls, and streaming.
 `status` and `doctor` report `capabilities.disk_snapshots` explicitly. In routing
 mode, parking returns an error instead of claiming that inference state was saved.
 No transcript cache is substituted for a KV snapshot. Seven-day cleanup only
-manages files owned by sloth-memory, never a backend's independent prefix cache.
+manages files owned by kvpark, never a backend's independent prefix cache.
 
 The proxy and Python runtime target Linux, macOS, and Windows. CI runs the Python
 suite and builds the patched llama.cpp runtime on all three systems. The backend
@@ -32,9 +32,9 @@ Then configure Hermes with the **exact model ID served by that server**. Use
 [the model-ID lookup below](#find-your-model-id) before replacing the placeholders:
 
 ```text
-/sloth-memory setup --backend ollama --upstream-url http://127.0.0.1:11434 --model "your-model:tag"
-/sloth-memory setup --backend vllm --upstream-url http://127.0.0.1:8000 --model "your-served-model"
-/sloth-memory setup --backend mlx --upstream-url http://127.0.0.1:8081 --model "your-mlx-model"
+/kvpark setup --backend ollama --upstream-url http://127.0.0.1:11434 --model "your-model:tag"
+/kvpark setup --backend vllm --upstream-url http://127.0.0.1:8000 --model "your-served-model"
+/kvpark setup --backend mlx --upstream-url http://127.0.0.1:8081 --model "your-mlx-model"
 ```
 
 Choose one backend per archive directory. To run another stack, include
@@ -43,13 +43,13 @@ selected URL into Hermes' model configuration. No sudo, packet interception,
 firewall edits, or privileged ports are required:
 
 ```text
-Hermes → sloth-memory (selected localhost port) → your inference server
+Hermes → kvpark (selected localhost port) → your inference server
 ```
 
 An existing unpatched llama.cpp server can be attached explicitly:
 
 ```text
-/sloth-memory setup --backend llama.cpp --cache-mode routing --upstream-url http://127.0.0.1:8090 --model "your-served-alias"
+/kvpark setup --backend llama.cpp --cache-mode routing --upstream-url http://127.0.0.1:8090 --model "your-served-alias"
 ```
 
 For native disk snapshots, build the included runtime and use the existing
@@ -60,8 +60,8 @@ For native disk snapshots, build the included runtime and use the existing
 Standalone example, without Hermes:
 
 ```bash
-sloth-memory serve --backend ollama --upstream-url http://127.0.0.1:11434
-sloth-memory doctor
+kvpark serve --backend ollama --upstream-url http://127.0.0.1:11434
+kvpark doctor
 ```
 
 Both commands use the same default archive directory. With a custom directory,
@@ -76,10 +76,10 @@ It may be a serving alias, a repository name, a tagged name, or a full file path
 Copy it exactly, including capitalization, slashes, and tags; a display name such
 as “Gemma” is not enough unless you configured that exact alias.
 
-Start the backend, then query its **own address**, before connecting Sloth. Run
+Start the backend, then query its **own address**, before connecting kvpark. Run
 the appropriate command from the machine running Hermes:
 
-| Backend | List models (example address) | Value to use for Sloth's `--model` |
+| Backend | List models (example address) | Value to use for kvpark's `--model` |
 | --- | --- | --- |
 | Existing llama.cpp | `curl -fsS http://127.0.0.1:8090/v1/models` | An `id` inside `data`; usually the `--alias` value, otherwise the model file path |
 | Ollama | `curl -fsS http://127.0.0.1:11434/v1/models` | An `id` inside `data`, including its tag, such as `example-model:latest` |
@@ -104,8 +104,8 @@ For example, if your vLLM server returns:
 Use the **`id` string `my-gemma`**, not the entire JSON object:
 
 ```text
-/sloth setup --backend vllm --cache-mode routing --upstream-url http://127.0.0.1:8000 --model "my-gemma"
-/sloth status
+/kvpark setup --backend vllm --cache-mode routing --upstream-url http://127.0.0.1:8000 --model "my-gemma"
+/kvpark status
 ```
 
 `my-gemma` is an example alias, not a model to download. If you choose to set that
@@ -121,8 +121,8 @@ the model you intend to serve; a listing alone does not prove that it can load o
 generate successfully. A locally served model can appear as an absolute directory
 path, so keep the quotes around `--model` when the path contains spaces.
 
-For Sloth's **managed native llama.cpp setup**, `--model` instead takes your local
-GGUF path, as shown in the [Hermes guide](hermes.md#guided-setup). Sloth starts that
+For kvpark's **managed native llama.cpp setup**, `--model` instead takes your local
+GGUF path, as shown in the [Hermes guide](hermes.md#guided-setup). kvpark starts that
 backend with the alias `local` and selects it for Hermes automatically.
 
 If discovery fails:
@@ -132,7 +132,7 @@ If discovery fails:
 - **401 or 403:** use the backend's required authentication. For a Bearer-protected
   endpoint, supply an `Authorization: Bearer …` header; keep the credential out
   of chat and committed files. See [upstream credentials](#port-selection-and-routing)
-  when configuring Sloth to connect to that server.
+  when configuring kvpark to connect to that server.
 - **404 or HTML response:** check that this is the inference API address, not a
   web UI, and that `/v1` was not added twice.
 - **Empty `data` list:** check the backend's model configuration/downloads and
@@ -163,17 +163,20 @@ non-OpenAI client implementations are untouched; restart those sessions through
 the configured proxy. Disabling autostart leaves already running services alive.
 
 The proxy listens only on `127.0.0.1`. Remote upstreams can use HTTPS and an
-upstream credential file (`SLOTH_UPSTREAM_KEY_FILE`); the proxy's optional
-`SLOTH_API_KEY` is separate. Credentials are not stored in service metadata.
+upstream credential file (`KVPARK_UPSTREAM_KEY_FILE`); the proxy's optional
+`KVPARK_API_KEY` is separate. Credentials are not stored in service metadata.
 
 ## Platform storage
 
 Defaults follow `XDG_DATA_HOME` when set; otherwise:
 
-- Linux: `~/.local/share/sloth-memory`
-- macOS: `~/Library/Application Support/sloth-memory`
-- Windows: `%LOCALAPPDATA%\sloth-memory`
+- Linux: `~/.local/share/kvpark`
+- macOS: `~/Library/Application Support/kvpark`
+- Windows: `%LOCALAPPDATA%\kvpark`
 
+These defaults apply to new installations. The [sloth-memory migration](updates.md#migrate-from-sloth-memory)
+keeps the existing archive directory, even when its name still contains `sloth-memory`.
+Do not move it to match the new brand: its path is part of runtime compatibility.
 Explicit `--archive-dir` keeps an existing installation in place. Portable process
 identity uses psutil; Windows uses native byte-range file locks and a Job Object
 for managed child lifetime. Metadata files are flushed before atomic replacement.
@@ -185,7 +188,7 @@ durability than the Unix directory-flush path.
 Full disk resume across all four engines is **not implemented**. The next backend
 work needs real engine-side integration and model/hardware acceptance tests:
 
-- Ollama's documented OpenAI API provides chat routing, but not sloth-memory's
+- Ollama's documented OpenAI API provides chat routing, but not kvpark's
   snapshot controls. `keep_alive` controls model residency, not durable snapshots.
   [Ollama API](https://docs.ollama.com/api/openai-compatibility),
   [generate parameters](https://docs.ollama.com/api/generate).

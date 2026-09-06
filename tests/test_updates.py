@@ -8,11 +8,11 @@ import unittest
 import zipfile
 from unittest.mock import MagicMock, patch
 
-from sloth_memory import releases, updates
+from kvpark import releases, updates
 
 
 def release(version, **overrides):
-    name = f"sloth_memory-{version}-py3-none-any.whl"
+    name = f"kvpark-{version}-py3-none-any.whl"
     return dict(tag_name="v" + version, draft=False, assets=[dict(name=name,
         browser_download_url=f"{releases.REPOSITORY}/releases/download/v{version}/{name}",
         digest="sha256:" + "a" * 64)], **overrides)
@@ -23,8 +23,8 @@ class ReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             wheel = Path(tmp) / "package.whl"
             with zipfile.ZipFile(wheel, "w") as out:
-                out.writestr("sloth_memory-0.2.0a2.dist-info/METADATA", "Name: sloth-memory\nVersion: 0.2.0a2\n")
-                out.writestr("sloth_memory/update_compat.json", json.dumps(dict(updater_protocol=1, snapshot_format=3, control_version=4)))
+                out.writestr("kvpark-0.2.0a2.dist-info/METADATA", "Name: kvpark\nVersion: 0.2.0a2\n")
+                out.writestr("kvpark/update_compat.json", json.dumps(dict(updater_protocol=1, snapshot_format=3, control_version=4)))
             with self.assertRaisesRegex(ValueError, "manual compatibility"):
                 releases.validate_wheel(wheel, "0.2.0a2")
 
@@ -90,13 +90,13 @@ class UpdateTests(unittest.TestCase):
                "request": self.request, "install": self.install, "stop_proxy": self.stop,
                "start_proxy": self.start, "subprocess.check_output": lambda *a, **kw: "0.2.0a2\n"})
         for name, value in values.items():
-            mocked = patch("sloth_memory.updates." + name, side_effect=value).start()
+            mocked = patch("kvpark.updates." + name, side_effect=value).start()
             self.addCleanup(patch.stopall)
             self.mocks[name] = mocked
         process = MagicMock()
-        process.cmdline.return_value = [sys.executable, "-m", "sloth_memory", "serve"]
+        process.cmdline.return_value = [sys.executable, "-m", "kvpark", "serve"]
         process.environ.return_value = {}
-        self.process = patch("sloth_memory.updates.psutil.Process", return_value=process).start()
+        self.process = patch("kvpark.updates.psutil.Process", return_value=process).start()
 
     def request(self, url, action, *args, **kwargs):
         self.events.append(action)

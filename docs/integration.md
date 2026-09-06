@@ -1,6 +1,6 @@
 # Agent integration contract
 
-sloth-memory owns inference state. Your agent owns the transcript and session
+kvpark owns inference state. Your agent owns the transcript and session
 lifecycle. No Hermes imports or model-provider dependency exists in the core.
 
 ## Request identity
@@ -37,20 +37,21 @@ including draining disconnected clients, before another request may claim the sl
 
 ## Controls
 
-`GET /_sloth/status` returns resident identity, archives, global activity, and recent
-events. `GET /_sloth/doctor` checks runtime identity and backend slot topology when
-idle. `POST /_sloth/park` and `POST /_sloth/forget` take:
+`GET /_kvpark/status` returns resident identity, archives, global activity, and recent
+events. `GET /_kvpark/doctor` checks runtime identity and backend slot topology when
+idle. `POST /_kvpark/save` and `POST /_kvpark/forget` take:
 
 ```json
 {"key": "k-<SHA-256 of the UTF-8 slot_archive_key>"}
 ```
 
-The CLI hashes `--session` for you. Parking is a native command/action; it should
+The CLI hashes `--session` for you: `kvpark save --session …` saves and
+`kvpark forget --session …` removes that archive. Parking is a native command/action; it should
 not require an LLM turn that could displace the state you wanted to save.
 Resume is automatic on the next matching inference request. There is no manual
 restore action that reconstructs a transcript.
 
-An internal `POST /_sloth/simulate-gap` control also saves and erases a resident
+An internal `POST /_kvpark/simulate-gap` control also saves and erases a resident
 slot for diagnostics. It does not prove a process-restart or physical SSD test.
 
 Control failures return HTTP 409 with a reason. Archive failures during inference
@@ -73,19 +74,19 @@ separate measurements.
 ## Authentication
 
 The alpha binds only to `127.0.0.1` and rejects browser Origin requests. For an
-additional local access boundary, set `SLOTH_API_KEY` on the proxy and CLI/client;
+additional local access boundary, set `KVPARK_API_KEY` on the proxy and CLI/client;
 all endpoints then require that bearer token. If the backend requires a key, set
-`SLOTH_UPSTREAM_KEY_FILE` to a private local file in the proxy environment and pass
+`KVPARK_UPSTREAM_KEY_FILE` to a private local file in the proxy environment and pass
 the corresponding upstream authentication option when launching the backend.
 Never publish keys, transcript files, or archive directories.
 
 ## Cleanup settings API
 
-`GET /_sloth/settings` reads `ttl_days`, `max_gib`, and `cleanup_enabled`.
-`POST /_sloth/settings` atomically persists any subset of those settings.
-`POST /_sloth/cleanup` runs a manual sweep with the saved age/budget rules.
+`GET /_kvpark/settings` reads `ttl_days`, `max_gib`, and `cleanup_enabled`.
+`POST /_kvpark/settings` atomically persists any subset of those settings.
+`POST /_kvpark/cleanup` runs a manual sweep with the saved age/budget rules.
 Unknown keys, invalid booleans, negative ages, and nonpositive budgets are refused.
-Status includes the running package `version`, `maintenance`, `service: "sloth-memory"` and `control_version: 4` for adapters.
+Status includes the running package `version`, `maintenance`, `service: "kvpark"` and `control_version: 4` for adapters.
 
 ## Hermes
 
@@ -93,4 +94,6 @@ The native adapter now ships as a `hermes_agent.plugins` entry point. Follow the
 [Hermes guide](hermes.md) for launch-on-load, slash-command setup, parking,
 deletion, and persistent cleanup controls. It does not edit Hermes internals.
 Legacy `/qwen-slot` plugins use `/__slot_proxy/` and `SLOT_PROXY_*`; this package
-uses `/_sloth/` and `SLOTH_*`.
+uses `/_kvpark/` and `KVPARK_*`. The former sloth-memory package used `/_sloth/`;
+its migration is documented in [updates](updates.md#migrate-from-sloth-memory).
+The request identity fields and Hermes profile namespace remain unchanged by the rename.

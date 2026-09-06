@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0a1 — kvpark rename and migration
+
+- Rename the repository, Python distribution/module, CLI, and Hermes plugin to `kvpark`.
+- Use `kvpark save / status / forget` and `/kvpark save / status / forget`; retain `park` as a compatibility alias and Hermes’ `delete` alias.
+- Use `KVPARK_*` configuration names and `kvpark` default data directories for new installations; accept legacy `SLOTH_*` environment settings during migration.
+- Add `python -m kvpark migrate --hermes` previews and `--confirm` application for existing sloth-memory profiles.
+- Preserve the original archive directory, snapshot format, backend process, model configuration, and Hermes route backups; drain and stop only the verified legacy proxy.
+- Disable the old plugin and enable kvpark. Migration requires stopped clients; restart Hermes afterward to launch and verify the new proxy before removing the old package.
+
+Releases below were published under the former **sloth-memory** name. Their command names and validation scope are historical.
+
 ## 0.2.0a2 — uninstall and route recovery
 
 - Add `/sloth uninstall` previews and `/sloth uninstall confirm`, with terminal equivalents for Hermes and standalone services.

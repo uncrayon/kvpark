@@ -1,6 +1,6 @@
 """Exercise real pip upgrade/rollback in a disposable venv with a local HTTP backend.
 
-Usage: python scripts/test_update_release.py dist/sloth_memory-0.2.0a1-py3-none-any.whl
+Usage: python scripts/test_update_release.py dist/kvpark-0.2.0a1-py3-none-any.whl
 Requires the build environment to have psutil and packaging installed. No network.
 """
 
@@ -29,15 +29,15 @@ def variant(original, destination, version, *, broken=False):
     rows = []
     with zipfile.ZipFile(original) as source, zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as wheel:
         old = next(n.split("/")[0] for n in source.namelist() if n.endswith(".dist-info/METADATA"))
-        old_version = old[len("sloth_memory-"):-len(".dist-info")]
-        new = f"sloth_memory-{version}.dist-info"
+        old_version = old[len("kvpark-"):-len(".dist-info")]
+        new = f"kvpark-{version}.dist-info"
         for name in source.namelist():
             if name.endswith("/RECORD"):
                 continue
             data = source.read(name)
-            if name.endswith("/METADATA") or name == "sloth_memory/__init__.py":
+            if name.endswith("/METADATA") or name == "kvpark/__init__.py":
                 data = data.replace(old_version.encode(), version.encode())
-            if broken and name == "sloth_memory/__main__.py":
+            if broken and name == "kvpark/__main__.py":
                 data = b'import sys\nif "serve" in sys.argv: raise SystemExit(42)\n' + data
             name = name.replace(old, new)
             wheel.writestr(name, data)
@@ -64,16 +64,16 @@ class Backend(BaseHTTPRequestHandler):
 def main():
     wheel = Path(sys.argv[1]).resolve()
     if wheel.is_dir():
-        wheel, = wheel.glob("sloth_memory-*-py3-none-any.whl")
+        wheel, = wheel.glob("kvpark-*-py3-none-any.whl")
     current = wheel.name.split("-")[1]
     parsed = Version(current)
     future = f"{parsed.major}.{parsed.minor}.{parsed.micro + 1}a1"
-    with tempfile.TemporaryDirectory(prefix="sloth-update-test-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="kvpark-update-test-") as tmp:
         root = Path(tmp)
         venv.EnvBuilder(with_pip=True).create(root / "venv")
         python = root / "venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-        baseline = root / "sloth_memory-0.0.0-py3-none-any.whl"
-        broken = root / f"sloth_memory-{future}-py3-none-any.whl"
+        baseline = root / "kvpark-0.0.0-py3-none-any.whl"
+        broken = root / f"kvpark-{future}-py3-none-any.whl"
         variant(wheel, baseline, "0.0.0")
         variant(wheel, broken, future, broken=True)
         subprocess.run([str(python), "-m", "pip", "install", "--no-index", "--no-deps", str(baseline)], check=True,
@@ -88,7 +88,7 @@ def main():
         process = None
         try:
             with (root / "proxy.log").open("ab") as log:
-                process = subprocess.Popen([str(python), "-I", "-m", "sloth_memory", "serve", "--archive-dir", str(archive),
+                process = subprocess.Popen([str(python), "-I", "-m", "kvpark", "serve", "--archive-dir", str(archive),
                     "--port", "18081", "--backend", "ollama", "--cache-mode", "routing",
                     "--upstream-url", f"http://127.0.0.1:{backend.server_port}"], stdout=log, stderr=log)
             for _ in range(100):
@@ -102,7 +102,7 @@ def main():
             harness.write_text('''import hashlib, json, sys
 from pathlib import Path
 from unittest.mock import patch
-from sloth_memory import releases, updates
+from kvpark import releases, updates
 wheel, archive, version, expected = sys.argv[1:]
 wheel = Path(wheel)
 release = dict(version=version, url="unused", name=wheel.name, sha256=hashlib.sha256(wheel.read_bytes()).hexdigest())
@@ -117,12 +117,12 @@ print(json.dumps({"state":result["state"], "version":result["version"]}))
 ''')
             for candidate, version, expected in ((wheel, current, "complete"), (broken, future, "rolled_back")):
                 subprocess.run([str(python), "-I", str(harness), str(candidate), str(archive), version, expected], check=True)
-                actual = subprocess.check_output([str(python), "-I", "-m", "sloth_memory", "--version"], text=True).strip()
+                actual = subprocess.check_output([str(python), "-I", "-m", "kvpark", "--version"], text=True).strip()
                 assert actual == current, actual
                 record = json.loads((archive / "proxy.json").read_text())
                 assert record["base_url"] == original["base_url"]
                 assert record["upstream_url"] == original["upstream_url"]
-                subprocess.run([str(python), "-I", "-m", "sloth_memory", "doctor", "--archive-dir", str(archive)],
+                subprocess.run([str(python), "-I", "-m", "kvpark", "doctor", "--archive-dir", str(archive)],
                                stdout=subprocess.DEVNULL, check=True)
             print("PASS: real package upgrade, failed-start rollback, stable proxy route, backend retained")
         finally:

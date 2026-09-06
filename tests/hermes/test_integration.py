@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from sloth_memory import proxy
+from kvpark import proxy
 
 
 class HermesIntegrationTests(unittest.TestCase):
@@ -37,20 +37,20 @@ class HermesIntegrationTests(unittest.TestCase):
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
         self.url = f"http://127.0.0.1:{self.server.server_port}"
-        (self.home / "config.yaml").write_text(json.dumps({"plugins": {"enabled": ["sloth-memory"],
-            "entries": {"sloth-memory": {"settings": {"service": {"autostart": False, "external": True, "base_url": self.url}}}}},
+        (self.home / "config.yaml").write_text(json.dumps({"plugins": {"enabled": ["kvpark"],
+            "entries": {"kvpark": {"settings": {"service": {"autostart": False, "external": True, "base_url": self.url}}}}},
             "agent": {"max_turns": 12}, "model": {"provider": "custom", "default": "old", "base_url": self.url + "/v1"}}))
         from hermes_cli.plugins import get_plugin_manager, get_plugin_command_handler
         self.manager = get_plugin_manager()
         self.manager.discover_and_load()
         self.addCleanup(self.manager.unload)
-        self.command = get_plugin_command_handler("sloth-memory")
+        self.command = get_plugin_command_handler("kvpark")
         self.assertIsNotNone(self.command, "installed entry point did not register the slash command")
 
     def command_text(self, text):
         return asyncio.run(self.command(text))
 
-    async def gateway_command(self, text, thread="discord:acceptance", *, platform="discord", command="sloth-memory"):
+    async def gateway_command(self, text, thread="discord:acceptance", *, platform="discord", command="kvpark"):
         from unittest.mock import AsyncMock
         from gateway.run_inbound import GatewayInboundMixin
         from gateway.session import SessionSource
@@ -83,8 +83,8 @@ class HermesIntegrationTests(unittest.TestCase):
         self.archive.current_thread = adapter.namespace + "telegram:acceptance"
         self.archive.publish_status()
         with patch.object(self.archive, "park", return_value={"tokens": 456, "note": "Saved."}) as park:
-            result = asyncio.run(self.gateway_command("park", "telegram:acceptance",
-                                                      platform="telegram", command="sloth"))
+            result = asyncio.run(self.gateway_command("save", "telegram:acceptance",
+                                                      platform="telegram", command="kvpark"))
         self.assertIn("Parked 456 tokens", result)
         self.assertEqual(park.call_args.kwargs["key"], adapter.key("telegram-session"))
 
@@ -92,47 +92,47 @@ class HermesIntegrationTests(unittest.TestCase):
         from hermes_cli.config import save_config
         from hermes_cli.commands_platforms import telegram_menu_commands
         save_config({"platforms": {"telegram": {"extra": {"command_menu": {
-            "priority": ["sloth"], "priority_mode": "prepend"}}}}}, merge_existing=True)
+            "priority": ["kvpark"], "priority_mode": "prepend"}}}}}, merge_existing=True)
         menu, _ = telegram_menu_commands(max_commands=5)
-        self.assertIn("sloth", [name for name, _ in menu])
-        self.assertEqual(sum(name == "sloth" for name, _ in menu), 1)
+        self.assertIn("kvpark", [name for name, _ in menu])
+        self.assertEqual(sum(name == "kvpark" for name, _ in menu), 1)
 
     def test_update_check_dispatches_without_installing_or_restarting(self):
-        from sloth_memory import updates
+        from kvpark import updates
         result = dict(installed="0.2.0a1", loaded="0.2.0a1", proxy="0.2.0a1", latest="0.2.0a2", available=True)
         with patch.object(updates, "check", return_value=result), patch.object(updates, "apply") as install:
-            text = asyncio.run(self.gateway_command("update check", platform="telegram", command="sloth"))
+            text = asyncio.run(self.gateway_command("update check", platform="telegram", command="kvpark"))
         self.assertIn("Available: 0.2.0a2", text)
         install.assert_not_called()
 
     def test_uninstall_restores_route_disables_plugin_and_does_not_restart_it(self):
         from hermes_cli.config import read_user_config_raw, save_config
         adapter = self.command.__self__
-        # The original server occupied Sloth's preferred port, forcing fallback.
+        # The original server occupied kvpark's preferred port, forcing fallback.
         original = dict(provider="custom", default="gemma", base_url="http://127.0.0.1:8080/v1", context_length=12345)
         adapter.ctx.set_config("service", {**adapter.settings(), "previous_urls": ["http://127.0.0.1:8080"]})
         save_config({"model": original}, merge_existing=True)
         self.command_text("connect")
         self.command_text("connect")  # Reconnect must not overwrite the original route.
         before = read_user_config_raw()
-        preview = asyncio.run(self.gateway_command("uninstall", command="sloth", platform="telegram"))
+        preview = asyncio.run(self.gateway_command("uninstall", command="kvpark", platform="telegram"))
         self.assertIn("no changes", preview)
         self.assertEqual(before, read_user_config_raw())
-        result = asyncio.run(self.gateway_command("uninstall confirm", command="sloth", platform="telegram"))
-        self.assertIn("Sloth disconnected", result)
+        result = asyncio.run(self.gateway_command("uninstall confirm", command="kvpark", platform="telegram"))
+        self.assertIn("kvpark disconnected", result)
         current = read_user_config_raw()
         self.assertEqual(current["model"], original)
         self.assertEqual(current["agent"]["max_turns"], 12)
-        self.assertIn("sloth-memory", current["plugins"]["disabled"])
-        self.assertNotIn("sloth-memory", current["plugins"]["enabled"])
+        self.assertIn("kvpark", current["plugins"]["disabled"])
+        self.assertNotIn("kvpark", current["plugins"]["enabled"])
         self.assertTrue(adapter.service.closed.is_set())
         self.assertIsNone(adapter.middleware(request={}, base_url=self.url + "/v1", api_mode="chat_completions"))
-        self.assertIn("Sloth is disconnected", self.command_text("status"))
-        self.assertIn("Sloth disconnected", self.command_text("uninstall confirm"))
+        self.assertIn("kvpark is disconnected", self.command_text("status"))
+        self.assertIn("kvpark disconnected", self.command_text("uninstall confirm"))
         self.manager.unload()
         self.manager.discover_and_load(force=True)
         from hermes_cli.plugins import get_plugin_command_handler
-        self.assertIsNone(get_plugin_command_handler("sloth"))
+        self.assertIsNone(get_plugin_command_handler("kvpark"))
 
     def test_uninstall_without_route_backup_does_not_change_profile(self):
         from hermes_cli.config import read_user_config_raw
@@ -141,11 +141,58 @@ class HermesIntegrationTests(unittest.TestCase):
         self.assertIn("no original model-route backup", result)
         self.assertEqual(before, read_user_config_raw())
 
+    def test_legacy_profile_migration_keeps_model_route_and_archive(self):
+        from hermes_cli.config import read_user_config_raw, save_config
+        from kvpark.migration import run
+        raw = read_user_config_raw()
+        old = raw["plugins"]["entries"].pop("kvpark")
+        old["settings"]["service"].update(external=False, archive_dir=str(self.home / "legacy-archive"))
+        old["settings"]["route_backup"] = {"provider": "custom", "base_url": "http://127.0.0.1:9999/v1"}
+        raw["plugins"]["entries"]["sloth-memory"] = old
+        raw["plugins"]["enabled"] = ["sloth-memory"]
+        save_config(raw)
+        before = read_user_config_raw()
+        self.assertIn("no changes", run(hermes=True))
+        self.assertEqual(read_user_config_raw(), before)
+        self.assertIn("Migration prepared", run(hermes=True, confirm=True))
+        after = read_user_config_raw()
+        self.assertEqual(after["model"], before["model"])
+        settings = after["plugins"]["entries"]["kvpark"]["settings"]
+        self.assertEqual(settings["service"]["archive_dir"], str((self.home / "legacy-archive").resolve()))
+        self.assertEqual(settings["route_backup"], old["settings"]["route_backup"])
+        self.assertIn("already migrated", run(hermes=True, confirm=True))
+        backup, = self.home.glob("config.before-kvpark-*.json")
+        self.assertEqual(json.loads(backup.read_text()), before)
+        if os.name != "nt":
+            self.assertEqual(backup.stat().st_mode & 0o777, 0o600)
+
+    def test_failed_legacy_proxy_stop_restores_profile_and_reopens_gate(self):
+        from hermes_cli.config import read_user_config_raw, save_config
+        from kvpark import migration
+        raw = read_user_config_raw()
+        old = raw["plugins"]["entries"].pop("kvpark")
+        archive = str(self.home / "legacy-archive")
+        old["settings"]["service"].update(external=False, archive_dir=archive)
+        raw["plugins"]["entries"]["sloth-memory"] = old
+        raw["plugins"]["enabled"] = ["sloth-memory"]
+        save_config(raw)
+        before = read_user_config_raw()
+        record = dict(pid=123, base_url=self.url)
+        status = dict(service="sloth-memory", control_version=4, archive_dir=archive)
+        with patch.object(migration, "owned_process", return_value=record), \
+                patch.object(migration, "request", side_effect=[status, {"ok": True}, {"ok": True}]) as request, \
+                patch.object(migration, "stop_proxy", side_effect=RuntimeError("stop failed")), \
+                patch.object(migration, "process_matches", return_value=True):
+            with self.assertRaisesRegex(RuntimeError, "stop failed"):
+                migration.run(hermes=True, confirm=True)
+            self.assertEqual(request.call_args.args[1], "cancel-update")
+            self.assertEqual(read_user_config_raw(), before)
+
     def test_uninstall_respects_managed_plugin_leaf_settings(self):
         from hermes_cli.config import read_user_config_raw
         before = read_user_config_raw()
-        for key in ("plugins.entries.sloth-memory.settings.service.autostart",
-                    "plugins.entries.sloth-memory.settings.route_backup.base_url"):
+        for key in ("plugins.entries.kvpark.settings.service.autostart",
+                    "plugins.entries.kvpark.settings.route_backup.base_url"):
             with patch("hermes_cli.managed_scope.managed_config_keys", return_value={key}):
                 result = self.command_text("uninstall confirm")
                 self.assertIn("managed by your administrator", result)
@@ -154,13 +201,13 @@ class HermesIntegrationTests(unittest.TestCase):
     def test_successful_update_requests_native_gateway_restart_after_reply(self):
         from unittest.mock import Mock
         from hermes_cli.lifecycle import invoke_hook
-        from sloth_memory import updates
+        from kvpark import updates
         gateway = Mock()
         invoke_hook("pre_gateway_dispatch", gateway=gateway)
         async def command():
             loop = asyncio.get_running_loop()
             with patch.object(loop, "call_later", wraps=loop.call_later) as later:
-                result = await self.gateway_command("update", command="sloth")
+                result = await self.gateway_command("update", command="kvpark")
                 self.assertIn("restart shortly", result)
                 gateway.request_restart.assert_not_called()
                 callback = next(call.args[1] for call in later.call_args_list if call.args[0] == 2)
@@ -168,14 +215,14 @@ class HermesIntegrationTests(unittest.TestCase):
                 gateway.request_restart.assert_called_once_with(detached=False, via_service=True)
         with patch.object(updates, "apply", return_value=dict(version="0.2.0a2", note="Updated.")), \
                 patch("importlib.metadata.version", return_value="0.2.0a2"), \
-                patch("sloth_memory.__version__", "0.2.0a1"), \
+                patch("kvpark.__version__", "0.2.0a1"), \
                 patch("gateway.restart.is_gateway_supervisor_process", return_value=True):
             asyncio.run(command())
 
     def test_failed_update_never_requests_gateway_restart(self):
         from unittest.mock import Mock
         from hermes_cli.lifecycle import invoke_hook
-        from sloth_memory import updates
+        from kvpark import updates
         gateway = Mock()
         invoke_hook("pre_gateway_dispatch", gateway=gateway)
         with patch.object(updates, "apply", side_effect=RuntimeError("rolled_back")):
@@ -185,7 +232,7 @@ class HermesIntegrationTests(unittest.TestCase):
 
     def test_discord_park_before_first_turn_explains_how_to_load_state(self):
         with patch.object(self.archive, "park") as park:
-            result = asyncio.run(self.gateway_command("park"))
+            result = asyncio.run(self.gateway_command("save"))
         self.assertIn("Send a normal message", result)
         park.assert_not_called()
 
@@ -196,7 +243,7 @@ class HermesIntegrationTests(unittest.TestCase):
         self.archive.publish_status()
         with patch.dict(os.environ, {"HERMES_SESSION_ID": "unrelated-process-session"}):
             with patch.object(self.archive, "park", return_value={"tokens": 123, "note": "Saved."}) as park:
-                result = asyncio.run(self.gateway_command("park"))
+                result = asyncio.run(self.gateway_command("save"))
         self.assertIn("Parked 123 tokens", result)
         self.assertEqual(park.call_args.kwargs["key"], adapter.key("discord-session"))
 
@@ -206,7 +253,7 @@ class HermesIntegrationTests(unittest.TestCase):
         self.archive.current_thread = adapter.namespace + "discord:someone-else"
         self.archive.publish_status()
         with patch.object(self.archive, "park") as park:
-            result = asyncio.run(self.gateway_command("park"))
+            result = asyncio.run(self.gateway_command("save"))
         self.assertIn("Send a normal message", result)
         park.assert_not_called()
 
@@ -264,7 +311,7 @@ class HermesIntegrationTests(unittest.TestCase):
 
     def test_autostart_setting_persists_and_discovery_invokes_startup(self):
         self.command_text("autostart off")
-        from sloth_memory.hermes_service import Service
+        from kvpark.hermes_service import Service
         with patch.object(Service, "start_async") as start:
             self.command_text("autostart on")
             start.assert_called_once()
@@ -313,18 +360,18 @@ class HermesIntegrationTests(unittest.TestCase):
         self.assertEqual(adapter.settings()["upstream_url"], "")
 
 
-@unittest.skipUnless(os.environ.get("SLOTH_TEST_SERVER") and os.environ.get("SLOTH_TEST_MODEL"), "optional real-model startup test")
+@unittest.skipUnless(os.environ.get("KVPARK_TEST_SERVER") and os.environ.get("KVPARK_TEST_MODEL"), "optional real-model startup test")
 class RealStartupTests(unittest.TestCase):
     def test_hermes_discovery_launches_services_and_native_park_delete_work(self):
-        from sloth_memory.hermes_service import Service
-        from sloth_memory.cli import request
+        from kvpark.hermes_service import Service
+        from kvpark.cli import request
         from hermes_cli.plugins import get_plugin_manager, get_plugin_command_handler
         from hermes_cli.middleware import apply_llm_request_middleware
         from agent.subagent_lifecycle import bind_subagent_parent
         from gateway.session_context import set_session_vars, clear_session_vars
         from openai import OpenAI
 
-        with tempfile.TemporaryDirectory(prefix="sloth-hermes-real-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="kvpark-hermes-real-") as tmp:
             home = Path(tmp)
             occupied = []
             for _ in range(2):
@@ -336,12 +383,12 @@ class RealStartupTests(unittest.TestCase):
             port, upstream = (sock.getsockname()[1] for sock in occupied)
             url = f"http://127.0.0.1:{port}"
             config = dict(autostart=True, base_url=url, upstream_port=upstream, archive_dir=str(home / "archive"),
-                          server=os.environ["SLOTH_TEST_SERVER"], model=os.environ["SLOTH_TEST_MODEL"],
+                          server=os.environ["KVPARK_TEST_SERVER"], model=os.environ["KVPARK_TEST_MODEL"],
                           backend_args=["--device", "none", "--n-gpu-layers", "0", "--ctx-size", "2048",
                                         "--threads", "4", "--threads-batch", "4", "--cache-ram", "0",
                                         "--ctx-checkpoints", "8", "--checkpoint-min-step", "128", "--jinja"])
-            (home / "config.yaml").write_text(json.dumps({"plugins": {"enabled": ["sloth-memory"],
-                "entries": {"sloth-memory": {"settings": {"service": config}}}}}))
+            (home / "config.yaml").write_text(json.dumps({"plugins": {"enabled": ["kvpark"],
+                "entries": {"kvpark": {"settings": {"service": config}}}}}))
             children = []
             spawn = Service._spawn
             def tracked_spawn(*args):
@@ -352,12 +399,12 @@ class RealStartupTests(unittest.TestCase):
                 manager = get_plugin_manager()
                 try:
                     manager.discover_and_load()
-                    command = get_plugin_command_handler("sloth-memory")
+                    command = get_plugin_command_handler("kvpark")
                     # No explicit start command: discovery itself must launch.
                     deadline = time.monotonic() + 120
                     while time.monotonic() < deadline:
                         try:
-                            from sloth_memory.network import proxy_record
+                            from kvpark.network import proxy_record
                             record = proxy_record(home / "archive")
                             if record:
                                 url = record["base_url"]
@@ -385,7 +432,7 @@ class RealStartupTests(unittest.TestCase):
                         with OpenAI(base_url=url + "/v1", api_key="local", timeout=120) as client:
                             response = client.chat.completions.create(**payload)
                         self.assertTrue(response.choices[0].message.content)
-                        self.assertIn("Parked", asyncio.run(command("park")))
+                        self.assertIn("Parked", asyncio.run(command("save")))
                         self.assertEqual(request(url, "status")["archived"], 1)
                         self.assertIn("Deleted saved snapshot", asyncio.run(command("delete")))
                         self.assertEqual(request(url, "status")["archived"], 0)
@@ -394,7 +441,7 @@ class RealStartupTests(unittest.TestCase):
                     manager.unload()
                     self.assertTrue(all(child.poll() is None for child in children), "cleanup services must survive closing Hermes")
                     manager.discover_and_load(force=True)
-                    get_plugin_command_handler("sloth-memory").__self__.service.worker.join(10)
+                    get_plugin_command_handler("kvpark").__self__.service.worker.join(10)
                     self.assertEqual(len(children), 2, "reload started duplicate services")
                 finally:
                     manager.unload()

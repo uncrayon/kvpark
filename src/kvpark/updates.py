@@ -1,4 +1,4 @@
-"""Replace only sloth-memory, retaining a local wheel for rollback and the model process."""
+"""Replace only kvpark, retaining a local wheel for rollback and the model process."""
 
 import base64
 import csv
@@ -54,7 +54,7 @@ def write_json(path, value):
 
 
 def check(archive, *, url=None):
-    installed = metadata.version("sloth-memory")
+    installed = metadata.version("kvpark")
     record = proxy_record(Path(archive))
     address = url or (record["base_url"] if record else None)
     try:
@@ -81,17 +81,17 @@ def check(archive, *, url=None):
 
 def rollback_wheel(destination):
     """Repackage the installed distribution, including local patches, before pip replaces it."""
-    dist = metadata.distribution("sloth-memory")
+    dist = metadata.distribution("kvpark")
     direct = json.loads(dist.read_text("direct_url.json") or "{}")
     if direct.get("dir_info", {}).get("editable"):
         raise ValueError("editable installations must be updated from their source checkout")
-    name = f"sloth_memory-{dist.version}"
+    name = f"kvpark-{dist.version}"
     path = destination / f"{name}-py3-none-any.whl"
     rows = []
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as wheel:
         for file in dist.files or []:
             relative = file.as_posix()
-            if not relative.startswith(("sloth_memory/", name + ".dist-info/")):
+            if not relative.startswith(("kvpark/", name + ".dist-info/")):
                 continue
             if "__pycache__" in relative or file.name in {"RECORD", "direct_url.json", "INSTALLER", "REQUESTED"}:
                 continue
@@ -99,7 +99,7 @@ def rollback_wheel(destination):
             wheel.writestr(relative, data)
             digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
             rows.append((relative, "sha256=" + digest, str(len(data))))
-        if not any(row[0] == "sloth_memory/__init__.py" for row in rows):
+        if not any(row[0] == "kvpark/__init__.py" for row in rows):
             raise ValueError("cannot back up this installation; use its original package manager")
         record = name + ".dist-info/RECORD"
         output = io.StringIO(newline="")
@@ -136,11 +136,11 @@ def stop_proxy(record):
 
 def start_proxy(record, archive, env, version):
     launch_token = uuid.uuid4().hex
-    argv = [sys.executable, "-I", "-m", "sloth_memory", "serve", "--archive-dir", str(archive),
+    argv = [sys.executable, "-I", "-m", "kvpark", "serve", "--archive-dir", str(archive),
             "--port", record["base_url"].rsplit(":", 1)[1], "--backend", record["backend"],
             "--cache-mode", record["cache_mode"], "--upstream-url", record["upstream_url"]]
     with (archive / "hermes-proxy.log").open("ab") as log:
-        child = subprocess.Popen(argv, env={**env, "SLOTH_UPDATE_START": "1", "SLOTH_LAUNCH_TOKEN": launch_token}, stdin=subprocess.DEVNULL, stdout=log,
+        child = subprocess.Popen(argv, env={**env, "KVPARK_UPDATE_START": "1", "KVPARK_LAUNCH_TOKEN": launch_token}, stdin=subprocess.DEVNULL, stdout=log,
                                  stderr=subprocess.STDOUT, **detached_options())
     try:
         for _ in range(100):
@@ -182,13 +182,13 @@ def start_proxy(record, archive, env, version):
 def apply(archive, *, hermes_home=None, external=False):
     if external:
         raise ValueError("this proxy is externally managed; update it through its service owner")
-    if os.name == "nt" and sys.argv[0].lower().endswith("sloth-memory.exe"):
-        raise ValueError("on Windows use python -m sloth_memory update so the console launcher can be replaced")
+    if os.name == "nt" and sys.argv[0].lower().endswith("kvpark.exe"):
+        raise ValueError("on Windows use python -m kvpark update so the console launcher can be replaced")
     archive = Path(archive)
     archive.mkdir(parents=True, exist_ok=True, mode=0o700)
     # One package environment can serve several profiles. Refuse concurrent
     # installs even when those profiles use different archive directories.
-    fd = lock_file(Path(sys.prefix) / ".sloth-memory-update.lock")
+    fd = lock_file(Path(sys.prefix) / ".kvpark-update.lock")
     try:
         return _apply(archive, hermes_home)
     finally:
@@ -196,7 +196,7 @@ def apply(archive, *, hermes_home=None, external=False):
 
 
 def _apply(archive, hermes_home):
-    installed = metadata.version("sloth-memory")
+    installed = metadata.version("kvpark")
     release = releases.latest(installed)
     newer = release and Version(release["version"]) > Version(installed)
     existing = proxy_record(archive)
@@ -226,7 +226,7 @@ def _apply(archive, hermes_home):
                     raise RuntimeError("the running proxy predates coordinated updates; follow the one-time upgrade in docs/updates.md")
                 process = psutil.Process(record["pid"])
                 argv = process.cmdline()
-                if not process_matches(record) or argv[1:4] != ["-m", "sloth_memory", "serve"] and argv[1:5] != ["-I", "-m", "sloth_memory", "serve"]:
+                if not process_matches(record) or argv[1:4] != ["-m", "kvpark", "serve"] and argv[1:5] != ["-I", "-m", "kvpark", "serve"]:
                     raise RuntimeError("proxy ownership could not be verified")
                 if not same_python_environment(argv[0], record.get("python_prefix")):
                     raise RuntimeError("proxy uses a different Python environment; update it separately")
@@ -240,7 +240,7 @@ def _apply(archive, hermes_home):
             if wheel:
                 changed = True  # A failed pip call can already have uninstalled files.
                 install(wheel, stage / "install.log")
-            version = subprocess.check_output([sys.executable, "-I", "-m", "sloth_memory", "--version"],
+            version = subprocess.check_output([sys.executable, "-I", "-m", "kvpark", "--version"],
                                               text=True, timeout=15).strip()
             if version != target_version:
                 raise RuntimeError("installed package failed its version check")

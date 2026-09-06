@@ -1,7 +1,7 @@
 # Security and deployment scope
 
-This alpha is for a trusted user on one Linux machine. It binds to localhost,
-rejects browser Origin requests, and optionally requires `SLOTH_API_KEY` for all
+This alpha is for a trusted user on one Linux, macOS, or Windows machine. It binds to localhost,
+rejects browser Origin requests, and optionally requires `KVPARK_API_KEY` for all
 proxy endpoints. It is not a multi-user inference gateway. Do not expose its ports
 through a tunnel or public reverse proxy as a shared service.
 

@@ -29,12 +29,12 @@ def main():
     if args.output.exists():
         parser.error("output exists; choose a fresh evidence filename")
     children, logs = [], []
-    with tempfile.TemporaryDirectory(prefix="sloth-acceptance-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="kvpark-acceptance-") as tmp:
         root = Path(tmp)
         proxy_port, backend_port = free_port(), free_port()
         while proxy_port == backend_port:
             backend_port = free_port()
-        env = {k: v for k, v in os.environ.items() if not k.startswith(("SLOTH_", "LLAMA_ARG_"))}
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("KVPARK_", "LLAMA_ARG_"))}
         env.update(HIP_VISIBLE_DEVICES="", ROCR_VISIBLE_DEVICES="", CUDA_VISIBLE_DEVICES="")
 
         def call(port, path, body=None):
@@ -46,7 +46,7 @@ def main():
         def spawn(argv, name):
             log = (root / name).open("w")
             logs.append(log)
-            process = subprocess.Popen([sys.executable, "-m", "sloth_memory", *argv],
+            process = subprocess.Popen([sys.executable, "-m", "kvpark", *argv],
                                        stdout=log, stderr=subprocess.STDOUT, env=env)
             children.append(process)
             return process
@@ -67,7 +67,7 @@ def main():
 
         def start():
             nonlocal backend_port, proxy_port
-            from sloth_memory.network import managed_port, proxy_record
+            from kvpark.network import managed_port, proxy_record
             backend = spawn(["backend", "--server", str(args.server), "--model", str(args.model),
                              "--archive-dir", str(root / "archive"), "--port", str(backend_port), "--",
                              "--device", "none", "--n-gpu-layers", "0", "--ctx-size", "4096",
@@ -79,8 +79,8 @@ def main():
             def bound_port():
                 record = proxy_record(root / "archive")
                 return int(record["base_url"].rsplit(":", 1)[1]) if record else None
-            proxy_port = ready(proxy, bound_port, "/_sloth/status", "proxy.log")
-            if not call(proxy_port, "/_sloth/doctor")["ok"]:
+            proxy_port = ready(proxy, bound_port, "/_kvpark/status", "proxy.log")
+            if not call(proxy_port, "/_kvpark/doctor")["ok"]:
                 raise RuntimeError("runtime diagnostics failed")
 
         def stop():
@@ -104,7 +104,7 @@ def main():
                 temperature=0, seed=42, reasoning_effort="none"))
             # HTTP EOF can precede the proxy's final bookkeeping by a few ms.
             for _ in range(100):
-                status = call(proxy_port, "/_sloth/status")
+                status = call(proxy_port, "/_kvpark/status")
                 if status["activity"]["phase"] == "idle":
                     break
                 time.sleep(.01)
@@ -123,8 +123,8 @@ def main():
             cold = completion(messages)
             if cold["cached_tokens"] != 0:
                 raise RuntimeError("cold baseline unexpectedly reused tokens")
-            status = call(proxy_port, "/_sloth/status")
-            parked = call(proxy_port, "/_sloth/park", {"key": status["resident_key"]})
+            status = call(proxy_port, "/_kvpark/status")
+            parked = call(proxy_port, "/_kvpark/park", {"key": status["resident_key"]})
             continued = messages + [cold["message"], dict(role="user", content="What is the project code? Reply with the code only.")]
             warm = completion(continued)
             print("Restarting both processes with RAM prompt cache disabled.", flush=True)
@@ -132,7 +132,7 @@ def main():
             start()
             replay = completion(messages)
             restored = completion(continued)
-            status = call(proxy_port, "/_sloth/status")
+            status = call(proxy_port, "/_kvpark/status")
             checks = dict(disk_restore=any(e["action"] == "restored" for e in status["recent"]),
                           replay_reused_majority=(replay["cached_tokens"] or 0) > (replay["processed_tokens"] or 0),
                           continuation_reused_majority=(restored["cached_tokens"] or 0) > (restored["processed_tokens"] or 0),

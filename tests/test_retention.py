@@ -6,7 +6,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from sloth_memory import proxy
+from kvpark import proxy
 
 
 class RetentionTests(unittest.TestCase):
@@ -71,7 +71,7 @@ class RetentionTests(unittest.TestCase):
             path.write_bytes(b"orphan")
             os.utime(path, (time.time()-8*86400,)*2)
         keep = self.root / "notes.bin"
-        keep.write_text("not a sloth snapshot")
+        keep.write_text("not a kvpark snapshot")
         os.utime(keep, (time.time()-20*86400,)*2)
         link = self.root / (proxy.key_for("link") + "." + "c" * 32 + ".bin")
         link.symlink_to(keep)

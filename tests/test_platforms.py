@@ -8,17 +8,17 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from sloth_memory.platforms import available_port, process_identity, process_matches
-from sloth_memory.network import bind_server
-from sloth_memory.proxy import Handler, atomic_json
-from sloth_memory.runtime import lock_directory
+from kvpark.platforms import available_port, process_identity, process_matches
+from kvpark.network import bind_server
+from kvpark.proxy import Handler, atomic_json
+from kvpark.runtime import lock_directory
 
 
 class PlatformTests(unittest.TestCase):
     def test_lock_excludes_other_process_and_releases_after_close(self):
         with tempfile.TemporaryDirectory() as tmp:
             fd = lock_directory(Path(tmp), "lock")
-            command = [sys.executable, "-c", "from sloth_memory.runtime import lock_directory; from pathlib import Path; import sys; lock_directory(Path(sys.argv[1]), 'lock')", tmp]
+            command = [sys.executable, "-c", "from kvpark.runtime import lock_directory; from pathlib import Path; import sys; lock_directory(Path(sys.argv[1]), 'lock')", tmp]
             try:
                 self.assertNotEqual(subprocess.run(command, capture_output=True).returncode, 0)
             finally:
@@ -59,7 +59,7 @@ class PlatformTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", "Windows process lifetime")
     def test_job_stops_child_when_launcher_releases_handle(self):
-        from sloth_memory.windows_job import Job
+        from kvpark.windows_job import Job
         process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
         try:
             job = Job(process.pid)

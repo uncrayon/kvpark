@@ -12,13 +12,16 @@ from . import __version__
 from .runtime import directory
 
 
-def request(url, action, payload=None, *, timeout=900):
+def request(url, action, payload=None, *, timeout=900, control_prefix="/_kvpark/"):
     headers = {"Content-Type": "application/json"}
-    if os.environ.get("SLOTH_API_KEY"):
-        headers["Authorization"] = "Bearer " + os.environ["SLOTH_API_KEY"]
+    key = os.environ.get("KVPARK_API_KEY")
+    if control_prefix == "/_sloth/":
+        key = os.environ.get("SLOTH_API_KEY", key)
+    if key:
+        headers["Authorization"] = "Bearer " + key
     data = None if payload is None else json.dumps(payload).encode()
     try:
-        with urlopen(Request(url.rstrip("/") + "/_sloth/" + action, data=data, headers=headers), timeout=timeout) as response:
+        with urlopen(Request(url.rstrip("/") + control_prefix + action, data=data, headers=headers), timeout=timeout) as response:
             return json.load(response)
     except HTTPError as exc:
         try:
@@ -29,9 +32,13 @@ def request(url, action, payload=None, *, timeout=900):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Let your local AI nap. Save its work for later.")
+    parser = argparse.ArgumentParser(description="Park your model's KV cache. Resume where you left off.")
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command", required=True)
+    migrate = sub.add_parser("migrate", help="migrate sloth-memory without moving saved caches")
+    migrate.add_argument("--hermes", action="store_true", help="migrate the active Hermes profile")
+    migrate.add_argument("--archive-dir", help="standalone legacy archive directory")
+    migrate.add_argument("--confirm", action="store_true", help="drain the old proxy and apply migration")
     uninstall = sub.add_parser("uninstall", help="preview or disconnect services; keep packages and data until explicitly removed")
     uninstall.add_argument("--confirm", action="store_true", help="apply the uninstall after previewing")
     uninstall.add_argument("--hermes", action="store_true", help="restore routing and disable the plugin in the active Hermes profile")
@@ -55,11 +62,11 @@ def main():
     backend.add_argument("--archive-dir")
     backend.add_argument("--port", type=int, default=8090)
     backend.add_argument("server_args", nargs=argparse.REMAINDER, help="extra llama-server arguments after --")
-    for name in ("status", "park", "forget", "doctor", "settings", "cleanup"):
-        cmd = sub.add_parser(name, help={"status": "show archives and measured reuse", "park": "save the resident conversation", "forget": "delete a saved archive", "doctor": "check runtime, backend, and topology", "settings": "view or update saved cleanup preferences", "cleanup": "delete expired archives now"}[name])
-        cmd.add_argument("--url", default=os.environ.get("SLOTH_URL"))
+    for name in ("status", "save", "forget", "doctor", "settings", "cleanup"):
+        cmd = sub.add_parser(name, aliases=["park"] if name == "save" else [], help={"status": "show archives and measured reuse", "save": "park the resident conversation", "forget": "delete a saved archive", "doctor": "check runtime, backend, and topology", "settings": "view or update saved cleanup preferences", "cleanup": "delete expired archives now"}[name])
+        cmd.add_argument("--url", default=os.environ.get("KVPARK_URL"))
         cmd.add_argument("--archive-dir", help="discover the running proxy in this archive")
-        if name in ("park", "forget"):
+        if name in ("save", "forget"):
             group = cmd.add_mutually_exclusive_group(required=True)
             group.add_argument("--session", help="the exact slot_archive_key supplied during inference")
             group.add_argument("--key", help="the hashed k-… key returned by status")
@@ -68,8 +75,13 @@ def main():
             cmd.add_argument("--max-gib", type=float)
             cmd.add_argument("--cleanup", action=argparse.BooleanOptionalAction, default=None)
     args = parser.parse_args()
+    if args.command == "park":
+        args.command = "save"
     try:
-        if args.command == "uninstall":
+        if args.command == "migrate":
+            from .migration import run
+            print(run(hermes=args.hermes, archive=args.archive_dir, confirm=args.confirm))
+        elif args.command == "uninstall":
             if args.hermes:
                 if args.archive_dir:
                     parser.error("--hermes uses its profile's archive; do not pass --archive-dir")
@@ -104,9 +116,9 @@ def main():
                              args.cache_mode or ("native" if args.backend == "llama.cpp" else "routing"))
             overrides = validate({k: v for k, v in dict(ttl_days=args.ttl_days, max_gib=args.max_gib,
                                                       cleanup_enabled=args.cleanup).items() if v is not None})
-            os.environ.update(SLOTH_ARCHIVE_DIR=str(directory(args.archive_dir)), SLOTH_PORT=str(args.port),
-                              SLOTH_UPSTREAM_PORT=str(args.upstream_port), SLOTH_POLICY_OVERRIDES=json.dumps(overrides),
-                              SLOTH_UPSTREAM_URL=target.url, SLOTH_BACKEND=target.name, SLOTH_CACHE_MODE=target.cache_mode)
+            os.environ.update(KVPARK_ARCHIVE_DIR=str(directory(args.archive_dir)), KVPARK_PORT=str(args.port),
+                              KVPARK_UPSTREAM_PORT=str(args.upstream_port), KVPARK_POLICY_OVERRIDES=json.dumps(overrides),
+                              KVPARK_UPSTREAM_URL=target.url, KVPARK_BACKEND=target.name, KVPARK_CACHE_MODE=target.cache_mode)
             from .proxy import main as serve_proxy
             serve_proxy()
         elif args.command == "backend":
@@ -117,7 +129,7 @@ def main():
             launch(args.server, args.model, args.archive_dir, args.port, extra)
         else:
             payload = None
-            if args.command in ("park", "forget"):
+            if args.command in ("save", "forget"):
                 key = args.key or "k-" + hashlib.sha256(args.session.encode()).hexdigest()
                 payload = {"key": key}
             elif args.command == "cleanup":
@@ -133,7 +145,7 @@ def main():
             if args.command == "doctor" and not result["ok"]:
                 raise SystemExit(1)
     except (OSError, ValueError, RuntimeError, URLError) as exc:
-        print(f"sloth-memory: {exc}", file=sys.stderr)
+        print(f"kvpark: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
     except KeyboardInterrupt:
         raise SystemExit(130) from None
