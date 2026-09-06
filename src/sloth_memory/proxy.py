@@ -17,12 +17,15 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from .backends import Backend
+from .platforms import fsync_directory, process_matches
+from .runtime import directory
 
 LISTEN_HOST = os.environ.get("SLOTH_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("SLOTH_PORT", "8080"))
 UPSTREAM_HOST = os.environ.get("SLOTH_UPSTREAM_HOST", "127.0.0.1")
 UPSTREAM_PORT = int(os.environ.get("SLOTH_UPSTREAM_PORT", "8090"))
-ARCHIVE = Path(os.environ.get("SLOTH_ARCHIVE_DIR", str(Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))) / "sloth-memory")))
+ARCHIVE = directory()
 RUNTIME = Path(os.environ.get("SLOTH_RUNTIME", str(ARCHIVE / "runtime.json")))
 MIN_ARCHIVE_TOKENS = int(os.environ.get("SLOTH_MIN_TOKENS", "8192"))
 RESAVE_GROWTH_TOKENS = int(os.environ.get("SLOTH_RESAVE_GROWTH", "4096"))
@@ -37,6 +40,12 @@ HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authoriza
 log = logging.getLogger("slot-proxy")
 API_KEY = os.environ.get("SLOTH_API_KEY")
 MAX_REQUEST_BYTES = 64 * 1024**2
+
+
+def backend():
+    name = os.environ.get("SLOTH_BACKEND", "llama.cpp")
+    return Backend(name, os.environ.get("SLOTH_UPSTREAM_URL", f"http://{UPSTREAM_HOST}:{UPSTREAM_PORT}"),
+                   os.environ.get("SLOTH_CACHE_MODE", "native" if name == "llama.cpp" else "routing"))
 
 
 class UnsafeRestoreError(RuntimeError):
@@ -88,11 +97,7 @@ def atomic_json(path: Path, data: dict) -> None:
 
 
 def fsync_dir(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    fsync_directory(path)
 
 
 class Archive:
@@ -150,8 +155,7 @@ class Archive:
     def runtime(self):
         """Launcher manifest describes the process that actually loaded weights."""
         data = json.loads(RUNTIME.read_text())
-        stat = Path(f"/proc/{data['pid']}/stat").read_text().rsplit(") ", 1)[1].split()
-        if stat[19] != data["start_ticks"]:
+        if not process_matches(data):
             raise RuntimeError("model runtime manifest is stale")
         for name, expected in data["files"].items():
             st = os.stat(name)
@@ -167,7 +171,7 @@ class Archive:
         return data
 
     def request(self, method, path, body=None, timeout=600):
-        conn = http.client.HTTPConnection(UPSTREAM_HOST, UPSTREAM_PORT, timeout=timeout)
+        conn = backend().connection(timeout)
         try:
             payload = json.dumps(body).encode() if body is not None else None
             headers = {"Content-Type": "application/json", "Connection": "close"}
@@ -219,7 +223,7 @@ class Archive:
             # Stock /slots drops hybrid checkpoints. Do not call that a usable
             # archive: the accompanying resume file is mandatory.
             for path in files:
-                with path.open("rb") as fh:
+                with path.open("rb+") as fh:
                     os.fsync(fh.fileno())
             if sum(path.stat().st_size for path in files) > self.retention.settings()["max_gib"] * 1024**3:
                 raise ValueError("snapshot exceeds max-gib; increase the limit before parking")
@@ -348,10 +352,11 @@ class Archive:
                    for k, v in snapshot["entries"].items()]
         return dict(resident_key=snapshot["resident_key"], resident_thread=snapshot["resident_thread"],
                     activity=copy.deepcopy(snapshot["activity"]), runtime_error=snapshot["runtime_error"],
-                    upstream=f"{UPSTREAM_HOST}:{UPSTREAM_PORT}", archive_dir=str(ARCHIVE),
+                    upstream=backend().url.split("://", 1)[1], archive_dir=str(ARCHIVE),
                     archived=len(entries), entries=entries,
                     total_gib=round(sum(v["bytes"] for v in snapshot["entries"].values()) / 1024**3, 3),
-                    service="sloth-memory", control_version=2,
+                    service="sloth-memory", control_version=3, upstream_url=backend().url,
+                    capabilities=backend().capabilities(),
                     ttl_days=snapshot["retention"]["ttl_days"], max_gib=snapshot["retention"]["max_gib"],
                     cleanup_enabled=snapshot["retention"]["cleanup_enabled"], cleanup_interval_seconds=3600,
                     recent=[dict(e, ago_s=round(now-e["at"], 1)) for e in snapshot["recent"]])
@@ -361,6 +366,9 @@ class Archive:
         if not self.lock.acquire(blocking=False):
             return dict(ok=False, reason="inference is active; retry doctor when idle")
         try:
+            if not backend().snapshots:
+                self.request("GET", backend().health_path, timeout=5)
+                return dict(ok=True, **backend().capabilities())
             self.runtime()
             self.slot()
             return dict(ok=True, backend="reachable", slots=1,
@@ -512,6 +520,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("control body must be a JSON object")
                 payload = ARCHIVE_STATE.forget(req.get("key"))
             elif method == "POST" and path in {CONTROL_PREFIX + "park", CONTROL_PREFIX + "simulate-gap"}:
+                if not backend().snapshots:
+                    raise ValueError(backend().capabilities()["note"])
                 req = json.loads(body or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("control body must be a JSON object")
@@ -590,8 +600,8 @@ class Handler(BaseHTTPRequestHandler):
         lock = ARCHIVE_STATE.lock if generation else contextlib.nullcontext()
         started_at = time.monotonic()
         with lock:
-            archive_ready = True
-            if generation:
+            archive_ready = backend().snapshots
+            if generation and archive_ready:
                 try:
                     ARCHIVE_STATE.set_activity("switching", key)
                     ARCHIVE_STATE.switch(key, thread, signature, role)
@@ -617,9 +627,10 @@ class Handler(BaseHTTPRequestHandler):
                 ARCHIVE_STATE.set_activity("idle")
 
     def forward(self, method, body, started_at):
-        conn = http.client.HTTPConnection(UPSTREAM_HOST, UPSTREAM_PORT, timeout=1800)
+        target = backend()
+        conn = target.connection(1800)
         headers = {k: v for k, v in self.headers.items()
-                   if k.lower() not in HOP_BY_HOP and not (API_KEY and k.lower() == "authorization")}
+                   if k.lower() not in HOP_BY_HOP | {"host"} and not (API_KEY and k.lower() == "authorization")}
         headers["Content-Length"] = str(len(body))
         headers["Connection"] = "close"
         # Proxy authentication and backend authentication are separate credentials.
@@ -628,7 +639,7 @@ class Handler(BaseHTTPRequestHandler):
             headers["Authorization"] = "Bearer " + Path(key_file).read_text().strip()
         started = False
         try:
-            conn.request(method, self.path, body, headers)
+            conn.request(method, target.path(self.path), body, headers)
             upstream = conn.getresponse()
             observer = ResponseMetrics("text/event-stream" in upstream.getheader("Content-Type", ""), started_at)
             self.send_response(upstream.status)
@@ -684,22 +695,27 @@ def gc_loop():
 def main():
     logging.basicConfig(level=os.environ.get("SLOTH_LOG", "INFO"),
                         format="%(asctime)s %(levelname)s %(message)s")
-    if (UPSTREAM_HOST, UPSTREAM_PORT) == (LISTEN_HOST, LISTEN_PORT):
-        raise SystemExit("upstream and listen address are identical")
-    if LISTEN_HOST != "127.0.0.1" or UPSTREAM_HOST != "127.0.0.1":
-        raise SystemExit("this alpha supports localhost (127.0.0.1) only")
+    if LISTEN_HOST != "127.0.0.1":
+        raise SystemExit("the proxy listens on localhost only")
     from .runtime import lock_directory
     os.umask(0o077)
     lock_directory(ARCHIVE, ".proxy.lock")
     global ARCHIVE_STATE
     ARCHIVE_STATE = Archive()
-    try:
-        ARCHIVE_STATE.runtime()
-    except Exception as exc:
-        ARCHIVE_STATE.runtime_error = str(exc)
-        ARCHIVE_STATE.publish_status()
+    if backend().snapshots:
+        try:
+            ARCHIVE_STATE.runtime()
+        except Exception as exc:
+            ARCHIVE_STATE.runtime_error = str(exc)
+            ARCHIVE_STATE.publish_status()
+    from .network import bind_server
+    from .platforms import process_identity
+    server = bind_server(Handler, LISTEN_PORT, backend().url)
+    atomic_json(ARCHIVE / "proxy.json", dict(**process_identity(os.getpid()),
+                base_url=f"http://{LISTEN_HOST}:{server.server_port}", upstream_url=backend().url,
+                backend=backend().name, cache_mode=backend().cache_mode))
+    log.info("Proxy listening at http://%s:%s → %s (%s)", LISTEN_HOST, server.server_port, backend().url, backend().cache_mode)
     threading.Thread(target=gc_loop, daemon=True).start()
-    server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     server.daemon_threads = True
     server.serve_forever()
 

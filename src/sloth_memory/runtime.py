@@ -1,6 +1,5 @@
-"""Linux process identity and a foreground launcher for the local backend."""
+"""Runtime identity and a foreground launcher for the local backend."""
 
-import fcntl
 import hashlib
 import json
 import os
@@ -9,21 +8,20 @@ import re
 import shutil
 import subprocess
 import uuid
+import sys
+import signal
+import time
+
+from .platforms import data_directory, lock_file, process_identity
 
 
 def directory(value=None):
-    root = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share")))
+    root = data_directory()
     return Path(value or os.environ.get("SLOTH_ARCHIVE_DIR", root / "sloth-memory")).expanduser().resolve()
 
 
 def lock_directory(path, name):
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd = os.open(path / name, os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        os.close(fd)
-        raise RuntimeError(f"another process owns {path / name}") from None
+    fd = lock_file(path / name)
     os.set_inheritable(fd, True)
     return fd
 
@@ -35,7 +33,8 @@ def file_identity(path):
 
 def write_manifest(destination, pid, argv, extra_files=()):
     binary = Path(argv[0]).resolve(strict=True)
-    paths = {binary, *binary.parent.glob("*.so*"), *(Path(p).resolve(strict=True) for p in extra_files)}
+    paths = {binary, *(p for pattern in ("*.so*", "*.dylib", "*.dll") for p in binary.parent.glob(pattern)),
+             *(Path(p).resolve(strict=True) for p in extra_files)}
     # The launcher requires explicit local model paths. Include every file-valued
     # argument, split GGUF siblings, and the dynamically linked runtime libraries.
     for arg in argv[1:]:
@@ -51,20 +50,21 @@ def write_manifest(destination, pid, argv, extra_files=()):
             if match:
                 for index in range(1, int(match[2]) + 1):
                     paths.add(path.with_name(f"{match[1]}-{index:05d}-of-{match[2]}.gguf").resolve(strict=True))
-    linked = subprocess.run(["ldd", str(binary)], text=True, capture_output=True)
-    if linked.returncode and "not a dynamic executable" not in linked.stderr + linked.stdout:
-        raise RuntimeError("cannot inspect backend libraries: " + linked.stderr.strip())
-    for word in linked.stdout.split():
-        if word.startswith("/") and Path(word).is_file():
-            paths.add(Path(word).resolve())
+    if sys.platform.startswith("linux") or sys.platform == "darwin":
+        command = ["otool", "-L", str(binary)] if sys.platform == "darwin" else ["ldd", str(binary)]
+        linked = subprocess.run(command, text=True, capture_output=True)
+        if linked.returncode and "not a dynamic executable" not in linked.stderr + linked.stdout:
+            raise RuntimeError("cannot inspect backend libraries: " + linked.stderr.strip())
+        for word in linked.stdout.split():
+            if word.startswith("/") and Path(word).is_file():
+                paths.add(Path(word).resolve())
     files = {str(path): file_identity(path) for path in sorted(paths)}
     # Environment affects kernels and rendering too. Store only its digest;
     # credentials and environment values must never appear in archive metadata.
     env = {k: v for k, v in os.environ.items() if k.startswith(("GGML_", "LLAMA_", "CUDA_", "HIP_", "ROCR_")) or k == "LD_LIBRARY_PATH"}
     identity = hashlib.sha256(json.dumps([argv, files, env], sort_keys=True).encode()).hexdigest()
-    ticks = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
-    data = dict(pid=int(pid), start_ticks=ticks, run_id=uuid.uuid4().hex,
-                identity=identity, files=files)
+    data = dict(**process_identity(pid), run_id=uuid.uuid4().hex,
+                identity=identity, files=files, argv=argv)
     from .proxy import atomic_json
     atomic_json(Path(destination), data)
 
@@ -93,9 +93,42 @@ def backend_command(server, model, archive, port, extra):
 
 
 def launch(server, model, archive, port, extra):
+    from .platforms import available_port
     archive = directory(archive)
-    argv = backend_command(server, model, archive, port, extra)
     os.umask(0o077)
-    lock_directory(archive, ".backend.lock")  # fd survives exec, released at process exit
-    write_manifest(archive / "runtime.json", os.getpid(), argv)
-    os.execv(argv[0], argv)
+    fd = lock_directory(archive, ".backend.lock")
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt
+    previous = signal.signal(signal.SIGTERM, interrupted)
+    try:
+        for attempt in range(5):
+            port = available_port(port)
+            argv = backend_command(server, model, archive, port, extra)
+            process = subprocess.Popen(argv)
+            job = None
+            started = time.monotonic()
+            try:
+                if os.name == "nt":
+                    from .windows_job import Job
+                    job = Job(process.pid)
+                write_manifest(archive / "runtime.json", process.pid, argv)
+                code = process.wait()
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                if job:
+                    job.close()
+            # llama.cpp cannot accept our reserved socket. If another process
+            # wins the bind race and startup fails, choose a new port and retry.
+            if code and time.monotonic() - started < 30 and available_port(port) != port and attempt < 4:
+                port = 0
+                continue
+            raise SystemExit(code)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        os.close(fd)

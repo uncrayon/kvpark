@@ -343,8 +343,8 @@ class RuntimeTests(unittest.TestCase):
             model = Path(tmp) / "model.gguf"
             model.write_bytes(b"weights")
             st = model.stat()
-            proc = Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(") ", 1)[1].split()
-            data = dict(pid=os.getpid(), start_ticks=proc[19], run_id="new", identity="id",
+            from sloth_memory.platforms import process_identity
+            data = dict(**process_identity(os.getpid()), run_id="new", identity="id",
                         files={str(model): [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]})
             manifest = Path(tmp) / "runtime.json"
             manifest.write_text(json.dumps(data))
@@ -356,7 +356,7 @@ class RuntimeTests(unittest.TestCase):
                 model.write_bytes(b"changed")
                 with self.assertRaisesRegex(RuntimeError, "files changed"):
                     a.runtime()
-                data["start_ticks"] = "0"
+                data["created_at"] = 0
                 manifest.write_text(json.dumps(data))
                 with self.assertRaisesRegex(RuntimeError, "stale"):
                     a.runtime()

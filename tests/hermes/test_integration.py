@@ -120,6 +120,38 @@ class HermesIntegrationTests(unittest.TestCase):
         self.assertEqual(config["model"]["default"], "local")
         self.assertEqual(config["agent"]["max_turns"], 12)
 
+    def test_matching_live_openai_client_follows_new_proxy_port(self):
+        from agent.subagent_lifecycle import bind_subagent_parent
+        from hermes_cli.middleware import apply_llm_request_middleware
+        from openai import OpenAI
+        adapter = self.command.__self__
+        old_url = "http://127.0.0.1:12345"
+        adapter.ctx.set_config("service", {**adapter.settings(), "connected": True, "previous_urls": [old_url]})
+        with OpenAI(base_url=old_url + "/v1", api_key="local") as client:
+            active = SimpleNamespace(session_id="route-test", _persist_disabled=False, client=client, base_url=old_url + "/v1")
+            with bind_subagent_parent(active):
+                result = apply_llm_request_middleware({"model": "local", "messages": []}, session_id="route-test",
+                    base_url=old_url + "/v1", api_mode="chat_completions")
+            self.assertEqual(str(client.base_url).rstrip("/"), self.url + "/v1")
+            self.assertEqual(active.base_url, self.url + "/v1")
+            self.assertEqual(result.payload["extra_body"]["slot_archive_role"], "foreground")
+
+    def test_generic_backend_model_name_is_preserved_when_connecting(self):
+        adapter = self.command.__self__
+        adapter.ctx.set_config("service", {**adapter.settings(), "backend": "ollama", "cache_mode": "routing",
+                                          "model": "my-model:latest"})
+        self.assertIn("new sessions", self.command_text("connect"))
+        from hermes_cli.config import read_user_config_raw
+        self.assertEqual(read_user_config_raw()["model"]["default"], "my-model:latest")
+
+    def test_changing_backend_clears_previous_model_and_endpoint(self):
+        adapter = self.command.__self__
+        adapter.ctx.set_config("service", {**adapter.settings(), "backend": "ollama", "cache_mode": "routing",
+            "model": "old-model", "upstream_url": "http://127.0.0.1:11434"})
+        self.command_text("setup --backend vllm")
+        self.assertEqual(adapter.settings()["model"], "")
+        self.assertEqual(adapter.settings()["upstream_url"], "")
+
 
 @unittest.skipUnless(os.environ.get("SLOTH_TEST_SERVER") and os.environ.get("SLOTH_TEST_MODEL"), "optional real-model startup test")
 class RealStartupTests(unittest.TestCase):
@@ -132,16 +164,16 @@ class RealStartupTests(unittest.TestCase):
         from gateway.session_context import set_session_vars, clear_session_vars
         from openai import OpenAI
 
-        def free_port():
-            with socket.socket() as sock:
-                sock.bind(("127.0.0.1", 0))
-                return sock.getsockname()[1]
-
         with tempfile.TemporaryDirectory(prefix="sloth-hermes-real-") as tmp:
             home = Path(tmp)
-            port, upstream = free_port(), free_port()
-            while upstream == port:
-                upstream = free_port()
+            occupied = []
+            for _ in range(2):
+                sock = socket.socket()
+                sock.bind(("127.0.0.1", 0))
+                sock.listen()
+                occupied.append(sock)
+                self.addCleanup(sock.close)
+            port, upstream = (sock.getsockname()[1] for sock in occupied)
             url = f"http://127.0.0.1:{port}"
             config = dict(autostart=True, base_url=url, upstream_port=upstream, archive_dir=str(home / "archive"),
                           server=os.environ["SLOTH_TEST_SERVER"], model=os.environ["SLOTH_TEST_MODEL"],
@@ -165,13 +197,23 @@ class RealStartupTests(unittest.TestCase):
                     deadline = time.monotonic() + 120
                     while time.monotonic() < deadline:
                         try:
-                            status = request(url, "status", timeout=2)
-                            break
+                            from sloth_memory.network import proxy_record
+                            record = proxy_record(home / "archive")
+                            if record:
+                                url = record["base_url"]
+                                status = request(url, "status", timeout=2)
+                                break
                         except OSError:
-                            time.sleep(.2)
+                            pass
+                        time.sleep(.2)
                     else:
                         self.fail("Hermes autostart did not launch the proxy")
                     self.assertEqual(len(children), 2)
+                    command.__self__.service.worker.join(10)
+                    actual = command.__self__.settings()
+                    self.assertNotEqual(actual["upstream_port"], upstream)
+                    self.assertNotEqual(url, f"http://127.0.0.1:{port}")
+                    self.assertEqual(actual["base_url"], url)
                     self.assertTrue(status["cleanup_enabled"])
                     self.assertEqual(status["ttl_days"], 7)
                     tokens = set_session_vars(session_id="hermes-real", session_key="cli:real")

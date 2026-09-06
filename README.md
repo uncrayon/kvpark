@@ -4,7 +4,12 @@
 
 sloth-memory saves a local model's conversation inference state to disk and restores
 it when you return. Built for people running open-weight models on their own hardware.
-MIT licensed. No cloud service, account, or Python runtime dependencies.
+MIT licensed. No cloud service or account. The portable runtime uses psutil.
+
+**In development:** Linux/macOS/Windows portability, automatic free-port selection,
+and routing adapters for llama.cpp, Ollama, vLLM, and MLX-LM. Disk park/resume still
+requires our patched llama.cpp runtime. See [backend capabilities](docs/backends.md).
+The installation below selects the published alpha.2; these changes are not in it.
 
 **Developer alpha · Linux · one local llama.cpp slot · pinned patched runtime.**
 The service is independent of Hermes. A native Hermes adapter provides startup,

@@ -1,5 +1,8 @@
 # Alpha compatibility
 
+This page describes published alpha.2. Development-version OS support and the
+capability matrix for other engines are in [backends](backends.md).
+
 ## Runtime
 
 The build script pins ggml-org/llama.cpp to

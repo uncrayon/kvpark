@@ -4,16 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sloth-memory"
-version = "0.1.0a2"
+version = "0.2.0.dev0"
 description = "Let your local AI nap. Resume long conversations from saved inference state."
 readme = "README.md"
 requires-python = ">=3.10"
+dependencies = ["psutil>=5.9"]
 license = {text = "MIT"}
 authors = [{name = "Ulises Rayon"}]
 keywords = ["llama.cpp", "kv-cache", "local-ai", "open-weights", "agents"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
   "Programming Language :: Python :: 3",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]

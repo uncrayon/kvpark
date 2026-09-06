@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0.dev0 — unreleased
+
+- Portable process identity, data directories, file locks, and managed process lifetime for Linux, macOS, and Windows.
+- Select available ports, publish bound addresses, and discover them from CLI controls and Hermes.
+- Configure Hermes through the local proxy, preserving served model IDs; refresh matching live OpenAI clients after a port change.
+- Routing adapters for existing llama.cpp, Ollama, vLLM, and MLX-LM servers with explicit capability reporting.
+- Native disk snapshots remain limited to the patched, managed llama.cpp runtime. Other adapters reject parking clearly.
+- Cross-platform Python, Hermes integration, and native build CI.
+
 ## 0.1.0a2 — Hermes adapter and configurable cleanup
 
 - Added native Hermes plugin discovery, automatic service startup/reuse, and

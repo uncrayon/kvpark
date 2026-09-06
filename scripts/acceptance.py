@@ -57,22 +57,29 @@ def main():
                 if process.poll() is not None:
                     raise RuntimeError(f"child failed:\n{(root / log).read_text()[-8000:]}")
                 try:
-                    call(port, endpoint)
-                    return
+                    actual = port() if callable(port) else port
+                    if actual:
+                        call(actual, endpoint)
+                        return actual
                 except OSError:
                     time.sleep(.2)
             raise TimeoutError("private service did not become ready")
 
         def start():
+            nonlocal backend_port, proxy_port
+            from sloth_memory.network import managed_port, proxy_record
             backend = spawn(["backend", "--server", str(args.server), "--model", str(args.model),
                              "--archive-dir", str(root / "archive"), "--port", str(backend_port), "--",
                              "--device", "none", "--n-gpu-layers", "0", "--ctx-size", "4096",
                              "--threads", "4", "--threads-batch", "4", "--cache-ram", "0",
                              "--ctx-checkpoints", "8", "--checkpoint-min-step", "128", "--jinja"], "backend.log")
-            ready(backend, backend_port, "/health", "backend.log")
+            backend_port = ready(backend, lambda: managed_port(root / "archive"), "/health", "backend.log")
             proxy = spawn(["serve", "--archive-dir", str(root / "archive"), "--port", str(proxy_port),
                            "--upstream-port", str(backend_port)], "proxy.log")
-            ready(proxy, proxy_port, "/_sloth/status", "proxy.log")
+            def bound_port():
+                record = proxy_record(root / "archive")
+                return int(record["base_url"].rsplit(":", 1)[1]) if record else None
+            proxy_port = ready(proxy, bound_port, "/_sloth/status", "proxy.log")
             if not call(proxy_port, "/_sloth/doctor")["ok"]:
                 raise RuntimeError("runtime diagnostics failed")
 

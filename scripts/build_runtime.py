@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import tarfile
 import tempfile
+import os
 
 PIN = "85d5703a3b1b47243213a39059a6e3076c92733a"
 
@@ -43,8 +44,12 @@ def main():
     subprocess.run(["cmake", "-S", str(source), "-B", str(build), "-DCMAKE_BUILD_TYPE=Release",
                     "-DGGML_NATIVE=OFF", "-DLLAMA_BUILD_TESTS=OFF", "-DLLAMA_BUILD_EXAMPLES=OFF",
                     "-DLLAMA_OPENSSL=OFF", *args.cmake_arg], check=True)
-    subprocess.run(["cmake", "--build", str(build), "--target", "llama-server", "-j", str(args.jobs)], check=True)
-    print(f"\nBuilt {build / 'bin/llama-server'}\nKeep its adjacent libraries with it.")
+    subprocess.run(["cmake", "--build", str(build), "--config", "Release", "--target", "llama-server", "-j", str(args.jobs)], check=True)
+    name = "llama-server.exe" if os.name == "nt" else "llama-server"
+    binaries = list((build / "bin").rglob(name))
+    if len(binaries) != 1:
+        raise RuntimeError("could not locate the built llama-server")
+    print(f"\nBuilt {binaries[0]}\nKeep its adjacent libraries with it.")
 
 
 if __name__ == "__main__":
