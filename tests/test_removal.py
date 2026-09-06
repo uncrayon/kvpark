@@ -4,8 +4,11 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
+
+import psutil
 
 from sloth_memory import removal
 from sloth_memory.hermes_uninstall import restored_config
@@ -87,16 +90,26 @@ class RemovalTests(unittest.TestCase):
 
     def test_real_owned_backend_stops_and_unrelated_process_survives(self):
         script = self.archive / "fake_backend.py"
-        script.write_text("import time; time.sleep(60)")
-        argv = [sys.executable, str(script), "--slot-save-path", str(self.archive)]
-        children = [subprocess.Popen(argv), subprocess.Popen([sys.executable, str(script)])]
+        script.write_text("import pathlib, sys, time; pathlib.Path(sys.argv[1]).touch(); time.sleep(60)")
+        ready = self.archive / "ready"
+        argv = [sys.executable, str(script), str(ready), "--slot-save-path", str(self.archive)]
+        children = [subprocess.Popen(argv), subprocess.Popen([sys.executable, str(script), str(self.archive / "other-ready")])]
         def cleanup():
             for child in children:
                 if child.poll() is None:
                     child.terminate()
                 child.wait(10)
         self.addCleanup(cleanup)
-        record = {**process_identity(children[0].pid), "argv": argv}
+        deadline = time.monotonic() + 10
+        while not ready.exists() and time.monotonic() < deadline:
+            self.assertIsNone(children[0].poll())
+            time.sleep(.01)
+        self.assertTrue(ready.exists(), "fake backend did not start")
+        # macOS framework Python can re-exec with a different argv[0]. This
+        # fixture records the ready Python stand-in, not its transient launcher.
+        actual = psutil.Process(children[0].pid).cmdline()
+        self.assertEqual(actual[1:], argv[1:])
+        record = {**process_identity(children[0].pid), "argv": actual}
         (self.archive / "runtime.json").write_text(json.dumps(record))
         (self.archive / "snapshot.bin").write_bytes(b"keep")
         # The externally launched upstream mode does not own this backend.
