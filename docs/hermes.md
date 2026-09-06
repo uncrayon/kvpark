@@ -11,7 +11,39 @@ Hermes source or replace its semantic memory provider.
 
 If you already installed sloth-memory, use the [rename migration](updates.md#migrate-from-sloth-memory) instead of enabling a second plugin.
 
-For a new installation, use **the same Python environment that runs Hermes**:
+For a new installation, install into **the Python environment that runs Hermes**.
+The standalone `kvpark/.venv` from the README is a separate environment. Activating
+it does not change the interpreter used by an existing `hermes` launcher.
+
+### macOS and Linux: standard Hermes installation
+
+Use Hermes' interpreter explicitly; these commands work from any directory and
+do not require activating or leaving your current virtual environment:
+
+```bash
+HERMES_PY="$HOME/.hermes/hermes-agent/venv/bin/python"
+"$HERMES_PY" -c "import sys, hermes_cli; print('Hermes Python:', sys.executable)"
+"$HERMES_PY" -m pip install --upgrade https://github.com/uncrayon/kvpark/releases/download/v0.3.0a1/kvpark-0.3.0a1-py3-none-any.whl
+"$HERMES_PY" -c "from importlib.metadata import distribution; d = distribution('kvpark'); print('kvpark', d.version); print([(e.name, e.value) for e in d.entry_points if e.group == 'hermes_agent.plugins'])"
+"$HERMES_PY" -m hermes_cli.main plugins enable kvpark
+"$HERMES_PY" -m hermes_cli.main plugins list --plain --no-bundled
+```
+
+The discovery check should print `kvpark 0.3.0a1` and
+`[('kvpark', 'kvpark.hermes')]`. If the first command fails because the interpreter
+does not exist, stop and locate your actual Hermes installation before continuing.
+For a custom installation, change `HERMES_PY` to that installation's Python.
+`command -v hermes` locates the launcher, which may be a wrapper pointing to a
+different interpreter. A separately configured gateway must use the environment
+where you install the plugin too. Keep the same Hermes profile selected throughout.
+
+If Hermes' environment has no pip module, use
+`uv pip install --python "$HERMES_PY" https://github.com/uncrayon/kvpark/releases/download/v0.3.0a1/kvpark-0.3.0a1-py3-none-any.whl`
+for the installation step, then continue with the discovery and enable commands.
+
+### Install from a checkout or on Windows
+
+With **Hermes' own virtual environment** activated, use:
 
 ```bash
 # With your Hermes virtual environment activated:
@@ -33,16 +65,34 @@ load the entry point. The adapter is tested against Hermes
 0.21.0, upstream commit `9dd6634c5635321cf38840cc30e9b51226689128`.
 Use Python 3.11–3.13 for Hermes; the standalone service also supports 3.10/3.14.
 
-When activating Hermes' environment, use the interpreter that actually runs
-your CLI or gateway. For a standard Linux installation this is often:
+On Windows, activate Hermes' environment using its `Scripts\Activate.ps1`, or
+invoke that environment's `python.exe` explicitly with PowerShell's `&` operator.
+Do not create a separate kvpark environment for the Hermes plugin.
+
+If you prefer activation on macOS/Linux, the standard Hermes installation uses:
 
 ```bash
 source ~/.hermes/hermes-agent/venv/bin/activate
 python -c "import sys; print(sys.executable)"
 ```
 
-Check your own installation path; installing in an unrelated virtual environment
-will not make the plugin visible to Hermes.
+### "Plugin 'kvpark' is not installed or bundled"
+
+This is a plugin-discovery failure, before any connection to your model server.
+If pip reported a successful installation, check which Python received it:
+
+```bash
+python -c "import sys; print(sys.executable)"
+python -m pip show kvpark
+command -v hermes
+```
+
+Seeing a path inside `kvpark/.venv` means you installed the standalone package.
+Changing directory with `cd ..` does not deactivate that environment or change
+the interpreter inside the Hermes launcher. Use the explicit Hermes-interpreter
+installation above, then verify its entry point and enable the plugin with that
+same interpreter. Reinstalling the model server or restarting the gateway alone
+will not fix a missing package in Hermes' environment.
 
 For managed disk snapshots, build the [compatible runtime](compatibility.md)
 and obtain your own GGUF model before setup:
@@ -77,6 +127,33 @@ coordinated release update. See [updates and recovery](updates.md).
 
 Use `/kvpark` in the Hermes CLI, Discord, and Telegram. It opens setup instructions
 when called without arguments.
+
+**Next release:** in the Hermes desktop composer or CLI, type `/kvpark ` (including the space) to
+see action suggestions such as `setup`, `save`, `status`, and `forget`. Partial
+actions filter the list: `/kvpark sa` suggests `save`. Arguments also accept free
+text, so you can enter setup flags, model IDs, URLs, paths, or a saved slot key.
+After installing an update, restart the Hermes client that owns the composer to
+reload plugin metadata; an already open desktop client may keep its old catalog.
+
+### Pasted URL becomes a link chip
+
+Hermes desktop can turn a pasted address into an `@url:` reference. kvpark
+`0.3.0a1` rejects that wrapper with "upstream URL must be http(s)://host:port";
+the next release extracts the address before validating it. The same issue can
+affect `--base-url` and `/kvpark base-url`.
+
+For `0.3.0a1`, escape the colon as `http\://` in the slash command. This keeps
+the desktop from converting the address into a chip, and kvpark's argument
+parser removes the backslash. For example, with vLLM on port 8081:
+
+```text
+/kvpark setup --backend vllm --cache-mode routing --upstream-url http\://127.0.0.1:8081 --model "your-exact-served-model-id"
+```
+
+Replace the model ID with the value from `/v1/models`. Enter this as one message
+in Hermes. Using this syntax also works after the URL-chip fix.
+
+### Configure your backend
 
 Already serving a model with vLLM, Ollama, MLX-LM, or llama.cpp? First
 [find its exact model ID](backends.md#find-your-model-id), then follow

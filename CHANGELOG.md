@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Accept Hermes desktop URL chips in setup and base-url commands, preserving the full host and port and applying the same URL validation.
+- Offer kvpark action suggestions in Hermes' desktop composer and CLI while preserving free-text arguments; remove the completion entry when the plugin unloads.
+- Make Hermes installation use its own Python interpreter explicitly and explain how to recover from installing into a separate standalone environment.
+
 ## 0.3.0a1 — kvpark rename and migration
 
 - Rename the repository, Python distribution/module, CLI, and Hermes plugin to `kvpark`.

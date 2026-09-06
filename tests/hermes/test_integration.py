@@ -50,6 +50,59 @@ class HermesIntegrationTests(unittest.TestCase):
     def command_text(self, text):
         return asyncio.run(self.command(text))
 
+    def test_setup_accepts_desktop_url_chips(self):
+        from hermes_cli import config
+        model = "mlx-community/gemma-4-e2b-it-4bit"
+        for url in ('@url:`http://127.0.0.1:8081/v1`', '@url:"http://127.0.0.1:8081/v1"',
+                    'http://127.0.0.1:8081/v1', r'http\://127.0.0.1:8081/v1'):
+            with self.subTest(url=url):
+                result = self.command_text(f'setup --backend vllm --cache-mode routing --upstream-url {url} --model "{model}"')
+                self.assertIn("Settings saved", result)
+                service = config.load_config()["plugins"]["entries"]["kvpark"]["settings"]["service"]
+                self.assertEqual(service["upstream_url"], "http://127.0.0.1:8081")
+                self.assertEqual(service["model"], model)
+                self.assertEqual(service["backend"], "vllm")
+        self.assertIn("Settings saved", self.command_text(f'base-url @url:`{self.url}/v1`'))
+        service = config.load_config()["plugins"]["entries"]["kvpark"]["settings"]["service"]
+        self.assertEqual(service["base_url"], self.url)
+        for bad in ('@url:`file:///tmp/model`', '@file:`http://127.0.0.1:8081`',
+                    '@url:`http://user:password@127.0.0.1:8081`', '@url:`http://127.0.0.1:8081/other`'):
+            with self.subTest(invalid=bad):
+                before = config.read_user_config_raw()
+                self.assertIn("upstream URL must", self.command_text(f'setup --upstream-url {bad}'))
+                self.assertEqual(config.read_user_config_raw(), before)
+
+    def test_argument_picker_offers_actions_and_keeps_free_text(self):
+        from hermes_cli.commands import SUBCOMMANDS
+        from hermes_cli.commands_completion import SlashCommandCompleter
+        from hermes_cli.plugins import get_plugin_commands
+        from prompt_toolkit.document import Document
+        from importlib import import_module
+        from tui_gateway import methods_tools
+        self.assertEqual(get_plugin_commands()["kvpark"]["argument_mode"], "mixed")
+        catalog = methods_tools._Catalog()
+        with patch.object(methods_tools, "_tools_mod", import_module, create=True):
+            methods_tools._catalog_plugin_commands(catalog)
+        self.assertEqual(catalog.commands["/kvpark"]["argument_mode"], "mixed")
+        completer = SlashCommandCompleter()
+
+        def complete(text):
+            return [item.text for item in completer.get_completions(Document(text), None)]
+
+        actions = complete("/kvpark ")
+        self.assertEqual(actions, SUBCOMMANDS["/kvpark"])
+        for action in ("setup", "save", "status", "forget", "update", "uninstall"):
+            self.assertIn(action, actions)
+        self.assertEqual(complete("/kvpark sa"), ["save"])
+        self.assertEqual(complete("/kvpark setup --model custom-model"), [])
+        self.assertEqual(complete("/context "), ["all"])
+        self.manager.unload()
+        self.assertNotIn("/kvpark", SUBCOMMANDS)
+        self.assertEqual(complete("/kvpark "), [])
+        self.assertEqual(complete("/context "), ["all"])
+        self.manager.discover_and_load()
+        self.assertEqual(complete("/kvpark "), actions)
+
     async def gateway_command(self, text, thread="discord:acceptance", *, platform="discord", command="kvpark"):
         from unittest.mock import AsyncMock
         from gateway.run_inbound import GatewayInboundMixin

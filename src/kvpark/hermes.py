@@ -161,6 +161,15 @@ class Adapter:
         parser.add_argument("--external", action=argparse.BooleanOptionalAction, default=None)
         parsed = vars(parser.parse_args(args))
         updates = {key: value for key, value in parsed.items() if value is not None}
+        # The desktop composer serializes pasted links as @url:`address`.
+        # Decode only URL options; normal validation still checks the address.
+        for key in ("upstream_url", "base_url"):
+            value = updates.get(key, "")
+            if value.startswith("@url:"):
+                value = value[5:]
+                if len(value) >= 2 and value[0] == value[-1] == "`":
+                    value = value[1:-1]
+                updates[key] = value
         if self.settings()["uninstalled"]:
             updates.update(uninstalled=False, autostart=True)
         if "backend" in updates and updates["backend"] != self.settings()["backend"]:
@@ -321,7 +330,23 @@ def register(ctx):
     adapter = Adapter(ctx)
     ctx.register_command("kvpark", adapter.command,
                          description="Park model state, resume conversations, and manage saved caches",
-                         args_hint="setup | save | status | forget | cleanup | retention | base-url | update | uninstall", argument_mode="text")
+                         args_hint="setup | save | status | forget | cleanup | retention | base-url | update | uninstall", argument_mode="mixed")
+    # Hermes 0.21 exposes argument mode through register_command, but its CLI
+    # completer and desktop catalog both read options from this shared registry.
+    from hermes_cli.commands import SUBCOMMANDS
+    options = ["setup", "save", "status", "forget", "slots", "start", "connect",
+               "retention", "budget", "cleanup", "autostart", "base-url", "update", "uninstall", "help"]
+    previous = SUBCOMMANDS.get("/kvpark")
+    SUBCOMMANDS["/kvpark"] = options
+
+    def remove_completions():
+        if SUBCOMMANDS.get("/kvpark") is options:
+            if previous is None:
+                SUBCOMMANDS.pop("/kvpark", None)
+            else:
+                SUBCOMMANDS["/kvpark"] = previous
+
+    ctx.on_unload(remove_completions)
     ctx.register_hook("pre_gateway_dispatch", adapter.capture_gateway)
     ctx.register_hook("pre_command", adapter.capture_command)
     ctx.register_middleware("llm_request", adapter.middleware)

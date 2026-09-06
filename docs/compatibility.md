@@ -78,6 +78,29 @@ Keep the compiled binary with its libraries. GPU backend libraries loaded outsid
 the binary directory may require an explicit, stable `LD_LIBRARY_PATH`; rebuild
 and repark after runtime updates.
 
+### Moving a checkout
+
+The source does not depend on its parent directory. Run the documented commands
+from the checkout root; explicit relative `--source` and `--output` paths resolve
+from your current working directory. Runtime libraries in the Linux build tree
+use paths relative to the binary, so the binary and its adjacent libraries can
+move together.
+
+Virtual environments and CMake build caches are specific to their creation path.
+After moving the source, recreate the virtual environment, reinstall kvpark, and
+build a new runtime instead of editing generated CMake files:
+
+```bash
+python scripts/build_runtime.py --output runtime-rebuilt --cmake-arg=-DGGML_METAL=OFF
+```
+
+Use the new server path in `kvpark backend` or Hermes setup, and update any model,
+draft, projector, or library paths if those files moved too. Existing archives live
+in the platform data directory unless you selected a custom location. Runtime
+identity includes absolute paths, so a moved or rebuilt backend may require a
+fresh prefill and park. Runtime output directories are local build artifacts and
+must not be committed or included in Python distributions.
+
 ## Storage policy
 
 New archives default to seven days after the last save, cleanup enabled, and a

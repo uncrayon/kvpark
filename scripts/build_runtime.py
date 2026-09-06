@@ -42,6 +42,7 @@ def main():
     subprocess.run(["git", "apply", str(repo / "patches/llama-slot-resume.patch")], cwd=source, check=True)
     build = out / "build"
     subprocess.run(["cmake", "-S", str(source), "-B", str(build), "-DCMAKE_BUILD_TYPE=Release",
+                    "-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON",
                     "-DGGML_NATIVE=OFF", "-DLLAMA_BUILD_TESTS=OFF", "-DLLAMA_BUILD_EXAMPLES=OFF",
                     "-DLLAMA_OPENSSL=OFF", *args.cmake_arg], check=True)
     subprocess.run(["cmake", "--build", str(build), "--config", "Release", "--target", "llama-server", "-j", str(args.jobs)], check=True)

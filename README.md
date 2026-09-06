@@ -48,7 +48,13 @@ and compiled runtimes are not bundled.
 For Hermes, follow [installation in Hermes' Python environment](docs/hermes.md#install-alongside-hermes)
 instead of creating the standalone environment below.
 
-Standalone installation on macOS/Linux:
+### Standalone installation (without the Hermes plugin)
+
+The `.venv` below belongs only to kvpark. If you plan to run
+`hermes plugins enable kvpark`, use the [Hermes installation commands](docs/hermes.md#install-alongside-hermes)
+instead; Hermes cannot discover packages installed only in this separate environment.
+
+On macOS/Linux:
 
 ```bash
 git clone --branch v0.3.0a1 https://github.com/uncrayon/kvpark.git
