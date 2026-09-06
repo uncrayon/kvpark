@@ -121,7 +121,7 @@ def install(wheel, log):
 
 def stop_proxy(record):
     if not process_matches(record):
-        raise RuntimeError("proxy process identity changed; refusing to stop it")
+        return  # The original exited. Never signal a process that reused its PID.
     process = psutil.Process(record["pid"])
     process.terminate()
     deadline = time.monotonic() + 15
@@ -135,18 +135,21 @@ def stop_proxy(record):
 
 
 def start_proxy(record, archive, env, version):
+    launch_token = uuid.uuid4().hex
     argv = [sys.executable, "-I", "-m", "sloth_memory", "serve", "--archive-dir", str(archive),
             "--port", record["base_url"].rsplit(":", 1)[1], "--backend", record["backend"],
             "--cache-mode", record["cache_mode"], "--upstream-url", record["upstream_url"]]
     with (archive / "hermes-proxy.log").open("ab") as log:
-        child = subprocess.Popen(argv, env={**env, "SLOTH_UPDATE_START": "1"}, stdin=subprocess.DEVNULL, stdout=log,
+        child = subprocess.Popen(argv, env={**env, "SLOTH_UPDATE_START": "1", "SLOTH_LAUNCH_TOKEN": launch_token}, stdin=subprocess.DEVNULL, stdout=log,
                                  stderr=subprocess.STDOUT, **detached_options())
     try:
         for _ in range(100):
             if child.poll() is not None:
                 raise RuntimeError("replacement proxy exited; inspect hermes-proxy.log")
             current = proxy_record(archive)
-            if current and current["pid"] == child.pid:
+            # Windows' venv launcher may spawn the actual proxy under another
+            # PID. Match this launch, not just the launcher's process number.
+            if current and current.get("launch_token") == launch_token:
                 status = request(current["base_url"], "status", timeout=5)
                 if current["base_url"] != record["base_url"] or status.get("version") != version:
                     raise RuntimeError("replacement proxy address or version did not match")
@@ -158,10 +161,15 @@ def start_proxy(record, archive, env, version):
         raise RuntimeError("replacement proxy did not become ready")
     except BaseException:
         if child.poll() is None:
-            child.terminate()
             try:
+                parent = psutil.Process(child.pid)
+                for descendant in reversed(parent.children(recursive=True)):
+                    stop_proxy(dict(pid=descendant.pid, created_at=descendant.create_time()))
+                child.terminate()
                 child.wait(15)
-            except subprocess.TimeoutExpired:
+            except psutil.NoSuchProcess:
+                pass
+            except (subprocess.TimeoutExpired, psutil.Error, RuntimeError):
                 raise ProxyStopError(f"replacement PID {child.pid} did not stop; manual recovery required") from None
         raise
 

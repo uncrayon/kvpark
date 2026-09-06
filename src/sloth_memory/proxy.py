@@ -748,6 +748,7 @@ def main():
     server = bind_server(Handler, LISTEN_PORT, backend().url)
     atomic_json(ARCHIVE / "proxy.json", dict(**process_identity(os.getpid()),
                 python_prefix=str(Path(sys.prefix).resolve()),
+                launch_token=os.environ.get("SLOTH_LAUNCH_TOKEN"),
                 base_url=f"http://{LISTEN_HOST}:{server.server_port}", upstream_url=backend().url,
                 backend=backend().name, cache_mode=backend().cache_mode))
     log.info("Proxy listening at http://%s:%s → %s (%s)", LISTEN_HOST, server.server_port, backend().url, backend().cache_mode)
