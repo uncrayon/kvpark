@@ -20,12 +20,27 @@ python -m pip install --upgrade .
 hermes plugins enable sloth-memory
 ```
 
+If Hermes asks whether the plugin may replace built-in tools, answer **No**.
+sloth-memory registers commands and middleware; it needs no tool overrides.
+Use `hermes plugins list --plain --no-bundled` to check that it is enabled.
+
 For an existing checkout, use `git pull --ff-only origin main` on its `main`
 branch, then repeat the pip install command. Run `sloth-memory --version` in
 Hermes' environment to confirm `0.2.0.dev0`. Restart Hermes after installation or
 upgrade to load the entry point. The adapter is tested against Hermes
 0.21.0, upstream commit `9dd6634c5635321cf38840cc30e9b51226689128`.
 Use Python 3.11–3.13 for Hermes; the standalone service also supports 3.10/3.14.
+
+When activating Hermes' environment, use the interpreter that actually runs
+your CLI or gateway. For a standard Linux installation this is often:
+
+```bash
+source ~/.hermes/hermes-agent/venv/bin/activate
+python -c "import sys; print(sys.executable)"
+```
+
+Check your own installation path; installing in an unrelated virtual environment
+will not make the plugin visible to Hermes.
 
 For managed disk snapshots, build the [compatible runtime](compatibility.md)
 and obtain your own GGUF model before setup:
@@ -182,6 +197,55 @@ an active model. Plugin settings live under
 `plugins.entries.sloth-memory.settings.service` in the active Hermes profile.
 Secrets stay in `SLOTH_API_KEY` and `SLOTH_UPSTREAM_KEY_FILE`; onboarding does not
 write or print them.
+
+## Migrate an existing custom integration
+
+Install and verify `/sloth-memory setup` before changing the active model route.
+Keep a private backup of your Hermes profile's `config.yaml`, `.env`, old service
+configuration, and plugin links. These files can contain credentials; do not
+commit them. Keep existing transcripts and legacy archives in place. Use a fresh
+sloth-memory archive directory: changing the runtime arguments or archive namespace
+can invalidate previous snapshots, so the first request may need a fresh prefill.
+
+Before configuring managed startup:
+
+1. Finish active turns and pause the Hermes gateway or other clients.
+2. Park the resident conversation through the old integration if it supports it.
+3. Stop the old proxy and model service, and disable their automatic startup.
+   Port fallback prevents address conflicts but does not prevent loading a second
+   copy of the model. System-level services may need sudo to retire; sloth-memory
+   itself runs as your normal user.
+4. Disable the old archive plugin (`hermes plugins disable qwen-slot` for the
+   original integration). Retire any custom provider override that injected its
+   archive metadata. Preserve unrelated providers and model settings.
+5. Configure sloth-memory, start a new Hermes session, then restart the gateway
+   after the new route and disk persistence have been checked.
+
+A model-specific GPU runtime that already includes the compatible slot-resume
+extension can be supplied via `--server`; it still needs model-specific acceptance.
+The standard build does not include the originating project's separate DFlash2
+position or AMD hardware fixes. Preserve required fixes when migrating such a build.
+
+Transfer model and hardware settings with `--backend-args`, including context
+size, GPU device, draft model, projector, cache types, and reasoning settings.
+This option **replaces** the default argument list. Include
+`--ctx-checkpoints 8 --checkpoint-min-step 128`; use `--cache-ram 0` for the
+restart test so RAM prompt caching cannot stand in for a disk restore.
+Do not copy `--model`, `--alias`, `--host`, `--port`, `--parallel`,
+`--slot-save-path`, or UI switches from the old launcher; sloth-memory owns them.
+The managed model is advertised as `local`.
+
+Custom GPU bundles may require environment variables such as `LD_LIBRARY_PATH`.
+The plugin's child processes inherit Hermes' environment, not the old model
+service's environment. Make the required settings available to both CLI and
+gateway launches, for example in the active Hermes profile's `.env`, then restart
+Hermes. Use the bundle's absolute library directory and retain its libraries.
+Check the backend log and runtime manifest to confirm the intended build loaded.
+
+If startup fails, inspect `hermes-backend.log` and `hermes-proxy.log` inside the
+archive directory. Restore the saved profile and old plugin configuration before
+re-enabling the old services; stop any newly managed processes first to avoid
+loading duplicate models. `autostart off` alone does not stop running processes.
 
 ## Identity and compatibility
 

@@ -109,6 +109,8 @@ Install sloth-memory in Hermes' Python environment, enable it with
 ```
 
 The [Hermes setup guide](docs/hermes.md) covers selecting the backend and model.
+Already using a custom proxy or qwen-slot? Follow the [migration steps](docs/hermes.md#migrate-an-existing-custom-integration)
+to retire the old services and preserve your model settings.
 Complete setup starts the proxy and selects its actual URL for new Hermes sessions.
 The managed llama.cpp backend also starts with Hermes; existing servers remain
 under your control. Services keep running after Hermes closes for cleanup. No sudo

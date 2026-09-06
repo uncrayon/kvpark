@@ -2,6 +2,9 @@
 
 ## 0.2.0.dev0 — unreleased
 
+- Clear stale startup errors after successful onboarding and show when Hermes is already connected.
+- Document installation into an existing Hermes environment and migration from custom proxies, with live ROCm/DFlash2 acceptance evidence.
+
 - Portable process identity, data directories, file locks, and managed process lifetime for Linux, macOS, and Windows.
 - Select available ports, publish bound addresses, and discover them from CLI controls and Hermes.
 - Configure Hermes through the local proxy, preserving served model IDs; refresh matching live OpenAI clients after a port change.

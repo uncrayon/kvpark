@@ -30,6 +30,18 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(service.ensure(), state)
             spawn.assert_not_called()
 
+    def test_successful_retry_clears_previous_startup_error(self):
+        config = defaults()
+        service = Service(lambda: config)
+        with patch("sloth_memory.hermes_service.request", side_effect=URLError("offline")):
+            service._start()
+        self.assertIn("/sloth-memory setup", service.error)
+        state = {"service": "sloth-memory", "control_version": 2,
+                 "archive_dir": config["archive_dir"], "upstream": "127.0.0.1:8090"}
+        with patch("sloth_memory.hermes_service.request", return_value=state):
+            self.assertEqual(service.ensure(), state)
+        self.assertIsNone(service.error)
+
     def test_unrelated_service_is_never_taken_over(self):
         service = Service(defaults)
         with patch("sloth_memory.hermes_service.request", return_value={"service": "other"}), patch.object(service, "_spawn") as spawn:

@@ -118,6 +118,7 @@ class Service:
         self.resolved = config
         if self.persist:
             self.persist(config)
+        self.error = None
 
     def ensure(self):
         config = validate_service(self.settings())

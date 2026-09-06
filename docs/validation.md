@@ -1,5 +1,46 @@
 # Alpha validation
 
+## Live Hermes migration — main development version
+
+On 2026-09-05, sloth-memory was installed into the existing Hermes Python 3.11
+environment using this repository's installation guide. The original qwen-slot
+plugin, provider override, and system services were retired after a private
+rollback backup and parking the resident conversation. Setup ran through the real
+Hermes CLI slash command, rather than writing the plugin's settings by hand.
+
+This run used Linux, Hermes 0.21.0 (installed upstream revision `79445a49` with
+pre-existing local fixes), and Qwen3.8-27B Q8 with DFlash2 on ROCm. It reused the
+previously validated runtime bundle, including its slot-resume extension, DFlash
+position fix, and AMD gfx1151 correction. It does **not** establish that the
+standard package build includes those hardware/model-specific fixes.
+
+| Check | Observed result |
+| --- | --- |
+| Installation and discovery | Installed `0.2.0.dev0` in Hermes' environment; `/sloth-memory setup` available without granting tool overrides |
+| Native setup | Plugin launched backend and proxy; preserved context size 262,144, GPU/draft/projector and reasoning settings |
+| Actual request ownership | A real Hermes conversation reached the proxy with a verified foreground archive key |
+| Park | Slash command saved 666 tokens, approximately 0.665 GiB |
+| Process-loss recovery | Both backend and proxy were stopped, then restarted by plugin discovery; RAM prompt caching was disabled |
+| Occupied proxy port | A test listener held port 8080; the proxy selected 41283 and Hermes persisted and followed that route |
+| Restored continuation | 666 cached / 35 processed tokens; 0.135 s disk restore and 0.815 s time to first token; correctly recalled the project code and mascot |
+| Vision and reasoning | Through Hermes with `xhigh` reasoning, read the original document heading, both page numbers, and the nonlinear terms correctly |
+| Cleanup controls | With cleanup enabled, an eight-day-old disposable orphan was removed while a six-day-old orphan and unrelated file remained; restored seven-day/on defaults |
+| Delete | Slash command deleted only the acceptance conversation's saved snapshot; transcript retained |
+| Gateway | Existing Hermes gateway restarted on the selected proxy route; runtime identity and single-slot health checks passed |
+
+The test exposed a stale startup-error message after successful onboarding. The
+retry path now clears that error, and onboarding recognizes an already connected
+configuration. A regression test covers recovery after an initial startup failure.
+The installation guide now covers the tool-override prompt, environment selection,
+legacy-service migration, and preserving runtime arguments and library paths.
+
+Validation after the fix: 55 package tests (one Windows-only skip on Linux), plus
+nine passing integration checks against the installed Hermes environment (the
+optional isolated real-model test was skipped; the live workflow above supplied
+real-model evidence). This is a functional installation test with a short text
+conversation, not a matched performance benchmark, a fresh 100K-context test,
+or a macOS/Windows hardware acceptance run. No full OS reboot was performed.
+
 ## Hermes and cleanup — alpha.2
 
 The standalone suite now covers persistent cleanup controls, expiry by save date,

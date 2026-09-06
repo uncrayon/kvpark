@@ -125,6 +125,9 @@ class Adapter:
                       '/sloth-memory setup --server "/path/to/llama-server" --model "/path/to/model.gguf"']
         elif not config["model"] and not config["external"]:
             lines.append('Next: /sloth-memory setup --model "the-exact-model-ID-served-by-your-backend"')
+        elif config["connected"]:
+            lines.append("Configured. New Hermes sessions use this proxy; send a message, then /sloth-memory park to save it."
+                         if config["cache_mode"] == "native" else "Configured. New Hermes sessions use this proxy in routing mode.")
         else:
             lines += ["Next: /sloth-memory start, then /sloth-memory connect to select this route for future sessions."]
         lines += ["Commands:", "  status | park | delete [k-…] | slots",
