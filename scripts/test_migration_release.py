@@ -129,7 +129,9 @@ def main():
     if wheel.is_dir():
         wheel, = wheel.glob("kvpark-*-py3-none-any.whl")
     with tempfile.TemporaryDirectory(prefix="kvpark-migration-test-") as tmp:
-        root = Path(tmp)
+        # Match the canonical paths published by both proxies on macOS (/private)
+        # and Windows (expanded short directory names).
+        root = Path(tmp).resolve()
         old = legacy_wheel(root, args.legacy_wheel)
         venv.EnvBuilder(with_pip=True).create(root / "venv")
         python = root / "venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")

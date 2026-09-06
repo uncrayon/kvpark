@@ -158,7 +158,7 @@ class HermesIntegrationTests(unittest.TestCase):
         after = read_user_config_raw()
         self.assertEqual(after["model"], before["model"])
         settings = after["plugins"]["entries"]["kvpark"]["settings"]
-        self.assertEqual(settings["service"]["archive_dir"], str(self.home / "legacy-archive"))
+        self.assertEqual(settings["service"]["archive_dir"], str((self.home / "legacy-archive").resolve()))
         self.assertEqual(settings["route_backup"], old["settings"]["route_backup"])
         self.assertIn("already migrated", run(hermes=True, confirm=True))
         backup, = self.home.glob("config.before-kvpark-*.json")
