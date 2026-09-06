@@ -9,9 +9,16 @@ from sloth_memory.hermes_service import Service, defaults, validate_service
 
 
 class ServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        location = patch("sloth_memory.hermes_service.directory", side_effect=lambda value=None: Path(value or self.tmp.name))
+        location.start()
+        self.addCleanup(location.stop)
+
     def test_base_url_normalization_and_local_only_boundary(self):
         self.assertEqual(validate_service({"base_url": "http://127.0.0.1:9000/v1/"})["base_url"], "http://127.0.0.1:9000")
-        for url in ("https://example.com", "http://127.0.0.1:8080/x", "http://user@127.0.0.1:8080", "http://127.0.0.1:8090"):
+        for url in ("https://example.com", "http://127.0.0.1:8080/x", "http://user@127.0.0.1:8080"):
             with self.assertRaises(ValueError):
                 validate_service({"base_url": url})
 
@@ -26,7 +33,7 @@ class ServiceTests(unittest.TestCase):
     def test_unrelated_service_is_never_taken_over(self):
         service = Service(defaults)
         with patch("sloth_memory.hermes_service.request", return_value={"service": "other"}), patch.object(service, "_spawn") as spawn:
-            with self.assertRaisesRegex(RuntimeError, "incompatible service"):
+            with self.assertRaisesRegex(ValueError, "/sloth-memory setup"):
                 service.ensure()
             spawn.assert_not_called()
 

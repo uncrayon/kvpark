@@ -1,6 +1,5 @@
 """Start or attach to local sloth-memory services when Hermes loads its plugin."""
 
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -12,13 +11,17 @@ from urllib.error import URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
+from .backends import Backend, DEFAULT_URLS, normalize_url
 from .cli import request
+from .network import managed_port, proxy_record
+from .platforms import detached_options, file_lock, process_matches
 from .runtime import directory
 
 
 def defaults():
     return dict(base_url="http://127.0.0.1:8080", upstream_port=8090, archive_dir=str(directory()),
-                autostart=True, external=False, server="", model="",
+                autostart=True, external=False, server="", model="", backend="llama.cpp",
+                upstream_url="", cache_mode="native", connected=False, previous_urls=[],
                 backend_args=["--ctx-size", "8192", "--cache-ram", "0", "--ctx-checkpoints", "8",
                               "--checkpoint-min-step", "128", "--jinja"])
 
@@ -32,33 +35,50 @@ def validate_service(values):
             or parsed.query or parsed.fragment or parsed.path not in ("", "/", "/v1", "/v1/")):
         raise ValueError("base URL must be http://127.0.0.1:<port>, optionally ending in /v1")
     port = parsed.port or 80
-    if type(result["upstream_port"]) is not int or not 1 <= result["upstream_port"] <= 65535 or port == result["upstream_port"]:
-        raise ValueError("upstream port must be valid and different from the proxy port")
+    if type(result["upstream_port"]) is not int or not 1 <= result["upstream_port"] <= 65535:
+        raise ValueError("upstream port must be valid")
     result["base_url"] = f"http://127.0.0.1:{port}"
     result["archive_dir"] = str(directory(result["archive_dir"]))
-    for key in ("autostart", "external"):
+    if not isinstance(result["previous_urls"], list) or any(not isinstance(url, str) for url in result["previous_urls"]):
+        raise ValueError("previous_urls must be a list of proxy addresses")
+    for url in result["previous_urls"]:
+        parsed_previous = urlsplit(normalize_url(url))
+        if parsed_previous.scheme != "http" or parsed_previous.hostname != "127.0.0.1":
+            raise ValueError("previous proxy URLs must be local")
+    for key in ("autostart", "external", "connected"):
         if type(result[key]) is not bool:
             raise ValueError(f"{key} must be true or false")
     for key in ("model", "server"):
         if not isinstance(result[key], str):
-            raise ValueError(f"{key} must be a path")
-        if result[key]:
+            raise ValueError(f"{key} must be a string")
+        if result[key] and (key == "server" or result["backend"] == "llama.cpp" and not result["upstream_url"]):
             path = Path(result[key]).expanduser().resolve(strict=True)
             if not path.is_file():
                 raise ValueError(f"{key} must be a local file")
             result[key] = str(path)
     if not isinstance(result["backend_args"], list) or any(not isinstance(arg, str) for arg in result["backend_args"]):
         raise ValueError("backend_args must be a list of arguments")
+    if result["upstream_url"]:
+        result["upstream_url"] = normalize_url(result["upstream_url"])
+    target(result)  # validate backend and native-snapshot boundary
     return result
 
 
+def target(config):
+    url = config["upstream_url"] or (f"http://127.0.0.1:{config['upstream_port']}" if config["backend"] == "llama.cpp"
+                                      else DEFAULT_URLS.get(config["backend"], ""))
+    return Backend(config["backend"], url, config["cache_mode"])
+
+
 class Service:
-    def __init__(self, settings):
+    def __init__(self, settings, persist=None):
         self.settings = settings
+        self.persist = persist
         self.error = None
         self.worker = None
         self.lock = threading.Lock()
         self.closed = threading.Event()
+        self.resolved = None
 
     def start_async(self):
         with self.lock:
@@ -77,61 +97,106 @@ class Service:
     def _existing(self, config):
         try:
             status = request(config["base_url"], "status", timeout=2)
-        except URLError:
+        except (URLError, RuntimeError, ValueError, TimeoutError):
             return None
-        if status.get("service") != "sloth-memory" or status.get("control_version", 0) < 2:
-            raise RuntimeError("this port is occupied by an incompatible service; choose another base URL or update it")
-        if not config["external"] and Path(status["archive_dir"]).resolve() != Path(config["archive_dir"]):
-            raise RuntimeError("the running proxy uses a different archive directory; choose a separate port")
-        if status.get("upstream") != f"127.0.0.1:{config['upstream_port']}" and not config["external"]:
-            raise RuntimeError("the running proxy uses a different upstream port")
-        return status
+        if not isinstance(status, dict) or status.get("service") != "sloth-memory" or status.get("control_version", 0) < 2:
+            return None
+        if config["external"]:
+            return status
+        if Path(status.get("archive_dir", "")).resolve() != Path(config["archive_dir"]):
+            return None
+        upstream = status.get("upstream_url", "http://" + status.get("upstream", ""))
+        if upstream != target(config).url:
+            return None
+        caps = status.get("capabilities", {"backend": "llama.cpp", "cache_mode": "native"})
+        return status if (caps.get("backend"), caps.get("cache_mode")) == (config["backend"], config["cache_mode"]) else None
+
+    def _remember(self, config):
+        previous = self.settings()["base_url"]
+        if previous != config["base_url"]:
+            config["previous_urls"] = list(dict.fromkeys([*config["previous_urls"], previous]))[-8:]
+        self.resolved = config
+        if self.persist:
+            self.persist(config)
 
     def ensure(self):
         config = validate_service(self.settings())
         if self.closed.is_set():
             raise RuntimeError("Hermes adapter has been unloaded")
-        existing = self._existing(config)
-        if existing and (config["external"] or self._health(config["upstream_port"])):
-            return existing
         if config["external"]:
-            raise RuntimeError("external proxy is unavailable; start it or configure a managed backend")
-        if not config["server"] or not config["model"]:
-            raise ValueError("Run /sloth-memory setup --server /path/to/llama-server --model /path/to/model.gguf")
-        from .runtime import backend_command
-        archive = Path(config["archive_dir"])
-        backend_command(config["server"], config["model"], archive, config["upstream_port"], config["backend_args"])
-        archive.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with (archive / ".hermes-start.lock").open("a") as start_lock:
-            # Multiple Hermes surfaces can load the same enabled plugin at once.
-            fcntl.flock(start_lock, fcntl.LOCK_EX)
             existing = self._existing(config)
-            if existing and self._health(config["upstream_port"]):
+            if not existing:
+                raise RuntimeError("external proxy is unavailable or incompatible")
+            self._remember(config)
+            return existing
+        archive = Path(config["archive_dir"])
+        with file_lock(archive / ".hermes-start.lock"):
+            # The process that won startup publishes the actual bound address.
+            # Read it again under the interprocess lock, including after a reboot.
+            record = proxy_record(archive)
+            if record:
+                expected = target(config)
+                if (record["backend"], record["cache_mode"]) != (expected.name, expected.cache_mode):
+                    raise RuntimeError("this archive is already serving another backend; use a separate archive directory")
+                if config["upstream_url"] and record["upstream_url"] != expected.url:
+                    raise RuntimeError("this archive is already serving another upstream; use a separate archive directory")
+                config["base_url"] = record["base_url"]
+                if config["backend"] == "llama.cpp" and not config["upstream_url"]:
+                    config["upstream_port"] = urlsplit(record["upstream_url"]).port
+            elif config["backend"] == "llama.cpp" and not config["upstream_url"]:
+                actual = managed_port(archive)
+                if actual:
+                    config["upstream_port"] = actual
+            existing = self._existing(config)
+            if existing:
+                if config["server"] and config["model"] and config["backend"] == "llama.cpp" and not config["upstream_url"]:
+                    if not self._owned_backend(config):
+                        raise RuntimeError("the running backend uses another model/configuration; use a separate archive directory")
+                self._remember(config)
                 return existing
-            if self.closed.is_set():
-                raise RuntimeError("Hermes adapter has been unloaded")
-            backend_running = False
-            # A surviving managed backend can be reused after a proxy crash.
-            try:
-                with self._health_response(config["upstream_port"]):
-                    backend_running = self._owned_backend(config)
-                    if not backend_running:
-                        raise RuntimeError("upstream port is already in use; configure external mode or choose another port")
-            except URLError as exc:
-                if hasattr(exc, "code"):
-                    raise RuntimeError("upstream port is already in use") from exc
+            if record:
+                raise RuntimeError("the archive's proxy is running but unavailable; inspect hermes-proxy.log")
+            managed = config["backend"] == "llama.cpp" and not config["upstream_url"]
+            if managed and (not config["server"] or not config["model"]):
+                raise ValueError("Run /sloth-memory setup --server /path/to/llama-server --model /path/to/model.gguf")
+            if not managed and not config["model"]:
+                raise ValueError("Set --model to the model name served by your backend")
+            if managed:
+                from .runtime import backend_command
+                backend_command(config["server"], config["model"], archive, config["upstream_port"], config["backend_args"])
             started = []
             try:
-                if not backend_running:
-                    backend = self._spawn(["backend", "--server", config["server"], "--model", config["model"],
-                        "--archive-dir", str(archive), "--port", str(config["upstream_port"]), "--", *config["backend_args"]], archive / "hermes-backend.log")
-                    started.append(backend)
-                    self._wait(backend, lambda: self._health(config["upstream_port"]), archive / "hermes-backend.log")
-                if not existing:
-                    proxy = self._spawn(["serve", "--archive-dir", str(archive), "--port", str(urlsplit(config["base_url"]).port),
-                        "--upstream-port", str(config["upstream_port"])], archive / "hermes-proxy.log")
-                    started.append(proxy)
-                    self._wait(proxy, lambda: self._existing(config), archive / "hermes-proxy.log")
+                if managed:
+                    port = managed_port(archive)
+                    if port:
+                        config["upstream_port"] = port
+                        if not self._owned_backend(config):
+                            raise RuntimeError("another model/configuration owns this archive; use a separate archive directory")
+                    else:
+                        child = self._spawn(["backend", "--server", config["server"], "--model", config["model"],
+                            "--archive-dir", str(archive), "--port", str(config["upstream_port"]), "--", *config["backend_args"]], archive / "hermes-backend.log")
+                        started.append(child)
+                        def ready():
+                            actual = managed_port(archive)
+                            if actual:
+                                config["upstream_port"] = actual
+                                return self._health(actual)
+                            return False
+                        self._wait(child, ready, archive / "hermes-backend.log")
+                else:
+                    self._probe(target(config))
+                child = self._spawn(["serve", "--archive-dir", str(archive), "--port", str(urlsplit(config["base_url"]).port),
+                    "--backend", config["backend"], "--cache-mode", config["cache_mode"],
+                    "--upstream-url", target(config).url], archive / "hermes-proxy.log")
+                started.append(child)
+                def ready_proxy():
+                    actual = proxy_record(archive)
+                    if actual:
+                        config["base_url"] = actual["base_url"]
+                        return self._existing(config)
+                    return None
+                self._wait(child, ready_proxy, archive / "hermes-proxy.log")
+                self._remember(config)
                 return self._existing(config)
             except BaseException:
                 for process in reversed(started):
@@ -150,10 +215,7 @@ class Service:
         try:
             archive = Path(config["archive_dir"])
             manifest = json.loads((archive / "runtime.json").read_text())
-            proc = Path(f"/proc/{manifest['pid']}")
-            ticks = (proc / "stat").read_text().rsplit(") ", 1)[1].split()[19]
-            argv = (proc / "cmdline").read_bytes().rstrip(b"\0").decode().split("\0")
-            return (ticks == manifest["start_ticks"] and argv == backend_command(
+            return (process_matches(manifest) and manifest["argv"] == backend_command(
                 config["server"], config["model"], archive, config["upstream_port"], config["backend_args"])
                 and all(file_identity(Path(path)) == expected for path, expected in manifest["files"].items()))
         except (OSError, ValueError, KeyError):
@@ -165,25 +227,24 @@ class Service:
             log.replace(log.with_suffix(".previous.log"))
         with log.open("ab") as output:
             process = subprocess.Popen([sys.executable, "-m", "sloth_memory", *argv], stdin=subprocess.DEVNULL,
-                stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
-        # The service survives Hermes closing so scheduled cleanup keeps running.
+                stdout=output, stderr=subprocess.STDOUT, **detached_options())
         threading.Thread(target=process.wait, name="sloth-memory-reaper", daemon=True).start()
         return process
 
     @staticmethod
-    def _health_response(port):
+    def _probe(backend):
         headers = {}
         key_file = os.environ.get("SLOTH_UPSTREAM_KEY_FILE")
         if key_file:
             headers["Authorization"] = "Bearer " + Path(key_file).read_text().strip()
-        return urlopen(Request(f"http://127.0.0.1:{port}/health", headers=headers), timeout=2)
+        with urlopen(Request(backend.url + backend.health_path, headers=headers), timeout=5) as response:
+            return json.load(response)
 
     @classmethod
     def _health(cls, port):
         try:
-            with cls._health_response(port) as response:
-                return json.load(response).get("status") == "ok"
-        except URLError:
+            return cls._probe(Backend("llama.cpp", f"http://127.0.0.1:{port}" )).get("status") == "ok"
+        except (URLError, ValueError):
             return False
 
     def _wait(self, process, probe, log):

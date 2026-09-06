@@ -1,5 +1,9 @@
 # Hermes adapter and onboarding
 
+For the next development version's portable startup, automatic port selection,
+and other inference engines, see [backend setup](backends.md). The instructions
+below describe the published alpha.2.
+
 The adapter ships inside sloth-memory as a native Hermes plugin. It uses plugin
 discovery, request middleware, commands, and profile settings. It does not patch
 Hermes source or replace its semantic memory provider.

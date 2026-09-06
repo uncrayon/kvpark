@@ -10,7 +10,7 @@ import re
 import shlex
 
 from .cli import request
-from .hermes_service import Service, defaults, validate_service
+from .hermes_service import Service, defaults, validate_service, target
 
 _command_context = ContextVar("sloth_memory_command_context", default=None)
 
@@ -45,7 +45,14 @@ class Adapter:
         from hermes_constants import get_hermes_home
         self.home = Path(get_hermes_home()).resolve()
         self.namespace = "hermes:" + hashlib.sha256(str(self.home).encode()).hexdigest()[:16] + ":"
-        self.service = Service(self.settings)
+        self.service = Service(self.settings, self.persist_service)
+
+    def persist_service(self, config):
+        previous = self.settings()
+        if previous != config:
+            self.ctx.set_config("service", config)
+        if config["connected"] and previous["base_url"] != config["base_url"]:
+            self.write_route(config)
 
     def settings(self):
         return {**defaults(), **self.ctx.get_config("service", {})}
@@ -58,10 +65,28 @@ class Adapter:
 
     def middleware(self, *, request, session_id="", base_url="", api_mode="", **kwargs):
         config = self.settings()
-        if base_url.rstrip("/") != config["base_url"].rstrip("/") + "/v1" or api_mode != "chat_completions":
+        routes = {url.rstrip("/") + "/v1" for url in [config["base_url"], *config["previous_urls"]]}
+        if config["connected"]:
+            routes.add(target(config).url + "/v1")
+        if base_url.rstrip("/") not in routes or api_mode != "chat_completions":
             return None
         if config["autostart"]:
             self.service.ensure()
+            config = self.settings()
+        destination = config["base_url"] + "/v1"
+        if base_url.rstrip("/") != destination:
+            # Hermes' request middleware changes payloads, not transports. For
+            # a bound native OpenAI client, update its documented base_url property
+            # before the pending dispatch, keeping model, history and sampling.
+            from agent.subagent_lifecycle import get_active_subagent_parent
+            from openai import OpenAI
+            active = get_active_subagent_parent()
+            client = getattr(active, "client", None)
+            if (getattr(active, "session_id", None) != session_id or not isinstance(client, OpenAI)
+                    or str(client.base_url).rstrip("/") != base_url.rstrip("/")):
+                return None
+            client.base_url = destination
+            active.base_url = destination
         payload = dict(request)
         extra = dict(payload.get("extra_body") or {})
         # Replace any inherited archive tags rather than trusting a fork's copy.
@@ -92,7 +117,10 @@ class Adapter:
                  "A 32 GiB budget also limits saved snapshots. Your transcript and live RAM state are kept.",
                  f"Proxy: {config['base_url']}/v1", f"Archive: {config['archive_dir']}",
                  "Starts with Hermes: " + ("on" if config["autostart"] else "off")]
-        if not config["external"] and not (config["server"] and config["model"]):
+        lines += [f"Backend: {config['backend']} · cache mode: {config['cache_mode']}"]
+        if config["cache_mode"] == "routing":
+            lines.append("Disk resume is unavailable for this adapter; backend-managed caches remain independent.")
+        if config["backend"] == "llama.cpp" and not config["external"] and not config["upstream_url"] and not (config["server"] and config["model"]):
             lines += ["Next: configure your patched llama-server and GGUF:",
                       '/sloth-memory setup --server "/path/to/llama-server" --model "/path/to/model.gguf"']
         else:
@@ -100,7 +128,8 @@ class Adapter:
         lines += ["Commands:", "  status | park | delete [k-…] | slots",
                   "  retention 7 | budget 32 | cleanup on|off|now",
                   "  base-url http://127.0.0.1:8080 | autostart on|off",
-                  "Setup also accepts --archive-dir, --upstream-port, --backend-args (quoted), and --external.",
+                  "Setup also accepts --backend llama.cpp|ollama|vllm|mlx, --upstream-url, --model, --cache-mode native|routing,",
+                  "--archive-dir, --upstream-port, --backend-args (quoted), and --external.",
                   "Restore is automatic when you return to a compatible conversation."]
         if self.service.error:
             lines.append("Startup needs attention: " + self.service.error)
@@ -112,16 +141,21 @@ class Adapter:
             def error(self, message):
                 raise ValueError(message)
         parser = Parser(prog="/sloth-memory setup", add_help=False)
-        for key in ("server", "model", "archive-dir", "base-url", "backend-args"):
+        for key in ("server", "model", "archive-dir", "base-url", "backend-args", "backend", "upstream-url", "cache-mode"):
             parser.add_argument("--" + key)
         parser.add_argument("--upstream-port", type=int)
         parser.add_argument("--external", action=argparse.BooleanOptionalAction, default=None)
         parsed = vars(parser.parse_args(args))
         updates = {key: value for key, value in parsed.items() if value is not None}
+        if "backend" in updates and "cache_mode" not in updates:
+            updates["cache_mode"] = "native" if updates["backend"] == "llama.cpp" else "routing"
         if "backend_args" in updates:
             updates["backend_args"] = shlex.split(updates["backend_args"])
         result = validate_service({**self.settings(), **updates})
         self.ctx.set_config("service", result)
+        ready = result["model"] and (result["server"] or result["upstream_url"] or result["backend"] != "llama.cpp")
+        if ready and not result["external"]:
+            return self.connect() + "\n" + self.onboarding()
         if result["autostart"]:
             self.service.start_async()
         return "Settings saved. " + self.onboarding()
@@ -147,6 +181,12 @@ class Adapter:
 
     def connect(self):
         self.service.ensure()
+        settings = self.settings()
+        self.write_route(settings)
+        self.ctx.set_config("service", {**settings, "connected": True})
+        return "Hermes now defaults to sloth-memory for new sessions. Restart Hermes and start a new conversation; existing sessions keep their saved route."
+
+    def write_route(self, settings):
         # Explicit command selects the default for FUTURE sessions through Hermes'
         # normal config writer; live agents and prompt histories are not changed.
         from hermes_cli import config
@@ -157,10 +197,12 @@ class Adapter:
         if any(managed_scope.is_key_managed("model." + field) for field in fields):
             raise PermissionError("model routing is managed by your administrator")
         config.read_user_config_raw()
-        config.save_config({"model": {"provider": "custom", "default": "local",
-                           "base_url": self.settings()["base_url"] + "/v1", "api_mode": "chat_completions"}},
+        model = "local" if settings["backend"] == "llama.cpp" and not settings["upstream_url"] else settings["model"]
+        if not model:
+            model = "local"  # legacy external llama.cpp proxy
+        config.save_config({"model": {"provider": "custom", "default": model,
+                           "base_url": settings["base_url"] + "/v1", "api_mode": "chat_completions"}},
                            merge_existing=True)
-        return "Hermes now defaults to sloth-memory for new sessions. Restart Hermes and start a new conversation; existing sessions keep their saved route."
 
     def handle(self, raw_args):
         args = shlex.split(raw_args)
@@ -199,6 +241,8 @@ class Adapter:
                      "Model: " + status["activity"]["phase"]]
             if status.get("runtime_error"):
                 lines.append("Runtime needs attention: " + status["runtime_error"])
+            if status.get("capabilities"):
+                lines.append(status["capabilities"]["note"])
             for entry in status["entries"]:
                 lines.append(f"{entry['key']} — {entry['tokens']:,} tokens, {entry['gib']} GiB, {entry['age_days']} days old")
             return "\n".join(lines)

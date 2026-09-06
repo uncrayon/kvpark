@@ -6,10 +6,12 @@ permissions:
   contents: read
 jobs:
   python:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         python: ['3.10', '3.12', '3.14']
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -19,14 +21,18 @@ jobs:
       - run: python -m unittest discover -s tests -v
       - run: sloth-memory --version
   runtime:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python scripts/build_runtime.py --jobs 2
-      - run: runtime/build/bin/llama-server --version
+      - run: python scripts/build_runtime.py --jobs 2 --cmake-arg=-DGGML_METAL=OFF
+      - run: python -c "import pathlib, subprocess; p = next(p for p in pathlib.Path('runtime/build/bin').rglob('*') if p.name in ('llama-server', 'llama-server.exe')); subprocess.run([str(p), '--version'], check=True)"
   package:
     runs-on: ubuntu-latest
     steps:
@@ -42,7 +48,11 @@ jobs:
           name: python-distributions
           path: dist/*
   hermes:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
