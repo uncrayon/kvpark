@@ -61,7 +61,7 @@ class Adapter:
         return "k-" + hashlib.sha256((self.namespace + session_id).encode()).hexdigest()
 
     def capture_command(self, *, command="", session_key=None, **kwargs):
-        _command_context.set(session_key if command.replace("_", "-") == "sloth-memory" else None)
+        _command_context.set(session_key if command.replace("_", "-") in {"sloth", "sloth-memory"} else None)
 
     def middleware(self, *, request, session_id="", base_url="", api_mode="", **kwargs):
         config = self.settings()
@@ -274,9 +274,10 @@ class Adapter:
 
 def register(ctx):
     adapter = Adapter(ctx)
-    ctx.register_command("sloth-memory", adapter.command,
-                         description="Set up conversation slots, park, delete, and configure cleanup",
-                         args_hint="setup | status | park | delete | cleanup | retention | base-url", argument_mode="text")
+    for name in ("sloth", "sloth-memory"):
+        ctx.register_command(name, adapter.command,
+                             description="Set up conversation slots, park, delete, and configure cleanup",
+                             args_hint="setup | status | park | delete | cleanup | retention | base-url", argument_mode="text")
     ctx.register_hook("pre_command", adapter.capture_command)
     ctx.register_middleware("llm_request", adapter.middleware)
     ctx.on_unload(adapter.service.closed.set)

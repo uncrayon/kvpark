@@ -56,6 +56,9 @@ backend. Connecting an existing server in routing mode requires no build.
 
 ## Guided setup
 
+`/sloth` is a shortcut for `/sloth-memory` on every platform. Use `/sloth` in
+Telegram, including for the setup commands below.
+
 ```text
 /sloth-memory setup
 ```
@@ -154,6 +157,32 @@ To delete another saved slot, copy its full key from `slots`:
 ```
 
 Resume by sending a normal message in the same compatible session.
+
+## Telegram command picker
+
+Use `/sloth setup`, `/sloth status`, and `/sloth park` in Telegram. Telegram
+command names cannot contain hyphens; the short alias also preserves the current
+chat's identity through Hermes' command hooks. Avoid the automatically converted
+`/sloth_memory` spelling on the tested Hermes version.
+
+Hermes limits its Telegram menu to 60 commands by default, so a working plugin
+command can be omitted from the picker. To keep `/sloth` visible, add it to the
+menu priority in your Hermes profile's `config.yaml`, merging with any existing
+platform settings and priority entries:
+
+```yaml
+platforms:
+  telegram:
+    extra:
+      command_menu:
+        priority: [sloth]
+        priority_mode: prepend
+```
+
+Restart the Hermes gateway after installation and configuration. It publishes
+the menu to Telegram for default, private-chat, and group scopes. Reopen the chat
+or command menu if the client still shows cached suggestions. You can also type
+`/sloth status` directly while checking menu registration.
 
 ## Discord command picker
 

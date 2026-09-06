@@ -2,6 +2,8 @@
 
 ## 0.2.0.dev0 — unreleased
 
+- Add the portable `/sloth` alias, preserve Telegram chat identity when parking, and document Telegram menu priority; cover dispatch and menu visibility in Hermes integration tests.
+
 - Explain when a gateway conversation needs a normal model turn before its first park; cover Discord command dispatch and conversation isolation in integration tests.
 
 - Clear stale startup errors after successful onboarding and show when Hermes is already connected.

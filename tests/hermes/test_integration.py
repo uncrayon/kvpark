@@ -50,7 +50,7 @@ class HermesIntegrationTests(unittest.TestCase):
     def command_text(self, text):
         return asyncio.run(self.command(text))
 
-    async def gateway_command(self, text, thread="discord:acceptance"):
+    async def gateway_command(self, text, thread="discord:acceptance", *, platform="discord", command="sloth-memory"):
         from unittest.mock import AsyncMock
         from gateway.run_inbound import GatewayInboundMixin
         from gateway.session import SessionSource
@@ -71,11 +71,31 @@ class HermesIntegrationTests(unittest.TestCase):
             def _gateway_idle_command_handlers(self):
                 return {}
 
-        source = SessionSource(platform=Platform.DISCORD, chat_id="test-channel", user_id="test-user")
-        event = MessageEvent(text="/sloth-memory " + text, source=source)
+        source = SessionSource(platform=Platform(platform), chat_id="test-channel", user_id="test-user")
+        event = MessageEvent(text="/" + command + " " + text, source=source)
         handled, result = await Runner()._hm_dispatch_idle_commands(event, source, thread)
         self.assertTrue(handled)
         return result
+
+    def test_telegram_short_command_preserves_chat_identity(self):
+        adapter = self.command.__self__
+        self.archive.current_key = adapter.key("telegram-session")
+        self.archive.current_thread = adapter.namespace + "telegram:acceptance"
+        self.archive.publish_status()
+        with patch.object(self.archive, "park", return_value={"tokens": 456, "note": "Saved."}) as park:
+            result = asyncio.run(self.gateway_command("park", "telegram:acceptance",
+                                                      platform="telegram", command="sloth"))
+        self.assertIn("Parked 456 tokens", result)
+        self.assertEqual(park.call_args.kwargs["key"], adapter.key("telegram-session"))
+
+    def test_telegram_menu_priority_keeps_short_command_visible(self):
+        from hermes_cli.config import save_config
+        from hermes_cli.commands_platforms import telegram_menu_commands
+        save_config({"platforms": {"telegram": {"extra": {"command_menu": {
+            "priority": ["sloth"], "priority_mode": "prepend"}}}}}, merge_existing=True)
+        menu, _ = telegram_menu_commands(max_commands=5)
+        self.assertIn("sloth", [name for name, _ in menu])
+        self.assertEqual(sum(name == "sloth" for name, _ in menu), 1)
 
     def test_discord_park_before_first_turn_explains_how_to_load_state(self):
         with patch.object(self.archive, "park") as park:
