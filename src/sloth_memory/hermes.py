@@ -187,7 +187,12 @@ class Adapter:
             matches = [entry["key"] for entry in status["entries"] if entry.get("thread") == thread]
             if len(matches) == 1:
                 return matches[0]
-        raise ValueError("this conversation could not be identified; use an exact key from /sloth-memory slots")
+            if not matches:
+                raise ValueError("this conversation has no saved or resident state in sloth-memory yet. "
+                                 "Send a normal message in this conversation, wait for the reply, then run "
+                                 "/sloth-memory park. Restarting the gateway alone does not load its model state.")
+            raise ValueError("this chat has multiple saved conversations; choose an exact key from /sloth-memory slots")
+        raise ValueError("Hermes did not provide this command's conversation identity; use an exact key from /sloth-memory slots")
 
     def connect(self):
         self.service.ensure()

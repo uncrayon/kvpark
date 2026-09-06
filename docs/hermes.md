@@ -136,6 +136,16 @@ also checked before restoring a snapshot.
 Disk park/resume requires native snapshot mode. Routing-only adapters report
 `capabilities.disk_snapshots: false` in status and reject parking.
 
+Before the first park after installation or migration, **send a normal message
+in that same conversation and wait for the reply**. Then run `/sloth-memory park`.
+Opening a saved transcript, `/status`, and restarting the gateway do not send its
+history through the model, so they cannot create resident state to save. A chat
+from the old integration may need a fresh prefill on this first message.
+
+If the command says there is no saved or resident state, follow that sequence.
+`/sloth-memory slots` lists snapshots already saved through this plugin; it cannot
+recover a conversation that has never run through the new proxy.
+
 Park and delete target the current verified conversation and make no model call.
 To delete another saved slot, copy its full key from `slots`:
 

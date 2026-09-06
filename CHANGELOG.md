@@ -2,6 +2,8 @@
 
 ## 0.2.0.dev0 — unreleased
 
+- Explain when a gateway conversation needs a normal model turn before its first park; cover Discord command dispatch and conversation isolation in integration tests.
+
 - Clear stale startup errors after successful onboarding and show when Hermes is already connected.
 - Document installation into an existing Hermes environment and migration from custom proxies, with live ROCm/DFlash2 acceptance evidence.
 

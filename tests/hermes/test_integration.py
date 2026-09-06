@@ -50,6 +50,60 @@ class HermesIntegrationTests(unittest.TestCase):
     def command_text(self, text):
         return asyncio.run(self.command(text))
 
+    async def gateway_command(self, text, thread="discord:acceptance"):
+        from unittest.mock import AsyncMock
+        from gateway.run_inbound import GatewayInboundMixin
+        from gateway.session import SessionSource
+        from gateway.config import Platform
+        from gateway.platforms.base import MessageEvent
+
+        class Runner(GatewayInboundMixin):
+            config = {}
+            _draining = False
+            hooks = SimpleNamespace(emit_collect=AsyncMock(return_value=[]))
+
+            def _check_slash_access(self, source, command):
+                return None
+
+            def _gateway_plain_command_handlers(self):
+                return {}
+
+            def _gateway_idle_command_handlers(self):
+                return {}
+
+        source = SessionSource(platform=Platform.DISCORD, chat_id="test-channel", user_id="test-user")
+        event = MessageEvent(text="/sloth-memory " + text, source=source)
+        handled, result = await Runner()._hm_dispatch_idle_commands(event, source, thread)
+        self.assertTrue(handled)
+        return result
+
+    def test_discord_park_before_first_turn_explains_how_to_load_state(self):
+        with patch.object(self.archive, "park") as park:
+            result = asyncio.run(self.gateway_command("park"))
+        self.assertIn("Send a normal message", result)
+        park.assert_not_called()
+
+    def test_discord_park_uses_hook_thread_without_a_bound_session_id(self):
+        adapter = self.command.__self__
+        self.archive.current_key = adapter.key("discord-session")
+        self.archive.current_thread = adapter.namespace + "discord:acceptance"
+        self.archive.publish_status()
+        with patch.dict(os.environ, {"HERMES_SESSION_ID": "unrelated-process-session"}):
+            with patch.object(self.archive, "park", return_value={"tokens": 123, "note": "Saved."}) as park:
+                result = asyncio.run(self.gateway_command("park"))
+        self.assertIn("Parked 123 tokens", result)
+        self.assertEqual(park.call_args.kwargs["key"], adapter.key("discord-session"))
+
+    def test_discord_park_never_selects_another_threads_resident_state(self):
+        adapter = self.command.__self__
+        self.archive.current_key = adapter.key("someone-else")
+        self.archive.current_thread = adapter.namespace + "discord:someone-else"
+        self.archive.publish_status()
+        with patch.object(self.archive, "park") as park:
+            result = asyncio.run(self.gateway_command("park"))
+        self.assertIn("Send a normal message", result)
+        park.assert_not_called()
+
     def test_real_discovery_onboarding_and_persistent_settings_over_http(self):
         self.assertIn("setup --server", self.command_text("setup --no-external"))
         self.assertIn("ttl_days", self.command_text("retention 14"))

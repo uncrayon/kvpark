@@ -41,6 +41,23 @@ real-model evidence). This is a functional installation test with a short text
 conversation, not a matched performance benchmark, a fresh 100K-context test,
 or a macOS/Windows hardware acceptance run. No full OS reboot was performed.
 
+## Discord first-park follow-up
+
+The first live Discord attempt after migration exposed a gap in the installation
+test: restarting the gateway and issuing `park` had not sent that existing
+conversation through the new proxy. The plugin reported an identity error even
+though the missing item was saved or resident state for that chat.
+
+The message and setup guide now explain the required first normal message.
+Integration tests exercise Hermes' actual idle gateway command dispatcher with a
+Discord event: first park without state, a matching resident conversation, and a
+different chat's resident state. The matching case resolves the correct key through
+the hook without a bound session ID; unrelated process environment identity is
+ignored. These tests use an isolated archive and stub the final save operation;
+they do not send Discord messages or constitute another real-model cache test.
+Twelve integration tests pass on both the installed and pinned Hermes versions;
+the optional isolated real-model test is skipped in these runs.
+
 ## Hermes and cleanup — alpha.2
 
 The standalone suite now covers persistent cleanup controls, expiry by save date,
