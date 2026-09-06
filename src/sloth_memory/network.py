@@ -5,6 +5,7 @@ import json
 from http.server import ThreadingHTTPServer
 import os
 import socket
+from socketserver import TCPServer
 from urllib.parse import urlsplit
 from .platforms import process_matches
 
@@ -35,7 +36,11 @@ class LocalServer(ThreadingHTTPServer):
     def server_bind(self):
         if os.name == "nt":
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-        super().server_bind()
+        # HTTPServer's default bind performs a reverse-DNS lookup, which can
+        # stall localhost startup on macOS with an unavailable resolver.
+        TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = self.server_address[1]
 
 
 def bind_server(handler, preferred, upstream_url):

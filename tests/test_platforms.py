@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from sloth_memory.platforms import available_port, process_identity, process_matches
 from sloth_memory.network import bind_server
@@ -40,7 +41,8 @@ class PlatformTests(unittest.TestCase):
             occupied.bind(("127.0.0.1", 0))
             occupied.listen()
             preferred = occupied.getsockname()[1]
-            server = bind_server(Handler, preferred, f"http://127.0.0.1:{preferred}")
+            with patch("socket.getfqdn", side_effect=AssertionError("localhost startup must not use DNS")):
+                server = bind_server(Handler, preferred, f"http://127.0.0.1:{preferred}")
             try:
                 selected = server.server_port
                 self.assertNotEqual(selected, preferred)

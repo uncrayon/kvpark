@@ -76,17 +76,19 @@ class RoutingTests(unittest.TestCase):
     def start(self, backend):
         archive = self.root / backend
         env = {key: value for key, value in os.environ.items() if not key.startswith("SLOTH_")}
-        process = subprocess.Popen([sys.executable, "-m", "sloth_memory", "serve", "--backend", backend,
-            "--cache-mode", "routing", "--upstream-url", self.upstream_url, "--port", str(self.preferred),
-            "--archive-dir", str(archive)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log = self.root / (backend + ".log")
+        with log.open("wb") as output:
+            process = subprocess.Popen([sys.executable, "-m", "sloth_memory", "serve", "--backend", backend,
+                "--cache-mode", "routing", "--upstream-url", self.upstream_url, "--port", str(self.preferred),
+                "--archive-dir", str(archive)], env=env, stdout=output, stderr=subprocess.STDOUT)
         self.children.append(process)
         for _ in range(100):
-            self.assertIsNone(process.poll(), "proxy exited")
+            self.assertIsNone(process.poll(), "proxy exited: " + log.read_text(errors="replace"))
             record = proxy_record(archive)
             if record:
                 return record, archive
             time.sleep(.05)
-        self.fail("proxy did not publish its bound address")
+        self.fail("proxy did not publish its bound address: " + log.read_text(errors="replace"))
 
     def test_four_backends_forward_models_streaming_tools_and_report_capabilities(self):
         for name in ("llama.cpp", "ollama", "vllm", "mlx"):
