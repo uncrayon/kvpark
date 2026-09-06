@@ -76,6 +76,12 @@ coordinated release update. See [updates and recovery](updates.md).
 `/sloth` is a shortcut for `/sloth-memory` on every platform. Use `/sloth` in
 Telegram, including for the setup commands below.
 
+Already serving a model with vLLM, Ollama, MLX-LM, or llama.cpp? First
+[find its exact model ID](backends.md#find-your-model-id), then follow
+[connect an existing server](backends.md#connect-an-existing-server).
+That guide shows the lookup command for each backend and which response value
+to copy into `--model`; no llama.cpp build is needed for routing an existing server.
+
 ```text
 /sloth-memory setup
 ```

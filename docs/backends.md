@@ -28,7 +28,8 @@ be used in routing mode, including a backend on another machine or in WSL.
 ## Connect an existing server
 
 Start the inference server normally using its own installation instructions.
-Then configure Hermes with the **exact model ID served by that server**:
+Then configure Hermes with the **exact model ID served by that server**. Use
+[the model-ID lookup below](#find-your-model-id) before replacing the placeholders:
 
 ```text
 /sloth-memory setup --backend ollama --upstream-url http://127.0.0.1:11434 --model "your-model:tag"
@@ -67,6 +68,80 @@ Both commands use the same default archive directory. With a custom directory,
 pass `--archive-dir` to both. `--url` remains an explicit override for controls.
 The proxy accepts chat completions, model discovery, and health checks; backend
 management APIs and other generation APIs are not exposed.
+
+## Find your model ID
+
+The model ID is the string the backend expects in a chat request's `model` field.
+It may be a serving alias, a repository name, a tagged name, or a full file path.
+Copy it exactly, including capitalization, slashes, and tags; a display name such
+as “Gemma” is not enough unless you configured that exact alias.
+
+Start the backend, then query its **own address**, before connecting Sloth. Run
+the appropriate command from the machine running Hermes:
+
+| Backend | List models (example address) | Value to use for Sloth's `--model` |
+| --- | --- | --- |
+| Existing llama.cpp | `curl -fsS http://127.0.0.1:8090/v1/models` | An `id` inside `data`; usually the `--alias` value, otherwise the model file path |
+| Ollama | `curl -fsS http://127.0.0.1:11434/v1/models` | An `id` inside `data`, including its tag, such as `example-model:latest` |
+| vLLM | `curl -fsS http://127.0.0.1:8000/v1/models` | An `id` inside `data`; `--served-model-name` if configured, otherwise the model name/path passed to vLLM |
+| MLX-LM | `curl -fsS http://127.0.0.1:8081/v1/models` | An `id` inside `data`, such as a Hugging Face repository ID or an absolute local model directory |
+
+The ports above are examples from this guide, not guaranteed backend defaults.
+Use the port shown in your server's startup output. If it runs on another machine,
+replace `127.0.0.1` with its reachable address; localhost always means the machine
+where you run the command. In Windows PowerShell, use `curl.exe` to avoid older
+PowerShell's `curl` alias. These commands do not need `jq`.
+
+For example, if your vLLM server returns:
+
+```json
+{
+  "object": "list",
+  "data": [{"id": "my-gemma", "object": "model"}]
+}
+```
+
+Use the **`id` string `my-gemma`**, not the entire JSON object:
+
+```text
+/sloth setup --backend vllm --cache-mode routing --upstream-url http://127.0.0.1:8000 --model "my-gemma"
+/sloth status
+```
+
+`my-gemma` is an example alias, not a model to download. If you choose to set that
+alias when starting vLLM, add `--served-model-name my-gemma` to your working serve
+command, then query `/v1/models` again to confirm it.
+
+For Ollama, `ollama list` is another option when the CLI is connected to the same
+server: copy the **NAME** column, including `:tag`. Do not copy its hexadecimal
+**ID** column; that identifies the model artifact, not the API model name.
+
+MLX-LM's list can include downloaded models that are not currently loaded. Choose
+the model you intend to serve; a listing alone does not prove that it can load or
+generate successfully. A locally served model can appear as an absolute directory
+path, so keep the quotes around `--model` when the path contains spaces.
+
+For Sloth's **managed native llama.cpp setup**, `--model` instead takes your local
+GGUF path, as shown in the [Hermes guide](hermes.md#guided-setup). Sloth starts that
+backend with the alias `local` and selects it for Hermes automatically.
+
+If discovery fails:
+
+- **Connection refused or timeout:** check that the server is running and that
+  Hermes can reach its host and port.
+- **401 or 403:** use the backend's required authentication. For a Bearer-protected
+  endpoint, supply an `Authorization: Bearer …` header; keep the credential out
+  of chat and committed files. See [upstream credentials](#port-selection-and-routing)
+  when configuring Sloth to connect to that server.
+- **404 or HTML response:** check that this is the inference API address, not a
+  web UI, and that `/v1` was not added twice.
+- **Empty `data` list:** check the backend's model configuration/downloads and
+  logs. Do not invent an ID or assume the first model is already loaded.
+
+Backend references: [llama.cpp model information](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md),
+[Ollama OpenAI compatibility](https://docs.ollama.com/api/openai-compatibility),
+[vLLM serving arguments](https://docs.vllm.ai/en/latest/cli/serve/),
+and [MLX-LM model listing implementation](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/server.py).
 
 ## Port selection and routing
 
