@@ -69,6 +69,8 @@ class Adapter:
 
     def middleware(self, *, request, session_id="", base_url="", api_mode="", **kwargs):
         config = self.settings()
+        if config["uninstalled"]:
+            return None
         routes = {url.rstrip("/") + "/v1" for url in [config["base_url"], *config["previous_urls"]]}
         if config["connected"]:
             routes.add(target(config).url + "/v1")
@@ -135,7 +137,7 @@ class Adapter:
         else:
             lines += ["Next: /sloth-memory start, then /sloth-memory connect to select this route for future sessions."]
         lines += ["Commands:", "  status | park | delete [k-…] | slots",
-                  "  update check | update",
+                  "  update check | update | uninstall [confirm]",
                   "  retention 7 | budget 32 | cleanup on|off|now",
                   "  base-url http://127.0.0.1:8080 | autostart on|off",
                   "Setup also accepts --backend llama.cpp|ollama|vllm|mlx, --upstream-url, --model, --cache-mode native|routing,",
@@ -147,6 +149,8 @@ class Adapter:
 
     def configure(self, args):
         import argparse
+        if self.settings()["uninstalled"] and self.service.closed.is_set():
+            raise RuntimeError("Restart Hermes after re-enabling the plugin before running setup again")
         class Parser(argparse.ArgumentParser):
             def error(self, message):
                 raise ValueError(message)
@@ -157,6 +161,8 @@ class Adapter:
         parser.add_argument("--external", action=argparse.BooleanOptionalAction, default=None)
         parsed = vars(parser.parse_args(args))
         updates = {key: value for key, value in parsed.items() if value is not None}
+        if self.settings()["uninstalled"]:
+            updates.update(uninstalled=False, autostart=True)
         if "backend" in updates and updates["backend"] != self.settings()["backend"]:
             # A model ID and endpoint belong to one backend. Reusing them while
             # changing engines can silently route to the previous engine.
@@ -209,25 +215,25 @@ class Adapter:
     def write_route(self, settings):
         # Explicit command selects the default for FUTURE sessions through Hermes'
         # normal config writer; live agents and prompt histories are not changed.
-        from hermes_cli import config
-        if config.is_managed():
-            raise PermissionError("model routing is managed by your administrator")
-        from hermes_cli import managed_scope
-        fields = ("provider", "default", "base_url", "api_mode")
-        if any(managed_scope.is_key_managed("model." + field) for field in fields):
-            raise PermissionError("model routing is managed by your administrator")
-        config.read_user_config_raw()
+        from .hermes_uninstall import save_route
         model = "local" if settings["backend"] == "llama.cpp" and not settings["upstream_url"] else settings["model"]
         if not model:
             model = "local"  # legacy external llama.cpp proxy
-        config.save_config({"model": {"provider": "custom", "default": model,
-                           "base_url": settings["base_url"] + "/v1", "api_mode": "chat_completions"}},
-                           merge_existing=True)
+        save_route(settings, {"provider": "custom", "default": model,
+                             "base_url": settings["base_url"] + "/v1", "api_mode": "chat_completions"})
 
     def handle(self, raw_args):
         args = shlex.split(raw_args)
         action = args[0] if args else "setup"
         rest = args[1:]
+        if action == "uninstall" and rest in ([], ["confirm"]):
+            from .hermes_uninstall import run
+            result = run(confirm=bool(rest))
+            if rest:
+                self.service.closed.set()
+            return result
+        if self.settings()["uninstalled"] and action not in {"setup", "onboarding", "help"}:
+            raise RuntimeError("Sloth is disconnected. Restart Hermes; see docs/uninstall.md to reinstall.")
         if action == "update" and rest in ([], ["check"]):
             from . import updates
             config = self.settings()
@@ -315,7 +321,7 @@ def register(ctx):
     for name in ("sloth", "sloth-memory"):
         ctx.register_command(name, adapter.command,
                              description="Set up conversation slots, park, delete, and configure cleanup",
-                             args_hint="setup | status | park | delete | cleanup | retention | base-url | update", argument_mode="text")
+                             args_hint="setup | status | park | delete | cleanup | retention | base-url | update | uninstall", argument_mode="text")
     ctx.register_hook("pre_gateway_dispatch", adapter.capture_gateway)
     ctx.register_hook("pre_command", adapter.capture_command)
     ctx.register_middleware("llm_request", adapter.middleware)

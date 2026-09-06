@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0a2 — uninstall and route recovery
+
+- Add `/sloth uninstall` previews and `/sloth uninstall confirm`, with terminal equivalents for Hermes and standalone services.
+- Save the original Hermes model route during setup and restore it on disconnect; preserve unrelated settings and refuse to guess missing backups.
+- Disable plugin startup, drain and stop verified owned processes, and keep existing backend servers and saved data.
+- Document package removal, optional archive/build cleanup, and manual uninstall for older alphas.
+
 ## 0.2.0a1 — coordinated release updates
 
 - Add `/sloth update check` and `/sloth update`, plus equivalent terminal commands.

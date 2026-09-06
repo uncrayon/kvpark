@@ -1,6 +1,6 @@
 # Backends and operating systems
 
-This describes alpha `0.2.0a1`. Older alpha.2 installations retain their original
+This describes alpha `0.2.0a2`. Older alpha.2 installations retain their original
 Linux-only scope until upgraded.
 
 ## Capability contract

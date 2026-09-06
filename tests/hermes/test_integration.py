@@ -105,6 +105,52 @@ class HermesIntegrationTests(unittest.TestCase):
         self.assertIn("Available: 0.2.0a2", text)
         install.assert_not_called()
 
+    def test_uninstall_restores_route_disables_plugin_and_does_not_restart_it(self):
+        from hermes_cli.config import read_user_config_raw, save_config
+        adapter = self.command.__self__
+        # The original server occupied Sloth's preferred port, forcing fallback.
+        original = dict(provider="custom", default="gemma", base_url="http://127.0.0.1:8080/v1", context_length=12345)
+        adapter.ctx.set_config("service", {**adapter.settings(), "previous_urls": ["http://127.0.0.1:8080"]})
+        save_config({"model": original}, merge_existing=True)
+        self.command_text("connect")
+        self.command_text("connect")  # Reconnect must not overwrite the original route.
+        before = read_user_config_raw()
+        preview = asyncio.run(self.gateway_command("uninstall", command="sloth", platform="telegram"))
+        self.assertIn("no changes", preview)
+        self.assertEqual(before, read_user_config_raw())
+        result = asyncio.run(self.gateway_command("uninstall confirm", command="sloth", platform="telegram"))
+        self.assertIn("Sloth disconnected", result)
+        current = read_user_config_raw()
+        self.assertEqual(current["model"], original)
+        self.assertEqual(current["agent"]["max_turns"], 12)
+        self.assertIn("sloth-memory", current["plugins"]["disabled"])
+        self.assertNotIn("sloth-memory", current["plugins"]["enabled"])
+        self.assertTrue(adapter.service.closed.is_set())
+        self.assertIsNone(adapter.middleware(request={}, base_url=self.url + "/v1", api_mode="chat_completions"))
+        self.assertIn("Sloth is disconnected", self.command_text("status"))
+        self.assertIn("Sloth disconnected", self.command_text("uninstall confirm"))
+        self.manager.unload()
+        self.manager.discover_and_load(force=True)
+        from hermes_cli.plugins import get_plugin_command_handler
+        self.assertIsNone(get_plugin_command_handler("sloth"))
+
+    def test_uninstall_without_route_backup_does_not_change_profile(self):
+        from hermes_cli.config import read_user_config_raw
+        before = read_user_config_raw()
+        result = self.command_text("uninstall confirm")
+        self.assertIn("no original model-route backup", result)
+        self.assertEqual(before, read_user_config_raw())
+
+    def test_uninstall_respects_managed_plugin_leaf_settings(self):
+        from hermes_cli.config import read_user_config_raw
+        before = read_user_config_raw()
+        for key in ("plugins.entries.sloth-memory.settings.service.autostart",
+                    "plugins.entries.sloth-memory.settings.route_backup.base_url"):
+            with patch("hermes_cli.managed_scope.managed_config_keys", return_value={key}):
+                result = self.command_text("uninstall confirm")
+                self.assertIn("managed by your administrator", result)
+                self.assertEqual(before, read_user_config_raw())
+
     def test_successful_update_requests_native_gateway_restart_after_reply(self):
         from unittest.mock import Mock
         from hermes_cli.lifecycle import invoke_hook
@@ -122,6 +168,7 @@ class HermesIntegrationTests(unittest.TestCase):
                 gateway.request_restart.assert_called_once_with(detached=False, via_service=True)
         with patch.object(updates, "apply", return_value=dict(version="0.2.0a2", note="Updated.")), \
                 patch("importlib.metadata.version", return_value="0.2.0a2"), \
+                patch("sloth_memory.__version__", "0.2.0a1"), \
                 patch("gateway.restart.is_gateway_supervisor_process", return_value=True):
             asyncio.run(command())
 

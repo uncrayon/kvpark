@@ -32,6 +32,10 @@ def main():
     parser = argparse.ArgumentParser(description="Let your local AI nap. Save its work for later.")
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command", required=True)
+    uninstall = sub.add_parser("uninstall", help="preview or disconnect services; keep packages and data until explicitly removed")
+    uninstall.add_argument("--confirm", action="store_true", help="apply the uninstall after previewing")
+    uninstall.add_argument("--hermes", action="store_true", help="restore routing and disable the plugin in the active Hermes profile")
+    uninstall.add_argument("--archive-dir", help="standalone archive; --hermes reads the profile's archive setting")
     update = sub.add_parser("update", help="check or install an official release, retaining rollback files")
     update.add_argument("action", nargs="?", choices=("check",))
     update.add_argument("--archive-dir")
@@ -65,7 +69,24 @@ def main():
             cmd.add_argument("--cleanup", action=argparse.BooleanOptionalAction, default=None)
     args = parser.parse_args()
     try:
-        if args.command == "update":
+        if args.command == "uninstall":
+            if args.hermes:
+                if args.archive_dir:
+                    parser.error("--hermes uses its profile's archive; do not pass --archive-dir")
+                try:
+                    from .hermes_uninstall import run
+                    print(run(confirm=args.confirm))
+                except ImportError as exc:
+                    raise RuntimeError("activate Hermes' Python environment to use --hermes") from exc
+            else:
+                from . import removal
+                archive = directory(args.archive_dir)
+                result = removal.stop(archive) if args.confirm else removal.plan(archive)
+                print(json.dumps({"applied": args.confirm, "archive_dir": str(archive),
+                    "proxy_pid": result["proxy"]["pid"] if result["proxy"] else None,
+                    "backend_pid": result["backend"]["pid"] if result["backend"] else None,
+                    "note": "Packages, snapshots, weights and builds are kept. Restore agent routes and stop other clients before --confirm."}, indent=2))
+        elif args.command == "update":
             from . import updates
             archive = directory(args.archive_dir)
             result = updates.check(archive) if args.action == "check" else updates.apply(archive)

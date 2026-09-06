@@ -67,7 +67,7 @@ package reinstall alone leaves their old proxy process running. To bootstrap:
 2. Activate the Python environment that runs Hermes and install the release:
 
    ```bash
-   python -m pip install --upgrade https://github.com/uncrayon/sloth-memory/releases/download/v0.2.0a1/sloth_memory-0.2.0a1-py3-none-any.whl
+   python -m pip install --upgrade https://github.com/uncrayon/sloth-memory/releases/download/v0.2.0a2/sloth_memory-0.2.0a2-py3-none-any.whl
    ```
 
 3. With all inference clients still stopped, save any resident state and stop
