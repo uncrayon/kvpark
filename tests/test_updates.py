@@ -49,6 +49,20 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(list(Path(tmp).iterdir()), [])
 
 
+class EnvironmentTests(unittest.TestCase):
+    def test_alias_of_environment_is_allowed_but_shared_binary_is_not(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            try:
+                (root / "alias").symlink_to(Path(sys.executable).parent, target_is_directory=True)
+                (root / "other").mkdir()
+                (root / "other" / Path(sys.executable).name).symlink_to(sys.executable)
+            except OSError:
+                self.skipTest("symlink creation is unavailable for this account")
+            self.assertTrue(updates.same_python_environment(root / "alias" / Path(sys.executable).name))
+            self.assertFalse(updates.same_python_environment(root / "other" / Path(sys.executable).name))
+
+
 class UpdateTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

@@ -30,6 +30,16 @@ class ProxyStopError(RuntimeError):
     """A replacement is still alive; do not change its package underneath it."""
 
 
+def same_python_environment(executable):
+    # Resolve aliases of the *directory* too (/var vs /private/var, Windows
+    # short paths), while keeping separate venvs that share one binary distinct.
+    try:
+        path = Path(executable)
+        return path.parent.samefile(Path(sys.executable).parent) and path.samefile(sys.executable)
+    except OSError:
+        return False
+
+
 def write_json(path, value):
     temporary = path.with_suffix(".tmp")
     with temporary.open("w", encoding="utf-8") as out:
@@ -201,7 +211,7 @@ def _apply(archive, hermes_home):
                 argv = process.cmdline()
                 if not process_matches(record) or argv[1:4] != ["-m", "sloth_memory", "serve"] and argv[1:5] != ["-I", "-m", "sloth_memory", "serve"]:
                     raise RuntimeError("proxy ownership could not be verified")
-                if Path(argv[0]).absolute() != Path(sys.executable).absolute():
+                if not same_python_environment(argv[0]):
                     raise RuntimeError("proxy uses a different Python environment; update it separately")
                 env = process.environ()
                 request(record["base_url"], "prepare-update", {}, timeout=90)
