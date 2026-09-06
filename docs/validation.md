@@ -1,5 +1,27 @@
 # Alpha validation
 
+## Coordinated updates — 0.2.0a1
+
+Local release checks on September 6, 2026:
+
+- 77 Python tests: 76 passed, one optional model test skipped.
+- 18 Hermes integration tests: 17 passed, one optional model test skipped,
+  against both the installed Hermes and pinned upstream source.
+- Real wheel installation in a disposable Python 3.14 virtual environment:
+  upgrade succeeded; a subsequent package with a deliberately broken proxy
+  startup rolled back to the previous wheel and a healthy proxy. The proxy
+  address and upstream backend were retained. No production model was used.
+- Tests cover maintenance gating, drain timeout, failed snapshot saves, invalid
+  release hashes/formats, wrong Python environments, interrupted installation,
+  failed replacement shutdown, and a lost acknowledgement when reopening traffic.
+- Release wheel and source archive passed package metadata validation.
+
+Package upgrade and failed-start rollback acceptance passed in CI on Linux,
+macOS, and Windows. Tests also cover Python environment aliases and native
+launchers whose process differs from the running proxy. Native gateway restart scheduling is covered through
+Hermes' real dispatch with the final restart operation mocked. This is separate
+from the earlier live model park/resume evidence below.
+
 ## Live Hermes migration — main development version
 
 On 2026-09-05, sloth-memory was installed into the existing Hermes Python 3.11

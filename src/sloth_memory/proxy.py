@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import sys
 from pathlib import Path
 import threading
 import time
@@ -20,6 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from .backends import Backend
 from .platforms import fsync_directory, process_matches
 from .runtime import directory
+from . import __version__
 
 LISTEN_HOST = os.environ.get("SLOTH_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("SLOTH_PORT", "8080"))
@@ -113,6 +115,7 @@ class Archive:
         self.current_prompt = None
         self.activity = {"phase": "idle", "key": None}
         self.runtime_error = None
+        self.maintenance_until = time.monotonic() + 300 if os.environ.get("SLOTH_UPDATE_START") == "1" else 0
         self.displaced = {}
         self._snapshot = {}
         self.entries = {}
@@ -355,11 +358,32 @@ class Archive:
                     upstream=backend().url.split("://", 1)[1], archive_dir=str(ARCHIVE),
                     archived=len(entries), entries=entries,
                     total_gib=round(sum(v["bytes"] for v in snapshot["entries"].values()) / 1024**3, 3),
-                    service="sloth-memory", control_version=3, upstream_url=backend().url,
+                    service="sloth-memory", version=__version__, control_version=4, upstream_url=backend().url,
+                    maintenance=self.maintenance_until > time.monotonic(),
                     capabilities=backend().capabilities(),
                     ttl_days=snapshot["retention"]["ttl_days"], max_gib=snapshot["retention"]["max_gib"],
                     cleanup_enabled=snapshot["retention"]["cleanup_enabled"], cleanup_interval_seconds=3600,
                     recent=[dict(e, ago_s=round(now-e["at"], 1)) for e in snapshot["recent"]])
+
+    def prepare_update(self, timeout=60):
+        # Set the gate before waiting: queued and new requests must not start
+        # another generation between saving the resident state and replacement.
+        if self.maintenance_until > time.monotonic():
+            raise RuntimeError("an update is already preparing this proxy")
+        self.maintenance_until = time.monotonic() + 300
+        acquired = self.lock.acquire(timeout=timeout)
+        try:
+            if not acquired:
+                raise RuntimeError("inference is still active; retry the update after the reply")
+            if backend().snapshots and self.current_key:
+                self.park(key=self.current_key)
+            return dict(ok=True, maintenance=True)
+        except BaseException:
+            self.maintenance_until = 0
+            raise
+        finally:
+            if acquired:
+                self.lock.release()
 
     def doctor(self):
         # Do not queue a diagnostic behind a long generation or mutate ownership.
@@ -503,10 +527,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def control(self, method, path, body):
         try:
+            if (method != "GET" and ARCHIVE_STATE.maintenance_until > time.monotonic()
+                    and path not in {CONTROL_PREFIX + "cancel-update", CONTROL_PREFIX + "prepare-update"}):
+                raise RuntimeError("sloth-memory is updating; retry shortly")
             if method == "GET" and path == CONTROL_PREFIX + "status":
                 payload = ARCHIVE_STATE.status()
             elif method == "GET" and path == CONTROL_PREFIX + "doctor":
                 payload = ARCHIVE_STATE.doctor()
+            elif method == "POST" and path == CONTROL_PREFIX + "prepare-update":
+                payload = ARCHIVE_STATE.prepare_update()
+            elif method == "POST" and path == CONTROL_PREFIX + "cancel-update":
+                ARCHIVE_STATE.maintenance_until = 0
+                payload = dict(ok=True)
             elif method == "GET" and path == CONTROL_PREFIX + "settings":
                 payload = ARCHIVE_STATE.status()
                 payload = {k: payload[k] for k in ("ttl_days", "max_gib", "cleanup_enabled")}
@@ -600,6 +632,9 @@ class Handler(BaseHTTPRequestHandler):
         lock = ARCHIVE_STATE.lock if generation else contextlib.nullcontext()
         started_at = time.monotonic()
         with lock:
+            if generation and ARCHIVE_STATE.maintenance_until > time.monotonic():
+                self.send_error(503, "sloth-memory is updating; retry shortly")
+                return
             archive_ready = backend().snapshots
             if generation and archive_ready:
                 try:
@@ -712,6 +747,8 @@ def main():
     from .platforms import process_identity
     server = bind_server(Handler, LISTEN_PORT, backend().url)
     atomic_json(ARCHIVE / "proxy.json", dict(**process_identity(os.getpid()),
+                python_prefix=str(Path(sys.prefix).resolve()),
+                launch_token=os.environ.get("SLOTH_LAUNCH_TOKEN"),
                 base_url=f"http://{LISTEN_HOST}:{server.server_port}", upstream_url=backend().url,
                 backend=backend().name, cache_mode=backend().cache_mode))
     log.info("Proxy listening at http://%s:%s → %s (%s)", LISTEN_HOST, server.server_port, backend().url, backend().cache_mode)

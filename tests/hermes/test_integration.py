@@ -97,6 +97,45 @@ class HermesIntegrationTests(unittest.TestCase):
         self.assertIn("sloth", [name for name, _ in menu])
         self.assertEqual(sum(name == "sloth" for name, _ in menu), 1)
 
+    def test_update_check_dispatches_without_installing_or_restarting(self):
+        from sloth_memory import updates
+        result = dict(installed="0.2.0a1", loaded="0.2.0a1", proxy="0.2.0a1", latest="0.2.0a2", available=True)
+        with patch.object(updates, "check", return_value=result), patch.object(updates, "apply") as install:
+            text = asyncio.run(self.gateway_command("update check", platform="telegram", command="sloth"))
+        self.assertIn("Available: 0.2.0a2", text)
+        install.assert_not_called()
+
+    def test_successful_update_requests_native_gateway_restart_after_reply(self):
+        from unittest.mock import Mock
+        from hermes_cli.lifecycle import invoke_hook
+        from sloth_memory import updates
+        gateway = Mock()
+        invoke_hook("pre_gateway_dispatch", gateway=gateway)
+        async def command():
+            loop = asyncio.get_running_loop()
+            with patch.object(loop, "call_later", wraps=loop.call_later) as later:
+                result = await self.gateway_command("update", command="sloth")
+                self.assertIn("restart shortly", result)
+                gateway.request_restart.assert_not_called()
+                callback = next(call.args[1] for call in later.call_args_list if call.args[0] == 2)
+                callback()
+                gateway.request_restart.assert_called_once_with(detached=False, via_service=True)
+        with patch.object(updates, "apply", return_value=dict(version="0.2.0a2", note="Updated.")), \
+                patch("importlib.metadata.version", return_value="0.2.0a2"), \
+                patch("gateway.restart.is_gateway_supervisor_process", return_value=True):
+            asyncio.run(command())
+
+    def test_failed_update_never_requests_gateway_restart(self):
+        from unittest.mock import Mock
+        from hermes_cli.lifecycle import invoke_hook
+        from sloth_memory import updates
+        gateway = Mock()
+        invoke_hook("pre_gateway_dispatch", gateway=gateway)
+        with patch.object(updates, "apply", side_effect=RuntimeError("rolled_back")):
+            result = self.command_text("update")
+        self.assertIn("rolled_back", result)
+        gateway.request_restart.assert_not_called()
+
     def test_discord_park_before_first_turn_explains_how_to_load_state(self):
         with patch.object(self.archive, "park") as park:
             result = asyncio.run(self.gateway_command("park"))
