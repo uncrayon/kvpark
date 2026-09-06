@@ -162,13 +162,18 @@ def start_proxy(record, archive, env, version):
     except BaseException:
         if child.poll() is None:
             try:
-                parent = psutil.Process(child.pid)
-                for descendant in reversed(parent.children(recursive=True)):
-                    stop_proxy(dict(pid=descendant.pid, created_at=descendant.create_time()))
-                child.terminate()
+                try:
+                    descendants = psutil.Process(child.pid).children(recursive=True)
+                except psutil.NoSuchProcess:
+                    descendants = []
+                for descendant in reversed(descendants):
+                    try:
+                        stop_proxy(dict(pid=descendant.pid, created_at=descendant.create_time()))
+                    except psutil.NoSuchProcess:
+                        continue
+                if child.poll() is None:
+                    child.terminate()
                 child.wait(15)
-            except psutil.NoSuchProcess:
-                pass
             except (subprocess.TimeoutExpired, psutil.Error, RuntimeError):
                 raise ProxyStopError(f"replacement PID {child.pid} did not stop; manual recovery required") from None
         raise

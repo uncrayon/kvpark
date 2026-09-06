@@ -4,7 +4,7 @@
 
 Local release checks on September 6, 2026:
 
-- 75 Python tests: 74 passed, one optional model test skipped.
+- 77 Python tests: 76 passed, one optional model test skipped.
 - 18 Hermes integration tests: 17 passed, one optional model test skipped,
   against both the installed Hermes and pinned upstream source.
 - Real wheel installation in a disposable Python 3.14 virtual environment:
@@ -16,8 +16,9 @@ Local release checks on September 6, 2026:
   failed replacement shutdown, and a lost acknowledgement when reopening traffic.
 - Release wheel and source archive passed package metadata validation.
 
-The CI workflow repeats package upgrade and failed-start rollback acceptance on
-Linux, macOS, and Windows. Native gateway restart scheduling is covered through
+Package upgrade and failed-start rollback acceptance passed in CI on Linux,
+macOS, and Windows. Tests also cover Python environment aliases and native
+launchers whose process differs from the running proxy. Native gateway restart scheduling is covered through
 Hermes' real dispatch with the final restart operation mocked. This is separate
 from the earlier live model park/resume evidence below.
 
