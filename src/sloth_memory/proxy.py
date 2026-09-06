@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import sys
 from pathlib import Path
 import threading
 import time
@@ -746,6 +747,7 @@ def main():
     from .platforms import process_identity
     server = bind_server(Handler, LISTEN_PORT, backend().url)
     atomic_json(ARCHIVE / "proxy.json", dict(**process_identity(os.getpid()),
+                python_prefix=str(Path(sys.prefix).resolve()),
                 base_url=f"http://{LISTEN_HOST}:{server.server_port}", upstream_url=backend().url,
                 backend=backend().name, cache_mode=backend().cache_mode))
     log.info("Proxy listening at http://%s:%s → %s (%s)", LISTEN_HOST, server.server_port, backend().url, backend().cache_mode)

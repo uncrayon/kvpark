@@ -50,6 +50,11 @@ class ReleaseTests(unittest.TestCase):
 
 
 class EnvironmentTests(unittest.TestCase):
+    def test_recorded_prefix_handles_framework_launchers(self):
+        self.assertTrue(updates.same_python_environment("framework-python", sys.prefix))
+        with tempfile.TemporaryDirectory() as other:
+            self.assertFalse(updates.same_python_environment(sys.executable, other))
+
     def test_alias_of_environment_is_allowed_but_shared_binary_is_not(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

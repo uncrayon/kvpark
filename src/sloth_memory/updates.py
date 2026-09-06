@@ -30,10 +30,14 @@ class ProxyStopError(RuntimeError):
     """A replacement is still alive; do not change its package underneath it."""
 
 
-def same_python_environment(executable):
+def same_python_environment(executable, prefix=None):
     # Resolve aliases of the *directory* too (/var vs /private/var, Windows
     # short paths), while keeping separate venvs that share one binary distinct.
     try:
+        # macOS framework and Windows venv launchers can expose the underlying
+        # interpreter in argv. The proxy records the environment Python loaded.
+        if prefix:
+            return Path(prefix).samefile(sys.prefix)
         path = Path(executable)
         return path.parent.samefile(Path(sys.executable).parent) and path.samefile(sys.executable)
     except OSError:
@@ -211,7 +215,7 @@ def _apply(archive, hermes_home):
                 argv = process.cmdline()
                 if not process_matches(record) or argv[1:4] != ["-m", "sloth_memory", "serve"] and argv[1:5] != ["-I", "-m", "sloth_memory", "serve"]:
                     raise RuntimeError("proxy ownership could not be verified")
-                if not same_python_environment(argv[0]):
+                if not same_python_environment(argv[0], record.get("python_prefix")):
                     raise RuntimeError("proxy uses a different Python environment; update it separately")
                 env = process.environ()
                 request(record["base_url"], "prepare-update", {}, timeout=90)
