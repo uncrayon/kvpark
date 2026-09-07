@@ -38,7 +38,7 @@ HELP
         uv_bin="$work/uv/uv"
     fi
     helper=''
-    if [[ -f "${BASH_SOURCE[0]}" ]]; then
+    if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
         script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
         if [[ -f "$script_dir/scripts/install.py" ]]; then helper="$script_dir/scripts/install.py"; fi
     fi

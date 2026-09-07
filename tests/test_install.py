@@ -215,6 +215,7 @@ class BootstrapTests(unittest.TestCase):
             result = subprocess.run([self.bash, "-s", "--", "--standalone", "--install-dir", "a path with spaces"],
                                     input=self.script.read_text(), env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(log.exists(), f"Bootstrap did not invoke uv. stdout={result.stdout!r}; stderr={result.stderr!r}")
             args = log.read_text().splitlines()
             self.assertEqual(args[-3:], ["--standalone", "--install-dir", "a path with spaces"])
             self.assertTrue(any(arg.endswith("/install.py") for arg in args))
