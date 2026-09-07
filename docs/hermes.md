@@ -1,6 +1,6 @@
 # Hermes adapter and onboarding
 
-These instructions install alpha `0.3.0a1`, including portable startup, automatic
+These instructions install alpha `0.3.0a2`, including portable startup, automatic
 port selection, and release updates. See [backend setup](backends.md) for capabilities.
 
 The adapter ships inside kvpark as a native Hermes plugin. It uses plugin
@@ -10,6 +10,21 @@ Hermes source or replace its semantic memory provider.
 ## Install alongside Hermes
 
 If you already installed sloth-memory, use the [rename migration](updates.md#migrate-from-sloth-memory) instead of enabling a second plugin.
+
+On macOS, Linux, or WSL, the installer finds Hermes' Python, installs kvpark
+there, verifies discovery, and enables the plugin:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/uncrayon/kvpark/main/install.sh | bash -s -- --hermes
+```
+
+Choose a discovered model in the installer, or type `/kvpark setup` in Hermes
+later. For a custom installation, pass
+`--hermes-python "/path/to/hermes/venv/bin/python"`. See [installer options](install.md).
+The manual alternatives below are useful for native Windows and troubleshooting.
+
+<details>
+<summary>Manual installation and troubleshooting (advanced)</summary>
 
 For a new installation, install into **the Python environment that runs Hermes**.
 The standalone `kvpark/.venv` from the README is a separate environment. Activating
@@ -23,13 +38,13 @@ do not require activating or leaving your current virtual environment:
 ```bash
 HERMES_PY="$HOME/.hermes/hermes-agent/venv/bin/python"
 "$HERMES_PY" -c "import sys, hermes_cli; print('Hermes Python:', sys.executable)"
-"$HERMES_PY" -m pip install --upgrade https://github.com/uncrayon/kvpark/releases/download/v0.3.0a1/kvpark-0.3.0a1-py3-none-any.whl
+"$HERMES_PY" -m pip install --upgrade https://github.com/uncrayon/kvpark/releases/download/v0.3.0a2/kvpark-0.3.0a2-py3-none-any.whl
 "$HERMES_PY" -c "from importlib.metadata import distribution; d = distribution('kvpark'); print('kvpark', d.version); print([(e.name, e.value) for e in d.entry_points if e.group == 'hermes_agent.plugins'])"
 "$HERMES_PY" -m hermes_cli.main plugins enable kvpark
 "$HERMES_PY" -m hermes_cli.main plugins list --plain --no-bundled
 ```
 
-The discovery check should print `kvpark 0.3.0a1` and
+The discovery check should print `kvpark 0.3.0a2` and
 `[('kvpark', 'kvpark.hermes')]`. If the first command fails because the interpreter
 does not exist, stop and locate your actual Hermes installation before continuing.
 For a custom installation, change `HERMES_PY` to that installation's Python.
@@ -38,7 +53,7 @@ different interpreter. A separately configured gateway must use the environment
 where you install the plugin too. Keep the same Hermes profile selected throughout.
 
 If Hermes' environment has no pip module, use
-`uv pip install --python "$HERMES_PY" https://github.com/uncrayon/kvpark/releases/download/v0.3.0a1/kvpark-0.3.0a1-py3-none-any.whl`
+`uv pip install --python "$HERMES_PY" https://github.com/uncrayon/kvpark/releases/download/v0.3.0a2/kvpark-0.3.0a2-py3-none-any.whl`
 for the installation step, then continue with the discovery and enable commands.
 
 ### Install from a checkout or on Windows
@@ -47,7 +62,7 @@ With **Hermes' own virtual environment** activated, use:
 
 ```bash
 # With your Hermes virtual environment activated:
-git clone --branch v0.3.0a1 https://github.com/uncrayon/kvpark.git
+git clone --branch v0.3.0a2 https://github.com/uncrayon/kvpark.git
 cd kvpark
 python -m pip install --upgrade .
 hermes plugins enable kvpark
@@ -60,7 +75,7 @@ Use `hermes plugins list --plain --no-bundled` to check that it is enabled.
 Existing kvpark installations can use `/kvpark update`; sloth-memory installations
 need the [one-time rename migration](updates.md#migrate-from-sloth-memory), because
 the old updater cannot replace a differently named package. Run `kvpark --version` in
-Hermes' environment to confirm `0.3.0a1`. Restart Hermes after installation to
+Hermes' environment to confirm `0.3.0a2`. Restart Hermes after installation to
 load the entry point. The adapter is tested against Hermes
 0.21.0, upstream commit `9dd6634c5635321cf38840cc30e9b51226689128`.
 Use Python 3.11–3.13 for Hermes; the standalone service also supports 3.10/3.14.
@@ -106,6 +121,8 @@ printed by the build; Windows typically places `llama-server.exe` under
 `runtime/build/bin/Release`. Onboarding does not download weights or compile a
 backend. Connecting an existing server in routing mode requires no build.
 
+</details>
+
 ## Persistence and updates
 
 To remove the integration and return to your original model server, see
@@ -125,21 +142,58 @@ coordinated release update. See [updates and recovery](updates.md).
 
 ## Guided setup
 
-Use `/kvpark` in the Hermes CLI, Discord, and Telegram. It opens setup instructions
-when called without arguments.
+The installer opens the model chooser in your terminal. You can also open it
+inside Hermes, including the CLI, desktop, Discord, and Telegram:
 
-**Next release:** in the Hermes desktop composer or CLI, type `/kvpark ` (including the space) to
-see action suggestions such as `setup`, `save`, `status`, and `forget`. Partial
-actions filter the list: `/kvpark sa` suggests `save`. Arguments also accept free
-text, so you can enter setup flags, model IDs, URLs, paths, or a saved slot key.
-After installing an update, restart the Hermes client that owns the composer to
-reload plugin metadata; an already open desktop client may keep its old catalog.
+```text
+/kvpark setup
+```
+
+kvpark checks local listening ports and reads the model lists from running
+servers. It shows choices such as:
+
+```text
+1. gemma:latest — Ollama (http://127.0.0.1:11434)
+2. my-model — Model server (http://127.0.0.1:9321)
+0. None of these / set up later
+```
+
+Choose a number:
+
+```text
+/kvpark setup 1
+```
+
+Then confirm with `/kvpark setup yes`, or cancel with `/kvpark setup 0`.
+After a successful connection, restart Hermes and start a new conversation.
+The exact model ID is carried through automatically. Existing conversations
+retain their saved route.
+
+If nothing appears, open your model app and load a model, then run
+`/kvpark setup scan`. For a server on another computer, paste its address after
+`/kvpark setup address`. The wizard reads that server's model list too; automatic
+scans stay on this computer. Authenticated servers are identified as requiring
+an API key; discovery does not send stored credentials to scanned ports.
+
+Discovery uses common ports when the operating system does not expose its
+listening sockets. Choices are kept per conversation, expire after ten minutes,
+and are rechecked before connection. Scanning, previewing, and cancelling do not
+change your current model route. The wizard saves settings only after connecting
+successfully, preserving the previous Hermes route for uninstall.
+
+Existing model servers are connected for chat routing. The chooser explicitly
+says that disk park/resume is unavailable on that connection. It does not infer
+snapshot support from a server's name or model. Managed disk snapshots remain an
+advanced option below.
+
+<details>
+<summary>Advanced setup, managed runtimes, and older-release workarounds</summary>
 
 ### Pasted URL becomes a link chip
 
 Hermes desktop can turn a pasted address into an `@url:` reference. kvpark
 `0.3.0a1` rejects that wrapper with "upstream URL must be http(s)://host:port";
-the next release extracts the address before validating it. The same issue can
+`0.3.0a2` extracts the address before validating it. The same issue can
 affect `--base-url` and `/kvpark base-url`.
 
 For `0.3.0a1`, escape the colon as `http\://` in the slash command. This keeps
@@ -165,8 +219,8 @@ to copy into `--model`; no llama.cpp build is needed for routing an existing ser
 /kvpark setup
 ```
 
-This shows defaults and the next step. For managed disk snapshots, configure
-the included patched runtime:
+This opens the numbered chooser for existing servers. For managed disk snapshots,
+configure the included patched runtime with the advanced command below:
 
 ```text
 /kvpark setup --server "/absolute/path/to/llama-server" --model "/absolute/path/to/model.gguf"
@@ -206,6 +260,8 @@ After configuration, the enabled plugin starts the proxy and, in managed native
 mode, the backend when Hermes loads. Existing upstream servers must already be
 running. Existing compatible services are reused; an archive-directory lock coordinates concurrent Hermes surfaces. Services stay running after Hermes closes
 so cleanup continues. Reopening Hermes does not launch another model copy.
+
+</details>
 
 ## Defaults
 

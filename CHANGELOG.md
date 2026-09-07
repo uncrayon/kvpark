@@ -1,7 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.3.0a2 — easier installation and model discovery
 
+- Add local model-server discovery and numbered setup choices in Hermes and the terminal. The installer opens the chooser automatically, and users can cancel without changing their model route.
+- Add a one-command installer for macOS, Linux, and WSL with automatic Python setup, Hermes environment detection and plugin enablement, a standalone command, checksum verification, and optional patched-runtime builds.
 - Accept Hermes desktop URL chips in setup and base-url commands, preserving the full host and port and applying the same URL validation.
 - Offer kvpark action suggestions in Hermes' desktop composer and CLI while preserving free-text arguments; remove the completion entry when the plugin unloads.
 - Make Hermes installation use its own Python interpreter explicitly and explain how to recover from installing into a separate standalone environment.

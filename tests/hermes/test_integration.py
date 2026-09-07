@@ -50,6 +50,50 @@ class HermesIntegrationTests(unittest.TestCase):
     def command_text(self, text):
         return asyncio.run(self.command(text))
 
+    def test_numbered_setup_preserves_route_until_confirmation(self):
+        from kvpark.discovery import Model, Scan
+        from kvpark import setup
+        from hermes_cli.config import read_user_config_raw
+        model = Model("http://127.0.0.1:9321", "model name/with spaces")
+        before = read_user_config_raw()
+        with patch("kvpark.discovery.discover", return_value=Scan([model])), patch.object(setup, "connect_model", return_value={"base_url": "http://127.0.0.1:12345"}) as connect:
+            self.assertIn("1. model name/with spaces", self.command_text("setup"))
+            self.assertIn("Use model name/with spaces", self.command_text("setup 1"))
+            self.assertEqual(read_user_config_raw(), before)
+            connect.assert_not_called()
+            self.assertIn("Connected to", self.command_text("setup yes"))
+            self.assertEqual(connect.call_args.args[0], model)
+            self.assertTrue(connect.call_args.kwargs["hermes"])
+
+    def test_wizard_saves_verified_connection_and_route_together(self):
+        from kvpark.discovery import Model, Scan
+        from hermes_cli.config import read_user_config_raw
+        model = Model("http://127.0.0.1:9321", "model name/with spaces")
+        before = read_user_config_raw()
+        with patch("kvpark.discovery.discover", return_value=Scan([model])), patch("kvpark.discovery.verify"), patch("kvpark.setup.Service.ensure", return_value={"service": "kvpark"}):
+            self.command_text("setup")
+            self.command_text("setup 1")
+            self.assertEqual(read_user_config_raw(), before)
+            self.assertIn("Connected to", self.command_text("setup yes"))
+        after = read_user_config_raw()
+        service = after["plugins"]["entries"]["kvpark"]["settings"]["service"]
+        self.assertEqual(after["model"]["default"], model.model)
+        self.assertEqual(service["model"], model.model)
+        self.assertEqual(service["upstream_url"], model.url)
+        self.assertEqual(service["cache_mode"], "routing")
+        self.assertEqual(after["agent"], before["agent"])
+        self.assertEqual(after["plugins"]["entries"]["kvpark"]["settings"]["route_backup"],
+                         {key: value for key, value in before["model"].items() if key in ("provider", "default", "base_url", "api_mode")})
+
+    def test_setup_none_leaves_route_and_plugin_settings_unchanged(self):
+        from kvpark.discovery import Model, Scan
+        from hermes_cli.config import read_user_config_raw
+        before = read_user_config_raw()
+        with patch("kvpark.discovery.discover", return_value=Scan([Model("http://127.0.0.1:9321", "model")])):
+            self.command_text("setup")
+            self.assertIn("unchanged", self.command_text("setup 0"))
+        self.assertEqual(read_user_config_raw(), before)
+
     def test_setup_accepts_desktop_url_chips(self):
         from hermes_cli import config
         model = "mlx-community/gemma-4-e2b-it-4bit"
@@ -311,7 +355,7 @@ class HermesIntegrationTests(unittest.TestCase):
         park.assert_not_called()
 
     def test_real_discovery_onboarding_and_persistent_settings_over_http(self):
-        self.assertIn("setup --server", self.command_text("setup --no-external"))
+        self.assertIn("numbered list", self.command_text("setup --no-external"))
         self.assertIn("ttl_days", self.command_text("retention 14"))
         self.assertEqual(self.archive.retention.settings()["ttl_days"], 14)
         self.assertIn("Cleanup:", self.command_text("cleanup off"))

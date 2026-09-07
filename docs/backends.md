@@ -1,6 +1,6 @@
 # Backends and operating systems
 
-This describes kvpark alpha `0.3.0a1`. Existing sloth-memory users should follow
+This describes kvpark alpha `0.3.0a2`. Existing sloth-memory users should follow
 the [rename migration](updates.md#migrate-from-sloth-memory).
 
 ## Capability contract
@@ -12,6 +12,7 @@ the [rename migration](updates.md#migrate-from-sloth-memory).
 | Ollama, existing server | Yes | Unavailable through this adapter |
 | vLLM, existing server | Yes | Unavailable through this adapter |
 | MLX-LM, existing server | Yes | Unavailable through this adapter |
+| Other OpenAI-compatible server | Yes | Unavailable through this adapter |
 
 Routing preserves the served model name, messages, tool calls, and streaming.
 `status` and `doctor` report `capabilities.disk_snapshots` explicitly. In routing
@@ -26,6 +27,13 @@ unsupported inference engine run on your hardware. A remote HTTP(S) upstream can
 be used in routing mode, including a backend on another machine or in WSL.
 
 ## Connect an existing server
+
+Run `/kvpark setup` in Hermes or `kvpark setup` in a terminal. Choose a detected
+model number, then confirm with `yes`. The wizard finds local ports and model IDs;
+you do not need the manual commands below. Choose `0` to make no changes.
+See [the numbered setup flow](hermes.md#guided-setup).
+
+### Manual connection (advanced)
 
 Start the inference server normally using its own installation instructions.
 Then configure Hermes with the **exact model ID served by that server**. Use

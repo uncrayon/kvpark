@@ -19,7 +19,7 @@ def editable():
         raise PermissionError("model routing or plugin settings are managed by your administrator")
 
 
-def save_route(settings, model):
+def save_route(settings, model, *, service=None, expected_model=None):
     from hermes_cli import config
     from hermes_cli.plugins import _locked_plugin_state
     editable()
@@ -29,6 +29,8 @@ def save_route(settings, model):
         backup = entry.get("settings", {}).get("route_backup")
         applied = entry.get("settings", {}).get("route_applied", {})
         current = raw.get("model", {})
+        if expected_model is not None and current != expected_model:
+            raise ValueError("The Hermes model changed during setup. Scan and choose again; your changes were kept.")
         if isinstance(current, str):
             current = {"default": current}
             raw["model"] = current
@@ -43,6 +45,11 @@ def save_route(settings, model):
             backup = {field: copy.deepcopy(current[field]) for field in FIELDS if field in current}
         saved = raw.setdefault("plugins", {}).setdefault("entries", {}).setdefault("kvpark", {}).setdefault("settings", {})
         saved.update(route_backup=backup, route_applied=model)
+        if service is not None:
+            saved["service"] = service
+            plugins = raw["plugins"]
+            plugins["enabled"] = list(dict.fromkeys([*plugins.get("enabled", []), "kvpark"]))
+            plugins["disabled"] = [name for name in plugins.get("disabled", []) if name != "kvpark"]
         raw.setdefault("model", {}).update(model)
         config.save_config(raw)
 

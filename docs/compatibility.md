@@ -1,6 +1,6 @@
 # Runtime compatibility
 
-This page describes alpha `0.3.0a1`. See [backends](backends.md) for routing
+This page describes alpha `0.3.0a2`. See [backends](backends.md) for routing
 capabilities. The rename from sloth-memory preserves snapshot format 2; the
 [migration](updates.md#migrate-from-sloth-memory) keeps the archive path and runtime
 unchanged so existing compatible snapshots remain usable.

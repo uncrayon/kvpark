@@ -5,9 +5,9 @@ import http.client
 from urllib.parse import urlsplit
 
 
-BACKENDS = ("llama.cpp", "ollama", "vllm", "mlx")
+BACKENDS = ("llama.cpp", "ollama", "vllm", "mlx", "openai")
 DEFAULT_URLS = {"llama.cpp": "http://127.0.0.1:8090", "ollama": "http://127.0.0.1:11434",
-                "vllm": "http://127.0.0.1:8000", "mlx": "http://127.0.0.1:8081"}
+                "vllm": "http://127.0.0.1:8000", "mlx": "http://127.0.0.1:8081", "openai": "http://127.0.0.1:8000"}
 
 
 def normalize_url(value):

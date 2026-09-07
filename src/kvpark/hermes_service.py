@@ -79,6 +79,7 @@ class Service:
         self.lock = threading.Lock()
         self.closed = threading.Event()
         self.resolved = None
+        self.started_processes = []
 
     def start_async(self):
         with self.lock:
@@ -202,6 +203,7 @@ class Service:
                     return None
                 self._wait(child, ready_proxy, archive / "hermes-proxy.log")
                 self._remember(config)
+                self.started_processes = started
                 return self._existing(config)
             except BaseException:
                 for process in reversed(started):

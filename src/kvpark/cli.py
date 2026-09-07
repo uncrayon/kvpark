@@ -10,6 +10,7 @@ from urllib.request import Request, urlopen
 
 from . import __version__
 from .runtime import directory
+from .backends import BACKENDS
 
 
 def request(url, action, payload=None, *, timeout=900, control_prefix="/_kvpark/"):
@@ -35,6 +36,12 @@ def main():
     parser = argparse.ArgumentParser(description="Park your model's KV cache. Resume where you left off.")
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command", required=True)
+    setup = sub.add_parser("setup", help="find running models and connect using numbered choices")
+    setup_mode = setup.add_mutually_exclusive_group()
+    setup_mode.add_argument("--hermes", action="store_true", help="configure Hermes in this Python environment")
+    setup_mode.add_argument("--standalone", action="store_true", help="configure standalone kvpark")
+    start = sub.add_parser("start", help="restart the connection selected with setup")
+    start.add_argument("--archive-dir")
     migrate = sub.add_parser("migrate", help="migrate sloth-memory without moving saved caches")
     migrate.add_argument("--hermes", action="store_true", help="migrate the active Hermes profile")
     migrate.add_argument("--archive-dir", help="standalone legacy archive directory")
@@ -50,7 +57,7 @@ def main():
     serve.add_argument("--archive-dir")
     serve.add_argument("--port", type=int, default=8080)
     serve.add_argument("--upstream-port", type=int, default=8090)
-    serve.add_argument("--backend", choices=("llama.cpp", "ollama", "vllm", "mlx"), default="llama.cpp")
+    serve.add_argument("--backend", choices=BACKENDS)
     serve.add_argument("--upstream-url", help="existing backend address, optionally ending in /v1")
     serve.add_argument("--cache-mode", choices=("native", "routing"))
     serve.add_argument("--ttl-days", type=float)
@@ -78,7 +85,31 @@ def main():
     if args.command == "park":
         args.command = "save"
     try:
-        if args.command == "migrate":
+        configured = None
+        explicit_backend = args.command == "serve" and (args.backend or args.upstream_url)
+        hermes_uninstall = args.command == "uninstall" and args.hermes
+        if args.command not in {"setup", "migrate", "backend"} and not args.archive_dir and not explicit_backend and not hermes_uninstall:
+            from .setup import saved_settings
+            configured = saved_settings()
+            if configured:
+                args.archive_dir = configured["archive_dir"]
+        if args.command == "setup":
+            from importlib.util import find_spec
+            from .setup import terminal
+            hermes = args.hermes or (not args.standalone and find_spec("hermes_cli") is not None)
+            terminal(hermes=hermes)
+        elif args.command == "start":
+            from .setup import saved_settings
+            from .hermes_service import Service
+            config = saved_settings()
+            if not config:
+                raise ValueError("Choose a model first with kvpark setup.")
+            if args.archive_dir and directory(args.archive_dir) != directory(config["archive_dir"]):
+                raise ValueError("kvpark start uses the connection selected in setup; run kvpark setup to choose another.")
+            service = Service(lambda: config)
+            service.ensure()
+            print("kvpark is ready. Run kvpark doctor to check the connection.")
+        elif args.command == "migrate":
             from .migration import run
             print(run(hermes=args.hermes, archive=args.archive_dir, confirm=args.confirm))
         elif args.command == "uninstall":
@@ -94,6 +125,9 @@ def main():
                 from . import removal
                 archive = directory(args.archive_dir)
                 result = removal.stop(archive) if args.confirm else removal.plan(archive)
+                if args.confirm:
+                    from .setup import clear_settings
+                    clear_settings(archive)
                 print(json.dumps({"applied": args.confirm, "archive_dir": str(archive),
                     "proxy_pid": result["proxy"]["pid"] if result["proxy"] else None,
                     "backend_pid": result["backend"]["pid"] if result["backend"] else None,
@@ -108,6 +142,11 @@ def main():
                 parser.error("ports must be between 1 and 65535")
             from .retention import validate
             from .backends import Backend, DEFAULT_URLS
+            if args.backend is None:
+                args.backend = configured["backend"] if configured else "llama.cpp"
+                if configured and not args.upstream_url:
+                    args.upstream_url = configured["upstream_url"]
+                    args.cache_mode = args.cache_mode or configured["cache_mode"]
             upstream = args.upstream_url
             if not upstream and args.backend == "llama.cpp":
                 from .network import managed_port

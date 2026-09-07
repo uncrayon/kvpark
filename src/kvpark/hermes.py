@@ -47,6 +47,8 @@ class Adapter:
         self.namespace = "hermes:" + hashlib.sha256(str(self.home).encode()).hexdigest()[:16] + ":"
         self.service = Service(self.settings, self.persist_service)
         self.gateway = None
+        from .setup import Guide
+        self.setup_guide = Guide()
 
     def capture_gateway(self, *, gateway=None, **kwargs):
         self.gateway = gateway
@@ -126,22 +128,15 @@ class Adapter:
         lines += [f"Backend: {config['backend']} · cache mode: {config['cache_mode']}"]
         if config["cache_mode"] == "routing":
             lines.append("Disk resume is unavailable for this adapter; backend-managed caches remain independent.")
-        if config["backend"] == "llama.cpp" and not config["external"] and not config["upstream_url"] and not (config["server"] and config["model"]):
-            lines += ["Next: configure your patched llama-server and GGUF:",
-                      '/kvpark setup --server "/path/to/llama-server" --model "/path/to/model.gguf"']
-        elif not config["model"] and not config["external"]:
-            lines.append('Next: /kvpark setup --model "the-exact-model-ID-served-by-your-backend"')
-        elif config["connected"]:
-            lines.append("Configured. New Hermes sessions use this proxy; send a message, then /kvpark save to save it."
-                         if config["cache_mode"] == "native" else "Configured. New Hermes sessions use this proxy in routing mode.")
+        if config["connected"]:
+            lines.append("Connected. Start a new Hermes conversation to use this model.")
         else:
-            lines += ["Next: /kvpark start, then /kvpark connect to select this route for future sessions."]
+            lines.append("Run /kvpark setup to find a running model and choose it from a numbered list.")
         lines += ["Commands:", "  save | status | forget [k-…] | slots",
                   "  update check | update | uninstall [confirm]",
                   "  retention 7 | budget 32 | cleanup on|off|now",
                   "  base-url http://127.0.0.1:8080 | autostart on|off",
-                  "Setup also accepts --backend llama.cpp|ollama|vllm|mlx, --upstream-url, --model, --cache-mode native|routing,",
-                  "--archive-dir, --upstream-port, --backend-args (quoted), and --external.",
+                  "Advanced setup and managed disk snapshots: docs/hermes.md",
                   "Restore is automatic when you return to a compatible conversation."]
         if self.service.error:
             lines.append("Startup needs attention: " + self.service.error)
@@ -265,8 +260,19 @@ class Adapter:
                 raise PermissionError("updates are managed by your administrator")
             result = updates.apply(config["archive_dir"], hermes_home=self.home, external=config["external"])
             return f"kvpark {result['version']}: {result['note']}"
-        if action in {"setup", "onboarding", "help"}:
-            return self.configure(rest) if rest and action == "setup" else self.onboarding()
+        if action == "setup":
+            if rest and rest[0].startswith("--"):
+                return self.configure(rest)
+            from .setup import connect_model, hermes_hint
+            owner = _command_context.get() or session_value("HERMES_SESSION_ID") or "local"
+            def apply(model):
+                return connect_model(model, self.settings(), hermes=True)
+            result = self.setup_guide.handle(rest, owner=owner, current=self.settings(), apply=apply, extra=[hermes_hint()])
+            if result.startswith("Connected to"):
+                result += "\nRestart Hermes and start a new conversation to use this model."
+            return result
+        if action in {"onboarding", "help"}:
+            return self.onboarding()
         if action == "base-url" and len(rest) == 1:
             return self.configure(["--base-url", rest[0]])
         if action == "autostart" and rest in (["on"], ["off"]):
@@ -351,5 +357,6 @@ def register(ctx):
     ctx.register_hook("pre_command", adapter.capture_command)
     ctx.register_middleware("llm_request", adapter.middleware)
     ctx.on_unload(adapter.service.closed.set)
-    if adapter.settings()["autostart"]:
+    config = adapter.settings()
+    if config["autostart"] and (config["external"] or config["model"]):
         adapter.service.start_async()

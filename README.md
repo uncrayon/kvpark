@@ -6,11 +6,11 @@ kvpark saves a local model's conversation inference state to disk and restores
 it when you return. Built for people running open-weight models on their own hardware.
 MIT licensed. No cloud service or account. The portable runtime uses psutil.
 
-**Alpha release `0.3.0a1`.** Supports Linux, macOS, and
+**Alpha release `0.3.0a2`.** Supports Linux, macOS, and
 Windows startup, automatic free-port selection, and routing adapters for llama.cpp,
 Ollama, vLLM, and MLX-LM. Disk park/resume through this adapter still requires the
 managed patched llama.cpp runtime and one slot. See [backend capabilities](docs/backends.md).
-Download the [current alpha](https://github.com/uncrayon/kvpark/releases/tag/v0.3.0a1).
+Download the [current alpha](https://github.com/uncrayon/kvpark/releases/tag/v0.3.0a2).
 Previously installed **sloth-memory**? Follow the
 [one-time rename migration](docs/updates.md#migrate-from-sloth-memory) before enabling kvpark.
 The package, CLI, Hermes command, and repository are now named `kvpark`.
@@ -40,13 +40,54 @@ Your agent → kvpark (local proxy) → inference server
 
 ## Install the latest alpha
 
-Requirements: Linux, macOS, or Windows, Python 3.10+, and Git. Building the managed
-llama.cpp runtime also needs CMake, a C/C++ toolchain, and your own supported GGUF
-model. On macOS, install the Xcode Command Line Tools for the compiler. Models
-and compiled runtimes are not bundled.
+On **macOS, Linux, or WSL**, paste this into a terminal:
 
-For Hermes, follow [installation in Hermes' Python environment](docs/hermes.md#install-alongside-hermes)
-instead of creating the standalone environment below.
+```bash
+curl -fsSL https://raw.githubusercontent.com/uncrayon/kvpark/main/install.sh | bash
+```
+
+The installer detects Hermes and installs into its own Python environment,
+then enables the plugin. Without Hermes, it creates a private standalone
+installation. It supplies Python when needed and adds the `kvpark` command to
+your shell. No Git checkout, pip setup, virtual-environment activation, or sudo.
+
+After installation, the setup wizard opens automatically:
+
+1. Pick a model from the numbered list of running servers.
+2. Confirm with **yes**, or choose **0** to set up later.
+3. For Hermes, restart it and start a new conversation.
+
+No model IDs to look up, ports to type, or setup flags to assemble. The scan checks
+this computer's listening ports and asks model servers which models they offer.
+Your current connection changes only after you confirm and the new connection works.
+
+To reopen the chooser, type `/kvpark setup` in Hermes, or `kvpark setup` in a
+terminal. Existing servers support chat routing; disk park/resume still requires
+the patched llama.cpp runtime. The wizard tells you which capability you are selecting.
+
+Force a standalone install:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/uncrayon/kvpark/main/install.sh | bash -s -- --standalone
+```
+
+Need the patched llama.cpp runtime for disk park/resume? Add `--runtime cpu`
+(or `metal`, `cuda`, `hip`, or `vulkan` for your installed GPU toolchain). This
+also requires Git, CMake, and a C++ compiler. The installer builds the runtime and
+prints the exact setup command; you supply your own GGUF model.
+
+See [installer options, custom Hermes locations, and troubleshooting](docs/install.md).
+Native Windows and manual installation instructions are below; WSL uses the
+one-command installer.
+
+<details>
+<summary>Manual installation and runtime launch (advanced)</summary>
+
+### Manual installation
+
+Requirements: Python 3.10+ and Git. Building the managed llama.cpp runtime also
+requires CMake and a C/C++ toolchain (Xcode Command Line Tools on macOS).
+For Hermes, use [its own Python environment](docs/hermes.md#install-alongside-hermes).
 
 ### Standalone installation (without the Hermes plugin)
 
@@ -57,7 +98,7 @@ instead; Hermes cannot discover packages installed only in this separate environ
 On macOS/Linux:
 
 ```bash
-git clone --branch v0.3.0a1 https://github.com/uncrayon/kvpark.git
+git clone --branch v0.3.0a2 https://github.com/uncrayon/kvpark.git
 cd kvpark
 python3 -m venv .venv
 source .venv/bin/activate
@@ -107,6 +148,8 @@ Storage defaults to `~/Library/Application Support/kvpark` on macOS,
 `XDG_DATA_HOME` overrides these. To change it, pass the **same** `--archive-dir` to
 the backend, proxy, and control commands.
 
+</details>
+
 ## Updates
 
 For an installed kvpark package, use `/kvpark update check` in Hermes to compare
@@ -120,17 +163,15 @@ For terminal use on any OS: `python -m kvpark update check` and
 
 ## Use with Hermes
 
-Before trying the plugin, read [uninstall and return to your original backend](docs/uninstall.md).
-It covers `/kvpark uninstall`, package removal, and optional archive/build cleanup.
-
-Install kvpark in Hermes' Python environment, enable it with
-`hermes plugins enable kvpark`, and restart Hermes. Then run:
+The installer enables the plugin in Hermes' own Python environment and opens the
+model chooser. To choose or change a model later, run:
 
 ```text
 /kvpark setup
 ```
 
-The [Hermes setup guide](docs/hermes.md) covers selecting the backend and model.
+Choose a model number and confirm with `yes`. Choose `0` to leave the current
+connection alone. The [Hermes setup guide](docs/hermes.md) shows the full flow.
 Migrating from sloth-memory? Use the [rename migration](docs/updates.md#migrate-from-sloth-memory), which preserves its archive and backend.
 Already using a custom proxy or qwen-slot? Follow the [migration steps](docs/hermes.md#migrate-an-existing-custom-integration)
 to retire the old services and preserve your model settings.

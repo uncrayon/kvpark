@@ -24,6 +24,26 @@ jobs:
       - run: python -m pip install .
       - run: python -m unittest discover -s tests -v
       - run: kvpark --version
+  installer:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install from the checkout in a fresh home, then rerun
+        shell: bash
+        run: |
+          export HOME="$RUNNER_TEMP/kvpark install home"
+          export XDG_DATA_HOME="$HOME/.local/share"
+          export UV_CACHE_DIR="$HOME/.cache/uv"
+          export UV_PYTHON_INSTALL_DIR="$HOME/.local/share/uv/python"
+          mkdir -p "$HOME"
+          bash install.sh --standalone --no-setup --package "$GITHUB_WORKSPACE"
+          bash install.sh --standalone --no-setup --package "$GITHUB_WORKSPACE"
+          "$HOME/.local/bin/kvpark" --version
+          "$HOME/.local/bin/kvpark" --help
   runtime:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -87,3 +107,7 @@ jobs:
       - run: python tests/hermes/test_integration.py -v
         env:
           PYTHONPATH: .hermes-test
+      - if: runner.os != 'Windows'
+        run: python -m pip install uv
+      - if: runner.os != 'Windows'
+        run: python scripts/test_install_hermes.py
