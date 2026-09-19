@@ -42,6 +42,10 @@ def main():
     setup_mode.add_argument("--standalone", action="store_true", help="configure standalone kvpark")
     start = sub.add_parser("start", help="restart the connection selected with setup")
     start.add_argument("--archive-dir")
+    start.add_argument("--hermes", action="store_true", help="start the connection configured in the active Hermes profile")
+    start.add_argument("--supervise", action="store_true",
+                       help="keep running and relaunch stopped services; for a systemd or launchd service")
+    start.add_argument("--interval", type=float, default=60, help="seconds between supervise checks (default 60)")
     migrate = sub.add_parser("migrate", help="migrate sloth-memory without moving saved caches")
     migrate.add_argument("--hermes", action="store_true", help="migrate the active Hermes profile")
     migrate.add_argument("--archive-dir", help="standalone legacy archive directory")
@@ -102,16 +106,42 @@ def main():
             hermes = args.hermes or (not args.standalone and find_spec("hermes_cli") is not None)
             terminal(hermes=hermes)
         elif args.command == "start":
-            from .setup import saved_settings
-            from .hermes_service import Service
-            config = saved_settings()
-            if not config:
-                raise ValueError("Choose a model first with kvpark setup.")
-            if args.archive_dir and directory(args.archive_dir) != directory(config["archive_dir"]):
-                raise ValueError("kvpark start uses the connection selected in setup; run kvpark setup to choose another.")
+            from .hermes_service import Service, supervise
+            if args.hermes:
+                if args.archive_dir:
+                    parser.error("--hermes uses its profile's archive; do not pass --archive-dir")
+                try:
+                    from .setup import hermes_settings
+                    config = hermes_settings()
+                except ImportError:
+                    raise RuntimeError("run kvpark start --hermes with the Python environment that runs Hermes") from None
+                if config["uninstalled"]:
+                    raise ValueError("kvpark is disconnected in this Hermes profile. Run /kvpark setup in Hermes first.")
+                if not (config["model"] or config["external"]):
+                    raise ValueError("No model is configured in this Hermes profile. Run /kvpark setup in Hermes first.")
+                check = "kvpark doctor --hermes"
+            else:
+                from .setup import saved_settings
+                config = saved_settings()
+                if not config:
+                    raise ValueError("Choose a model first with kvpark setup.")
+                if args.archive_dir and directory(args.archive_dir) != directory(config["archive_dir"]):
+                    raise ValueError("kvpark start uses the connection selected in setup; run kvpark setup to choose another.")
+                check = "kvpark doctor"
             service = Service(lambda: config)
-            service.ensure()
-            print("kvpark is ready. Run kvpark doctor to check the connection.")
+            if args.interval <= 0:
+                parser.error("--interval must be positive")
+            if args.supervise:
+                # A boot-time service keeps retrying; the model server may not be ready yet.
+                try:
+                    service.ensure()
+                    print(f"kvpark is ready at {config['base_url']}/v1; supervising every {args.interval:g}s.", flush=True)
+                except (OSError, ValueError, RuntimeError) as exc:
+                    print(f"kvpark: {exc}; retrying in {args.interval:g}s", flush=True)
+                supervise(service, args.interval)
+            else:
+                service.ensure()
+                print(f"kvpark is ready. Run {check} to check the connection.")
         elif args.command == "migrate":
             from .migration import run
             print(run(hermes=args.hermes, archive=args.archive_dir, confirm=args.confirm))

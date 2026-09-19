@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add `kvpark start --hermes`, which starts the connection configured in the active Hermes profile from a terminal, and `--supervise`, which keeps relaunching stopped services for a systemd or launchd boot service.
+
 ## 0.3.0a3 — safer routing and Hermes compatibility
 
 - Point Hermes at the chosen model server instead of the kvpark proxy. The plugin inserts its proxy into each request while the proxy is healthy, so a stopped proxy or a plugin that fails to load no longer breaks every Hermes conversation. `/kvpark doctor` flags the previous proxy route as legacy; `/kvpark connect` switches it.

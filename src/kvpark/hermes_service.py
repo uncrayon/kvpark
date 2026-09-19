@@ -81,6 +81,26 @@ def route_for(config):
     return {"provider": "custom", "default": model, "base_url": target(config).url + "/v1", "api_mode": "chat_completions"}
 
 
+def supervise(service, interval, *, stop=None, log=print):
+    """Keep the services running from a boot-time service: re-run ensure() until stopped.
+
+    ensure() attaches to healthy services and relaunches missing ones, so each pass
+    is a single local status request when everything is up. Failures are logged and
+    retried; the model server may not be ready right after boot.
+    """
+    if stop is None:
+        import signal
+        stop = threading.Event()
+        for name in ("SIGTERM", "SIGINT"):
+            if hasattr(signal, name):
+                signal.signal(getattr(signal, name), lambda *_: stop.set())
+    while not stop.wait(interval):
+        try:
+            service.ensure()
+        except (OSError, ValueError, RuntimeError) as exc:
+            log(f"kvpark: {exc}; retrying in {interval:g}s", flush=True)
+
+
 class Service:
     def __init__(self, settings, persist=None):
         self.settings = settings

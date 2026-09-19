@@ -205,6 +205,56 @@ starts its managed services if autostart is on. Starting Hermes itself at boot o
 login is a separate Hermes service setting. The cleanup policy still expires old
 snapshots; rebooting does not reset their age.
 
+### Start at boot
+
+The plugin starts kvpark's services when Hermes loads, and they stay up after
+Hermes closes, but nothing relaunches them after a reboot until Hermes runs
+again. Two ways to change that:
+
+- **Run the Hermes gateway as a service** (`hermes gateway install`). The gateway
+  loads the plugin at boot, which starts the services; the plugin also
+  relaunches a stopped proxy on the next request. Services launched this way
+  live in the gateway's control group, so `hermes gateway stop`, `restart`, and
+  `hermes update` stop them too, and the next request reloads the model.
+- **Run kvpark itself as a service**, independent of Hermes. `kvpark start --hermes`
+  starts the connection configured in the active Hermes profile from a terminal;
+  `--supervise` keeps running, rechecks every 60 seconds, and relaunches whatever
+  stopped. Use the Python environment that runs Hermes.
+
+On Linux, save this as `~/.config/systemd/user/kvpark.service`:
+
+```ini
+[Unit]
+Description=kvpark proxy and managed model server for Hermes
+
+[Service]
+ExecStart=%h/.hermes/hermes-agent/venv/bin/python -m kvpark start --hermes --supervise
+# Plugin-directory installation instead of a package:
+# Environment=PYTHONPATH=%h/.hermes/plugins/kvpark/src
+# Non-default profile, or GPU runtime variables from the profile:
+# Environment=HERMES_HOME=%h/.hermes-work
+# EnvironmentFile=-%h/.hermes/.env
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=90
+
+[Install]
+WantedBy=default.target
+```
+
+Then enable it, and let user services run without a login session:
+
+```bash
+systemctl --user daemon-reload && systemctl --user enable --now kvpark.service
+loginctl enable-linger "$USER"
+```
+
+`systemctl --user status kvpark` shows the supervisor, proxy, and backend in one
+control group; `systemctl --user stop kvpark` stops all three. Hermes reuses the
+running services, and `kvpark doctor --hermes` reports them. On macOS, a launchd
+agent in `~/Library/LaunchAgents` with `RunAtLoad` and `KeepAlive` running the
+same command does the equivalent.
+
 A gateway restart reuses an existing compatible proxy so it does not interrupt
 shared inference. It does not automatically replace that proxy's Python code.
 Use `/kvpark update check` to see all three versions and `/kvpark update` for the

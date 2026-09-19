@@ -1,7 +1,7 @@
 # Hermes plugin manifest. `hermes plugins install uncrayon/kvpark` clones this
 # repository into ~/.hermes/plugins/kvpark and loads the __init__.py next to it.
 name: kvpark
-version: 0.3.0a3
+version: 0.3.0a4.dev0
 description: Park model state, resume conversations, and manage saved caches
 author: Ulises Rayon
 kind: standalone

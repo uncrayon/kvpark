@@ -221,7 +221,9 @@ while it is running. If kvpark is stopped, or Hermes cannot load the plugin,
 Hermes keeps talking to the server directly, just without parking.
 The managed llama.cpp backend also starts with Hermes; existing servers remain
 under your control. Services keep running after Hermes closes for cleanup. No sudo
-is needed. Disk controls below require native snapshot mode.
+is needed. To relaunch them at boot without Hermes, run `kvpark start --hermes --supervise`
+from a [systemd or launchd service](docs/hermes.md#start-at-boot).
+Disk controls below require native snapshot mode.
 
 ```text
 /kvpark doctor
