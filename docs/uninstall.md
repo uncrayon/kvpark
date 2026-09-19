@@ -14,6 +14,7 @@ proxy that has been removed. No sudo is required for the standard installation.
 | Component | Location / owner | Removal |
 | --- | --- | --- |
 | Python package and Hermes entry point | The Python environment used for installation | `python -m pip uninstall kvpark` |
+| Plugin directory, if installed with `hermes plugins install` | `~/.hermes/plugins/kvpark` | `hermes plugins remove kvpark` after disconnecting |
 | Enabled plugin and model route | Active Hermes profile's `config.yaml` | Automated disconnect restores the saved route and disables the plugin |
 | Proxy and hourly cleanup loop | A kvpark Python process | Automated disconnect stops the verified archive-owned proxy |
 | Managed llama.cpp backend, if selected | Process started by kvpark | Automated disconnect stops the verified archive-owned backend |
@@ -92,7 +93,9 @@ python -m pip uninstall kvpark
 
 This removes kvpark's installed package, command launcher, and plugin entry point.
 It keeps dependencies that Hermes or other packages may also use. Do not delete
-Hermes' virtual environment. Restart the gateway if you want Hermes running again.
+Hermes' virtual environment. A plugin-directory installation is removed with
+`hermes plugins remove kvpark` instead; it has no package to uninstall. Restart the
+gateway if you want Hermes running again.
 Discord and Telegram menus update when Hermes synchronizes its command catalog;
 cached menus may take longer to reflect removal.
 

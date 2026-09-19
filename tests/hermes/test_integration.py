@@ -50,6 +50,67 @@ class HermesIntegrationTests(unittest.TestCase):
     def command_text(self, text):
         return asyncio.run(self.command(text))
 
+    def test_desktop_commands_accept_nonbreaking_spaces(self):
+        from importlib import import_module
+        from tui_gateway import methods_tools
+        from kvpark import hermes_uninstall
+        # The rich composer preserves textContent, including nonbreaking spaces.
+        # Exercise the desktop dispatcher, which passes these arguments unchanged.
+        with patch.object(methods_tools, "_tools_mod", import_module, create=True), \
+                patch.object(hermes_uninstall, "run", return_value="Uninstall preview") as uninstall:
+            for args in ("help\u00a0", "status\u00a0", "setup\u00a00", "uninstall\u00a0"):
+                with self.subTest(args=args):
+                    result = methods_tools._run_plugin_command(self.command, args)
+                    self.assertNotIn("Unknown command", result)
+            uninstall.assert_called_once_with(confirm=False)
+            uninstall.reset_mock()
+            methods_tools._run_plugin_command(self.command, "uninstall\u202fconfirm\u00a0")
+            uninstall.assert_called_once_with(confirm=True)
+
+    def configure_routing_fixture(self):
+        from hermes_cli.config import save_config
+        save_config({"plugins": {"entries": {"kvpark": {"settings": {"service": {
+            "autostart": False, "external": True, "connected": True,
+            "base_url": self.url, "backend": "vllm", "cache_mode": "routing",
+            "upstream_url": "http://127.0.0.1:8081", "model": "fixture-gemma"}}}}}}, merge_existing=True)
+
+    def test_routing_save_reports_capability_before_missing_desktop_identity(self):
+        from kvpark.hermes import Adapter
+        self.configure_routing_fixture()
+        with patch.object(Adapter, "current_key", side_effect=AssertionError("must not resolve identity")), \
+                patch.object(Adapter, "call", side_effect=AssertionError("must not send save")):
+            for command in ("save", "park"):
+                result = self.command_text(command)
+                self.assertIn("Disk save/resume is unavailable", result)
+                self.assertNotIn("conversation identity", result)
+
+    def test_configured_bare_command_shows_connection_without_restarting_setup(self):
+        self.configure_routing_fixture()
+        with patch("kvpark.discovery.discover", side_effect=AssertionError("must not restart setup")):
+            result = self.command_text("")
+        self.assertIn("fixture-gemma", result)
+        self.assertIn("Chat routing only", result)
+        self.assertIn("/kvpark doctor", result)
+        self.assertNotIn("Restore is automatic", result)
+
+    def test_doctor_checks_connection_without_conversation_identity(self):
+        from kvpark.hermes import Adapter
+        self.configure_routing_fixture()
+        with patch.object(Adapter, "current_key", side_effect=AssertionError("must not resolve identity")), \
+                patch.object(Adapter, "call", return_value={"ok": True, "note": "Routing only"}) as call:
+            result = self.command_text("doctor")
+        call.assert_called_once_with("doctor")
+        self.assertIn("Connection check: OK", result)
+        self.assertIn("fixture-gemma", result)
+        self.assertIn("Routing only", result)
+
+    def test_unknown_command_points_to_help_not_another_setup(self):
+        result = self.command_text("nonsense")
+        self.assertIn("/kvpark help", result)
+        self.assertIn("/kvpark status", result)
+        self.assertIn("/kvpark setup 1", result)
+        self.assertNotIn("setup for available commands", result)
+
     def test_numbered_setup_preserves_route_until_confirmation(self):
         from kvpark.discovery import Model, Scan
         from kvpark import setup
@@ -78,6 +139,8 @@ class HermesIntegrationTests(unittest.TestCase):
         after = read_user_config_raw()
         service = after["plugins"]["entries"]["kvpark"]["settings"]["service"]
         self.assertEqual(after["model"]["default"], model.model)
+        # Hermes is pointed at the chosen server, never at the proxy.
+        self.assertEqual(after["model"]["base_url"], model.url + "/v1")
         self.assertEqual(service["model"], model.model)
         self.assertEqual(service["upstream_url"], model.url)
         self.assertEqual(service["cache_mode"], "routing")
@@ -420,9 +483,127 @@ class HermesIntegrationTests(unittest.TestCase):
         self.assertIn("new sessions", self.command_text("connect"))
         from hermes_cli.config import read_user_config_raw
         config = read_user_config_raw()
-        self.assertEqual(config["model"]["base_url"], self.url + "/v1")
+        # The route is the managed model server; the proxy is inserted per request.
+        self.assertEqual(config["model"]["base_url"], "http://127.0.0.1:8090/v1")
         self.assertEqual(config["model"]["default"], "local")
         self.assertEqual(config["agent"]["max_turns"], 12)
+
+    def bound_client(self, base_url, session_id="route-test"):
+        from openai import OpenAI
+        client = OpenAI(base_url=base_url, api_key="local")
+        self.addCleanup(client.close)
+        return client, SimpleNamespace(session_id=session_id, _persist_disabled=False, client=client, base_url=base_url)
+
+    def test_upstream_route_is_redirected_to_a_healthy_proxy(self):
+        from agent.subagent_lifecycle import bind_subagent_parent
+        from hermes_cli.middleware import apply_llm_request_middleware
+        self.configure_routing_fixture()
+        upstream = "http://localhost:8081/v1"  # loopback alias of the configured server
+        client, active = self.bound_client(upstream)
+        with bind_subagent_parent(active):
+            result = apply_llm_request_middleware({"model": "fixture-gemma", "messages": []}, session_id="route-test",
+                                                  base_url=upstream, api_mode="chat_completions")
+        self.assertEqual(str(client.base_url).rstrip("/"), self.url + "/v1")
+        self.assertEqual(active.base_url, self.url + "/v1")
+        self.assertEqual(result.payload["extra_body"]["slot_archive_role"], "foreground")
+
+    def test_unavailable_proxy_leaves_hermes_on_its_model_server(self):
+        from agent.subagent_lifecycle import bind_subagent_parent
+        from hermes_cli.middleware import apply_llm_request_middleware
+        self.configure_routing_fixture()
+        adapter = self.command.__self__
+        dead = "http://127.0.0.1:1"
+        upstream = "http://127.0.0.1:8081/v1"
+        for autostart in (False, True):
+            with self.subTest(autostart=autostart):
+                adapter.ctx.set_config("service", {**adapter.settings(), "base_url": dead, "autostart": autostart})
+                client, active = self.bound_client(upstream)
+                original = {"model": "fixture-gemma", "messages": []}
+                with bind_subagent_parent(active):
+                    result = apply_llm_request_middleware(original, session_id="route-test", base_url=upstream,
+                                                          api_mode="chat_completions")
+                self.assertEqual(result.payload, original)
+                self.assertEqual(str(client.base_url).rstrip("/"), upstream)
+        self.assertIn("unavailable", adapter.service.error)
+        self.assertIn("unavailable", self.command_text("doctor"))
+        # A session still bound to the dead proxy is pointed back at the server.
+        client, active = self.bound_client(dead + "/v1")
+        with bind_subagent_parent(active):
+            apply_llm_request_middleware({"messages": []}, session_id="route-test", base_url=dead + "/v1",
+                                         api_mode="chat_completions")
+        self.assertEqual(str(client.base_url).rstrip("/"), upstream)
+
+    def test_register_works_on_hermes_without_argument_modes_or_completion_registry(self):
+        import sys
+        from kvpark.hermes import register
+        registered = {}
+
+        class OlderContext:
+            def get_config(self, key, default=None):
+                return default
+
+            def set_config(self, key, value):
+                pass
+
+            def register_command(self, name, handler, description="", args_hint=""):
+                registered["command"] = (name, handler)
+
+            def register_hook(self, name, callback):
+                registered.setdefault("hooks", []).append(name)
+
+            def register_middleware(self, kind, callback):
+                registered["middleware"] = kind
+
+            def on_unload(self, callback):
+                pass
+
+        with patch.dict(sys.modules, {"hermes_cli.commands": None}):
+            register(OlderContext())
+        name, handler = registered["command"]
+        self.assertEqual(name, "kvpark")
+        self.assertEqual(handler.__self__.support, {"argument_mode": False, "completion": False})
+        self.assertEqual(registered["middleware"], "llm_request")
+        self.assertIn("pre_command", registered["hooks"])
+        self.assertIn("argument suggestions need Hermes 0.21.0", asyncio.run(handler("doctor")))
+
+    def test_doctor_reports_versions_plugin_state_and_route(self):
+        import hermes_cli
+        from kvpark import __version__
+        self.configure_routing_fixture()
+        result = self.command_text("doctor")
+        self.assertIn(f"Hermes {hermes_cli.__version__}", result)
+        self.assertIn(f"kvpark {__version__}", result)
+        self.assertIn("Plugin: loaded", result)
+        self.assertIn("argument suggestions on", result)
+        # setUp routes Hermes straight at the proxy, the pre-0.3.0a3 layout.
+        self.assertIn("legacy", result)
+        self.command_text("connect")
+        self.assertIn("the model server itself", self.command_text("doctor"))
+
+    def test_terminal_doctor_loads_the_plugin_without_starting_services(self):
+        from kvpark import hermes_doctor
+        from kvpark.hermes_service import Service
+        self.configure_routing_fixture()
+        adapter = self.command.__self__
+        adapter.ctx.set_config("service", {**adapter.settings(), "autostart": True})
+        with patch.object(Service, "start_async") as start, patch.object(Service, "ensure") as ensure:
+            lines, ok = hermes_doctor.report()
+        start.assert_not_called()
+        ensure.assert_not_called()
+        self.assertTrue(ok, lines)
+        text = "\n".join(lines)
+        self.assertIn("Plugin: loaded (entrypoint)", text)
+        self.assertIn("Connection check:", text)
+        self.assertNotIn("KVPARK_NO_AUTOSTART", os.environ)
+
+    def test_update_from_a_plugin_directory_points_to_hermes(self):
+        from kvpark import updates
+        with patch("kvpark.hermes_doctor.install_source", return_value=("directory", "/plugins/kvpark")), \
+                patch.object(updates, "apply") as apply, patch.object(updates, "check") as check:
+            for text in ("update", "update check"):
+                self.assertIn("hermes plugins update kvpark", self.command_text(text))
+        apply.assert_not_called()
+        check.assert_not_called()
 
     def test_matching_live_openai_client_follows_new_proxy_port(self):
         from agent.subagent_lifecycle import bind_subagent_parent
@@ -447,6 +628,7 @@ class HermesIntegrationTests(unittest.TestCase):
         self.assertIn("new sessions", self.command_text("connect"))
         from hermes_cli.config import read_user_config_raw
         self.assertEqual(read_user_config_raw()["model"]["default"], "my-model:latest")
+        self.assertEqual(read_user_config_raw()["model"]["base_url"], "http://127.0.0.1:11434/v1")
 
     def test_changing_backend_clears_previous_model_and_endpoint(self):
         adapter = self.command.__self__

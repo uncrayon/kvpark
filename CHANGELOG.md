@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0a3 — safer routing and Hermes compatibility
+
+- Point Hermes at the chosen model server instead of the kvpark proxy. The plugin inserts its proxy into each request while the proxy is healthy, so a stopped proxy or a plugin that fails to load no longer breaks every Hermes conversation. `/kvpark doctor` flags the previous proxy route as legacy; `/kvpark connect` switches it.
+- Detect optional Hermes plugin APIs when loading. Hermes 0.20.1 and newer load the adapter; argument suggestions still need 0.21.0. A Hermes API change now surfaces as a `/kvpark` message naming the Hermes version instead of a silent load failure.
+- Add `kvpark doctor --hermes` and extend `/kvpark doctor`: Hermes version, where kvpark loads from, whether `/kvpark` registered, the route mode, and proxy reachability. The installer runs it after enabling the plugin and stops with the reason when Hermes cannot load kvpark; its final instructions no longer contradict the chooser it opens.
+- Install as a Hermes plugin directory with `hermes plugins install uncrayon/kvpark` and update with `hermes plugins update kvpark`; `/kvpark update` explains this for directory installs. Package installs keep the coordinated updater.
+- Accept nonbreaking spaces from rich-text command input without changing quoted model names or paths, including setup choices and uninstall confirmations.
+- Report unsupported disk saving before resolving Hermes conversation identity for routing connections. Keep configured users out of repeated onboarding and send unknown commands to help instead of restarting setup.
+
 ## 0.3.0a2 — easier installation and model discovery
 
 - Add local model-server discovery and numbered setup choices in Hermes and the terminal. The installer opens the chooser automatically, and users can cancel without changing their model route.

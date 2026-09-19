@@ -53,8 +53,16 @@ def write_json(path, value):
     temporary.replace(path)
 
 
+def installed_version():
+    try:
+        return metadata.version("kvpark")
+    except metadata.PackageNotFoundError:
+        raise ValueError("kvpark is not an installed package in this environment (source checkout or Hermes plugin "
+                         "directory). Update it with git pull or `hermes plugins update kvpark`.") from None
+
+
 def check(archive, *, url=None):
-    installed = metadata.version("kvpark")
+    installed = installed_version()
     record = proxy_record(Path(archive))
     address = url or (record["base_url"] if record else None)
     try:
@@ -196,7 +204,7 @@ def apply(archive, *, hermes_home=None, external=False):
 
 
 def _apply(archive, hermes_home):
-    installed = metadata.version("kvpark")
+    installed = installed_version()
     release = releases.latest(installed)
     newer = release and Version(release["version"]) > Version(installed)
     existing = proxy_record(archive)

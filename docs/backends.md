@@ -1,6 +1,6 @@
 # Backends and operating systems
 
-This describes kvpark alpha `0.3.0a2`. Existing sloth-memory users should follow
+This describes kvpark alpha `0.3.0a3`. Existing sloth-memory users should follow
 the [rename migration](updates.md#migrate-from-sloth-memory).
 
 ## Capability contract
@@ -10,7 +10,7 @@ the [rename migration](updates.md#migrate-from-sloth-memory).
 | Patched llama.cpp, managed locally | Yes | Yes; validate each model/build |
 | Stock llama.cpp, existing server | Yes, `--cache-mode routing` | Unavailable |
 | Ollama, existing server | Yes | Unavailable through this adapter |
-| vLLM, existing server | Yes | Unavailable through this adapter |
+| vLLM / vLLM-MLX, existing server | Yes, through the compatible chat API | Unavailable through this adapter |
 | MLX-LM, existing server | Yes | Unavailable through this adapter |
 | Other OpenAI-compatible server | Yes | Unavailable through this adapter |
 
@@ -19,6 +19,21 @@ Routing preserves the served model name, messages, tool calls, and streaming.
 mode, parking returns an error instead of claiming that inference state was saved.
 No transcript cache is substituted for a KV snapshot. Seven-day cleanup only
 manages files owned by kvpark, never a backend's independent prefix cache.
+
+### vLLM-MLX and Gemma on Apple Silicon
+
+Discovery can list an MLX model under vLLM because the server reports that owner
+in `/v1/models`. Finding a model or completing setup establishes chat routing;
+it does not add kvpark disk save/resume support to vLLM-MLX. Running setup again
+cannot enable that missing capability. The backend's own prefix or SSD cache is
+separate from kvpark's conversation snapshots.
+
+If setup has already completed, use `/kvpark status` to inspect the connection.
+Before `0.3.0a3`, `/kvpark save` could misleadingly report a missing conversation
+identity before reporting the backend limitation, and an unknown command pointed
+back to setup. Neither message proves that installation failed. Use `/kvpark help`
+for the command list; `/kvpark setup 1` selects the first discovery result, and
+`/kvpark setup yes` confirms it. Reinstalling does not resolve a capability limit.
 
 The proxy and Python runtime target Linux, macOS, and Windows. CI runs the Python
 suite and builds the patched llama.cpp runtime on all three systems. The backend

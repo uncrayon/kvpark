@@ -1,16 +1,35 @@
 # 🅿️ kvpark
 
+[![Disk save/resume: patched llama.cpp only](https://img.shields.io/badge/Disk_save%2Fresume-patched_llama.cpp_only-2da44e)](#server-support)
+[![Other servers: chat routing only](https://img.shields.io/badge/Other_servers-chat_routing_only-d4a72c)](#server-support)
+
 **Park your model’s conversation state. Pick up where you left off.**
 
 kvpark saves a local model's conversation inference state to disk and restores
-it when you return. Built for people running open-weight models on their own hardware.
+it when you return, using the managed patched llama.cpp runtime.
+Built for people running open-weight models on their own hardware.
 MIT licensed. No cloud service or account. The portable runtime uses psutil.
 
-**Alpha release `0.3.0a2`.** Supports Linux, macOS, and
-Windows startup, automatic free-port selection, and routing adapters for llama.cpp,
-Ollama, vLLM, and MLX-LM. Disk park/resume through this adapter still requires the
-managed patched llama.cpp runtime and one slot. See [backend capabilities](docs/backends.md).
-Download the [current alpha](https://github.com/uncrayon/kvpark/releases/tag/v0.3.0a2).
+## Server support
+
+**Disk save/resume currently requires the managed patched llama.cpp runtime with one slot.**
+Connecting another server enables chat routing; it does not enable kvpark disk snapshots.
+
+| Inference server | Chat routing | kvpark disk save/resume |
+| --- | --- | --- |
+| **Patched llama.cpp, managed by kvpark** | Yes | **Supported — validate your model/build** |
+| Stock llama.cpp | Yes | Unavailable |
+| Ollama | Yes | Unavailable |
+| vLLM / vLLM-MLX | Yes, through the compatible chat API | Unavailable |
+| MLX-LM | Yes | Unavailable |
+| Other OpenAI-compatible servers | Compatible chat API required | Unavailable |
+
+For example, **Gemma served by vLLM-MLX cannot be parked or resumed by kvpark**.
+The server's own caching is separate. See [backend capabilities and requirements](docs/backends.md#capability-contract).
+
+**Alpha release `0.3.0a3`.** The proxy supports Linux, macOS, and Windows,
+with automatic free-port selection.
+Download the [current alpha](https://github.com/uncrayon/kvpark/releases/tag/v0.3.0a3).
 Previously installed **sloth-memory**? Follow the
 [one-time rename migration](docs/updates.md#migrate-from-sloth-memory) before enabling kvpark.
 The package, CLI, Hermes command, and repository are now named `kvpark`.
@@ -40,16 +59,31 @@ Your agent → kvpark (local proxy) → inference server
 
 ## Install the latest alpha
 
-On **macOS, Linux, or WSL**, paste this into a terminal:
+**Using Hermes?** Install kvpark as a Hermes plugin, from Hermes itself:
+
+```bash
+hermes plugins install uncrayon/kvpark
+hermes plugins enable kvpark
+```
+
+Hermes' plugin scanner asks you to confirm because this repository also contains
+installer scripts and tests; answer yes. Restart Hermes, then type `/kvpark setup`
+and pick a model by number. Update later with `hermes plugins update kvpark`.
+kvpark is tested with Hermes 0.21.x; 0.20.1 or newer loads it, and argument
+suggestions in the composer need 0.21.0.
+
+**Everyone else**, or to install the package into Hermes' Python instead: on
+**macOS, Linux, or WSL**, paste this into a terminal:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/uncrayon/kvpark/main/install.sh | bash
 ```
 
-The installer detects Hermes and installs into its own Python environment,
-then enables the plugin. Without Hermes, it creates a private standalone
-installation. It supplies Python when needed and adds the `kvpark` command to
-your shell. No Git checkout, pip setup, virtual-environment activation, or sudo.
+The installer detects Hermes, installs into its own Python environment, enables
+the plugin, and then loads it exactly as Hermes does to confirm it works. Without
+Hermes, it creates a private standalone installation. It supplies Python when
+needed and adds the `kvpark` command to your shell. No Git checkout, pip setup,
+virtual-environment activation, or sudo.
 
 After installation, the setup wizard opens automatically:
 
@@ -64,6 +98,10 @@ Your current connection changes only after you confirm and the new connection wo
 To reopen the chooser, type `/kvpark setup` in Hermes, or `kvpark setup` in a
 terminal. Existing servers support chat routing; disk park/resume still requires
 the patched llama.cpp runtime. The wizard tells you which capability you are selecting.
+
+Something off? `kvpark doctor --hermes`, run with Hermes' Python (the installed
+`kvpark` command does that), reports Hermes' version, where kvpark loads from,
+whether `/kvpark` registered, which route Hermes uses, and whether the proxy answers.
 
 Force a standalone install:
 
@@ -98,7 +136,7 @@ instead; Hermes cannot discover packages installed only in this separate environ
 On macOS/Linux:
 
 ```bash
-git clone --branch v0.3.0a2 https://github.com/uncrayon/kvpark.git
+git clone --branch v0.3.0a3 https://github.com/uncrayon/kvpark.git
 cd kvpark
 python3 -m venv .venv
 source .venv/bin/activate
@@ -157,6 +195,8 @@ installed, loaded, and running versions, then `/kvpark update` to install a
 published release. The former sloth-memory package needs the one-time migration first. The updater saves
 resident state, replaces its proxy, verifies health, and attempts rollback on
 failure. Hermes gateways restart through their native restart lifecycle.
+A plugin-directory installation is updated with `hermes plugins update kvpark`
+followed by a Hermes restart; `/kvpark update` says so.
 
 For terminal use on any OS: `python -m kvpark update check` and
 `python -m kvpark update`. See [updates and recovery](docs/updates.md).
@@ -175,12 +215,16 @@ connection alone. The [Hermes setup guide](docs/hermes.md) shows the full flow.
 Migrating from sloth-memory? Use the [rename migration](docs/updates.md#migrate-from-sloth-memory), which preserves its archive and backend.
 Already using a custom proxy or qwen-slot? Follow the [migration steps](docs/hermes.md#migrate-an-existing-custom-integration)
 to retire the old services and preserve your model settings.
-Complete setup starts the proxy and selects its actual URL for new Hermes sessions.
+Complete setup starts the proxy and points new Hermes sessions at the chosen
+model server, not at the proxy: the plugin inserts the proxy into each request
+while it is running. If kvpark is stopped, or Hermes cannot load the plugin,
+Hermes keeps talking to the server directly, just without parking.
 The managed llama.cpp backend also starts with Hermes; existing servers remain
 under your control. Services keep running after Hermes closes for cleanup. No sudo
 is needed. Disk controls below require native snapshot mode.
 
 ```text
+/kvpark doctor
 /kvpark save
 /kvpark forget
 /kvpark retention 7

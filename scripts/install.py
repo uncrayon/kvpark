@@ -17,7 +17,7 @@ import time
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-RELEASE = "0.3.0a2"
+RELEASE = "0.3.0a3"
 REPOSITORY = "https://github.com/uncrayon/kvpark"
 
 
@@ -216,6 +216,21 @@ def expose_command(python, bin_dir, modify_path):
     return launcher
 
 
+def check_plugin_loads(python):
+    """Load the plugin the way Hermes does; enabling it only edits configuration."""
+    print("Checking that Hermes loads the plugin...", flush=True)
+    try:
+        output = run([python, "-I", "-m", "kvpark", "doctor", "--hermes"], capture=True)
+    except RuntimeError as exc:
+        detail = str(exc)
+        if "invalid choice" in detail or "unrecognized arguments" in detail:
+            print("This release predates the Hermes load check. Restart Hermes and run /kvpark help to confirm it loaded.")
+            return
+        raise RuntimeError("Hermes did not load kvpark:\n" + detail.partition("\n")[2].strip() +
+                           "\nFix the reported problem, then rerun this installer.") from None
+    print(output, flush=True)
+
+
 def launch_setup(python, *, hermes):
     command = [str(python), "-I", "-m", "kvpark", "setup", "--hermes" if hermes else "--standalone"]
     available = run([python, "-I", "-c", "import importlib.util; print(bool(importlib.util.find_spec('kvpark.setup')))"], capture=True)
@@ -308,6 +323,7 @@ plugins = load_config().get("plugins", {})
 assert "kvpark" in plugins.get("enabled", []), "Hermes did not enable kvpark"
 assert "kvpark" not in plugins.get("disabled", []), "Hermes still disables kvpark"
 '''])
+        check_plugin_loads(python)
     launcher = expose_command(python, args.bin_dir.expanduser().absolute(), not args.no_path)
     binary = build_runtime(args, root) if args.runtime else None
     version = run([launcher, "--version"], capture=True)
@@ -315,11 +331,14 @@ assert "kvpark" not in plugins.get("disabled", []), "Hermes still disables kvpar
     print(f"Works now: {shlex.quote(str(launcher))} --help")
     if not args.no_path:
         print("In a new terminal: kvpark --help")
-    if hermes:
-        print("\nNext: restart Hermes, then type /kvpark setup")
-        print("Setup finds running model servers and asks you to choose a model by number.")
+    chooser = "/kvpark setup in Hermes" if hermes else shlex.quote(str(launcher)) + " setup"
+    if args.no_setup:
+        print(f"\nNext: choose a model with {chooser}." + (" Restart Hermes first." if hermes else ""))
     else:
-        print("\nChoose your model with: " + shlex.quote(str(launcher)) + " setup")
+        print(f"\nNext: choose a model below. Later, {chooser} reopens the chooser.")
+    print("The chooser finds running model servers and asks you to pick one by number.")
+    if hermes:
+        print("Check the installation any time with: " + shlex.join([str(launcher), "doctor", "--hermes"]))
     if binary:
         print("\nRuntime ready. Supply your GGUF model:")
         if hermes:

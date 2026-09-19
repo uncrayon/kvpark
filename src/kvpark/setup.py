@@ -65,9 +65,11 @@ def connect_model(model, current, *, hermes=False):
             raise RuntimeError("The connection stopped during setup. Start the model server and scan again.")
         config["connected"] = True
         if hermes:
+            # Hermes is pointed at the model server, never at the proxy: the plugin's
+            # middleware inserts kvpark per request while the proxy is healthy.
+            from .hermes_service import route_for
             from .hermes_uninstall import save_route
-            save_route(config, {"provider": "custom", "default": model.model, "base_url": config["base_url"] + "/v1",
-                                "api_mode": "chat_completions"}, service=config, expected_model=expected_model)
+            save_route(config, route_for(config), service=config, expected_model=expected_model)
         else:
             from .proxy import atomic_json
             from .platforms import file_lock

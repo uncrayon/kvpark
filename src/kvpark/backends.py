@@ -20,6 +20,21 @@ def normalize_url(value):
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
+def route_key(value):
+    """Compare API routes by scheme, host, port, and path; loopback aliases are equivalent."""
+    text = str(value).strip().rstrip("/")
+    parsed = urlsplit(text)
+    try:
+        port = parsed.port
+    except ValueError:
+        return text
+    host = (parsed.hostname or "").lower()
+    if host in ("localhost", "::1", "0.0.0.0", "::"):
+        host = "127.0.0.1"
+    port = port or (443 if parsed.scheme == "https" else 80)
+    return f"{parsed.scheme}://{host}:{port}{parsed.path}"
+
+
 @dataclass(frozen=True)
 class Backend:
     name: str

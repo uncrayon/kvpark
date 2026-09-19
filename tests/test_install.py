@@ -110,10 +110,10 @@ class InstallerTests(unittest.TestCase):
         result = subprocess.run([str(launcher), "argument with spaces", "$(false)"], capture_output=True, text=True, check=True)
         self.assertEqual(result.stdout.splitlines(), ["-I", "-m", "kvpark", "argument with spaces", "$(false)"])
 
-    def invoke(self, info, *args):
+    def invoke(self, info, *args, run_side_effect=None):
         python = self.root / "hermes/venv/bin/python"
         argv = ["install.py", "--uv", "uv", "--version", "0.3.0a1", "--no-setup", "--no-path", "--bin-dir", str(self.root / "bin"), *args]
-        with patch.object(sys, "argv", argv), patch.object(installer, "find_hermes", return_value=(python, info)), patch.object(installer, "run") as run, patch.object(installer, "release_asset", return_value=self.root / "package.whl"), contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(sys, "argv", argv), patch.object(installer, "find_hermes", return_value=(python, info)), patch.object(installer, "run", side_effect=run_side_effect) as run, patch.object(installer, "release_asset", return_value=self.root / "package.whl"), contextlib.redirect_stdout(io.StringIO()):
             installer.main()
             return run.call_args_list
 
@@ -125,6 +125,37 @@ class InstallerTests(unittest.TestCase):
         enable = next(command for command in commands if "enable" in command)
         self.assertIn("--no-allow-tool-override", enable)
         self.assertEqual(enable[0], install[install.index("--python") + 1])
+
+    def test_hermes_install_verifies_the_plugin_loads_after_enabling(self):
+        calls = self.invoke(self.info)
+        commands = [[str(x) for x in call.args[0]] for call in calls]
+        enable = next(index for index, command in enumerate(commands) if "enable" in command)
+        doctor = next(index for index, command in enumerate(commands) if command[-2:] == ["doctor", "--hermes"])
+        self.assertGreater(doctor, enable)
+        self.assertEqual(commands[doctor][:4], [str(self.root / "hermes/venv/bin/python"), "-I", "-m", "kvpark"])
+
+    def test_standalone_install_skips_the_hermes_load_check(self):
+        info = {**self.info, "hermes": False, "prefix": str(self.root / "kvpark/venv")}
+        with patch.object(installer, "probe", return_value=info):
+            calls = self.invoke(info, "--standalone", "--install-dir", str(self.root / "kvpark"))
+        commands = [[str(x) for x in call.args[0]] for call in calls]
+        self.assertFalse(any(command[-2:] == ["doctor", "--hermes"] for command in commands))
+
+    def test_failed_plugin_load_stops_with_the_report(self):
+        def run(command, *, capture=False):
+            if [str(x) for x in command][-2:] == ["doctor", "--hermes"]:
+                raise RuntimeError("Command failed: doctor\nPlugin: found (entrypoint) but Hermes could not load it: TypeError")
+            return "True" if capture else None
+        with self.assertRaisesRegex(RuntimeError, r"Hermes did not load kvpark:\nPlugin: found .*TypeError"):
+            self.invoke(self.info, run_side_effect=run)
+
+    def test_release_without_the_load_check_is_not_an_error(self):
+        def run(command, *, capture=False):
+            if [str(x) for x in command][-2:] == ["doctor", "--hermes"]:
+                raise RuntimeError("Command failed: doctor\nusage: kvpark doctor\nkvpark doctor: error: unrecognized arguments: --hermes")
+            return "True" if capture else None
+        calls = self.invoke(self.info, run_side_effect=run)
+        self.assertTrue(any([str(x) for x in call.args[0]][-2:] == ["doctor", "--hermes"] for call in calls))
 
     def test_repeat_install_does_not_replace_the_running_package(self):
         with patch.object(installer, "fetch", side_effect=AssertionError("repeat installs need no release download")):

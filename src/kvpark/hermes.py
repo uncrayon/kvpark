@@ -9,10 +9,21 @@ from pathlib import Path
 import re
 import shlex
 
+from .backends import route_key
 from .cli import request
-from .hermes_service import Service, defaults, validate_service, target
+from .hermes_service import Service, defaults, route_for, validate_service, target
 
 _command_context = ContextVar("kvpark_command_context", default=None)
+
+
+def command_args(raw):
+    # Rich-text composers preserve nonbreaking spaces. Treat Unicode whitespace
+    # as separators outside quotes, while keeping quoted model IDs and paths exact.
+    lexer = shlex.shlex(raw, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    lexer.whitespace += "".join(char for char in set(raw) if char.isspace())
+    return list(lexer)
 
 
 def session_value(name):
@@ -39,6 +50,13 @@ def foreground_role(session_id):
     return "foreground" if disabled is False else "background" if disabled is True else "unverified"
 
 
+def known_route(config):
+    try:
+        return route_for(config)
+    except ValueError:
+        return None
+
+
 class Adapter:
     def __init__(self, ctx):
         self.ctx = ctx
@@ -47,6 +65,8 @@ class Adapter:
         self.namespace = "hermes:" + hashlib.sha256(str(self.home).encode()).hexdigest()[:16] + ":"
         self.service = Service(self.settings, self.persist_service)
         self.gateway = None
+        # Filled by register(): which optional Hermes plugin APIs this version offers.
+        self.support = {"argument_mode": False, "completion": False}
         from .setup import Guide
         self.setup_guide = Guide()
 
@@ -57,7 +77,7 @@ class Adapter:
         previous = self.settings()
         if previous != config:
             self.ctx.set_config("service", config)
-        if config["connected"] and previous["base_url"] != config["base_url"]:
+        if config["connected"] and known_route(previous) != known_route(config):
             self.write_route(config)
 
     def settings(self):
@@ -69,32 +89,53 @@ class Adapter:
     def capture_command(self, *, command="", session_key=None, **kwargs):
         _command_context.set(session_key if command == "kvpark" else None)
 
-    def middleware(self, *, request, session_id="", base_url="", api_mode="", **kwargs):
-        config = self.settings()
-        if config["uninstalled"]:
-            return None
-        routes = {url.rstrip("/") + "/v1" for url in [config["base_url"], *config["previous_urls"]]}
-        if config["connected"]:
-            routes.add(target(config).url + "/v1")
-        if base_url.rstrip("/") not in routes or api_mode != "chat_completions":
-            return None
-        if config["autostart"]:
-            self.service.ensure()
-            config = self.settings()
-        destination = config["base_url"] + "/v1"
-        if base_url.rstrip("/") != destination:
-            # Hermes' request middleware changes payloads, not transports. For
-            # a bound native OpenAI client, update its documented base_url property
-            # before the pending dispatch, keeping model, history and sampling.
+    def rebind(self, session_id, base_url, destination):
+        # Hermes' request middleware changes payloads, not transports. For a
+        # bound native OpenAI client, update its documented base_url property
+        # before the pending dispatch, keeping model, history and sampling.
+        try:
             from agent.subagent_lifecycle import get_active_subagent_parent
             from openai import OpenAI
-            active = get_active_subagent_parent()
-            client = getattr(active, "client", None)
-            if (getattr(active, "session_id", None) != session_id or not isinstance(client, OpenAI)
-                    or str(client.base_url).rstrip("/") != base_url.rstrip("/")):
+        except ImportError:
+            return False
+        active = get_active_subagent_parent()
+        client = getattr(active, "client", None)
+        if (getattr(active, "session_id", None) != session_id or not isinstance(client, OpenAI)
+                or route_key(str(client.base_url)) != route_key(base_url)):
+            return False
+        client.base_url = destination
+        active.base_url = destination
+        return True
+
+    def middleware(self, *, request, session_id="", base_url="", api_mode="", **kwargs):
+        config = self.settings()
+        if config["uninstalled"] or api_mode != "chat_completions":
+            return None
+        routes = {route_key(url + "/v1") for url in [config["base_url"], *config["previous_urls"]]}
+        upstream = target(config).url + "/v1" if config["connected"] else None
+        if upstream:
+            routes.add(route_key(upstream))
+        if route_key(base_url) not in routes:
+            return None
+        if config["autostart"]:
+            try:
+                self.service.ensure()
+            except (OSError, ValueError, RuntimeError) as exc:
+                # Hermes keeps talking to the model server itself until the proxy
+                # is back; parking is unavailable meanwhile. A session already
+                # bound to the proxy is pointed back at the server.
+                self.service.error = str(exc)
+                if upstream and route_key(base_url) != route_key(upstream):
+                    self.rebind(session_id, base_url, upstream)
                 return None
-            client.base_url = destination
-            active.base_url = destination
+            config = self.settings()
+        elif not self.service.available(config):
+            if upstream and route_key(base_url) != route_key(upstream):
+                self.rebind(session_id, base_url, upstream)
+            return None
+        destination = config["base_url"] + "/v1"
+        if route_key(base_url) != route_key(destination) and not self.rebind(session_id, base_url, destination):
+            return None
         payload = dict(request)
         extra = dict(payload.get("extra_body") or {})
         # Replace any inherited archive tags rather than trusting a fork's copy.
@@ -121,23 +162,31 @@ class Adapter:
 
     def onboarding(self):
         config = self.settings()
-        lines = ["🅿️ kvpark setup", "Saved disk snapshots expire after 7 days by default; cleanup checks hourly.",
-                 "A 32 GiB budget also limits saved snapshots. Your transcript and live RAM state are kept.",
+        lines = ["🅿️ kvpark",
                  f"Proxy: {config['base_url']}/v1", f"Archive: {config['archive_dir']}",
                  "Starts with Hermes: " + ("on" if config["autostart"] else "off")]
+        if config["model"]:
+            lines.append("Configured model: " + config["model"])
         lines += [f"Backend: {config['backend']} · cache mode: {config['cache_mode']}"]
         if config["cache_mode"] == "routing":
-            lines.append("Disk resume is unavailable for this adapter; backend-managed caches remain independent.")
+            lines.append("Chat routing only. kvpark cannot save or resume disk snapshots with this backend connection. "
+                         "Repeating setup will not enable disk snapshots; backend-managed caches are independent.")
         if config["connected"]:
-            lines.append("Connected. Start a new Hermes conversation to use this model.")
+            route = known_route(config)
+            if route:
+                lines.append(f"Hermes route: {route['default']} at {route['base_url']}; kvpark inserts its proxy while it runs.")
+            lines.append("Connection configured. Use /kvpark doctor to check it; setup is only needed to change models.")
         else:
             lines.append("Run /kvpark setup to find a running model and choose it from a numbered list.")
-        lines += ["Commands:", "  save | status | forget [k-…] | slots",
+        lines += ["Commands:", "  status | doctor | start | setup | help",
                   "  update check | update | uninstall [confirm]",
                   "  retention 7 | budget 32 | cleanup on|off|now",
                   "  base-url http://127.0.0.1:8080 | autostart on|off",
-                  "Advanced setup and managed disk snapshots: docs/hermes.md",
-                  "Restore is automatic when you return to a compatible conversation."]
+                  "Advanced setup and managed disk snapshots: docs/hermes.md"]
+        if config["cache_mode"] == "native":
+            lines += ["  save | forget [k-…] | slots",
+                      "Saved disk snapshots expire after 7 days by default; cleanup checks hourly with a 32 GiB budget.",
+                      "Restore is automatic when you return to a compatible conversation."]
         if self.service.error:
             lines.append("Startup needs attention: " + self.service.error)
         return "\n".join(lines)
@@ -214,22 +263,22 @@ class Adapter:
         settings = self.settings()
         self.write_route(settings)
         self.ctx.set_config("service", {**settings, "connected": True})
-        return "Hermes now defaults to kvpark for new sessions. Restart Hermes and start a new conversation; existing sessions keep their saved route."
+        route = route_for(settings)
+        return (f"Hermes now uses {route['default']} at {route['base_url']} for new sessions. kvpark inserts its "
+                "proxy automatically while it is running, including sessions already on this server. "
+                "Sessions on other routes are unchanged.")
 
     def write_route(self, settings):
-        # Explicit command selects the default for FUTURE sessions through Hermes'
-        # normal config writer; live agents and prompt histories are not changed.
+        # Hermes keeps the model server as its route; kvpark is inserted per request
+        # by the middleware. Written through Hermes' normal config writer for FUTURE
+        # sessions; live agents and prompt histories are not changed.
         from .hermes_uninstall import save_route
-        model = "local" if settings["backend"] == "llama.cpp" and not settings["upstream_url"] else settings["model"]
-        if not model:
-            model = "local"  # legacy external llama.cpp proxy
-        save_route(settings, {"provider": "custom", "default": model,
-                             "base_url": settings["base_url"] + "/v1", "api_mode": "chat_completions"})
+        save_route(settings, route_for(settings))
 
     def handle(self, raw_args):
-        args = shlex.split(raw_args)
-        action = args[0] if args else "setup"
-        action = {"park": "save", "delete": "forget"}.get(action, action)
+        args = command_args(raw_args)
+        action = args[0] if args else "help" if self.settings()["connected"] else "setup"
+        action = {"park": "save", "delete": "forget", "--help": "help", "-h": "help"}.get(action, action)
         rest = args[1:]
         if action == "uninstall" and rest in ([], ["confirm"]):
             from .hermes_uninstall import run
@@ -240,7 +289,12 @@ class Adapter:
         if self.settings()["uninstalled"] and action not in {"setup", "onboarding", "help"}:
             raise RuntimeError("kvpark is disconnected. Restart Hermes; see docs/uninstall.md to reinstall.")
         if action == "update" and rest in ([], ["check"]):
-            from . import updates
+            from . import updates, __version__
+            from .hermes_doctor import install_source
+            source, detail = install_source()
+            if source != "pip":
+                return (f"kvpark {__version__} runs from {detail}, not an installed package. Update it with "
+                        "`hermes plugins update kvpark` (or git pull in a checkout), then restart Hermes.")
             config = self.settings()
             if rest:
                 result = updates.check(config["archive_dir"], url=config["base_url"] if config["external"] else None)
@@ -269,7 +323,8 @@ class Adapter:
                 return connect_model(model, self.settings(), hermes=True)
             result = self.setup_guide.handle(rest, owner=owner, current=self.settings(), apply=apply, extra=[hermes_hint()])
             if result.startswith("Connected to"):
-                result += "\nRestart Hermes and start a new conversation to use this model."
+                result += ("\nHermes uses this model for new sessions; kvpark inserts its proxy automatically while it runs. "
+                           "Restart Hermes and start a new conversation to switch an existing chat.")
             return result
         if action in {"onboarding", "help"}:
             return self.onboarding()
@@ -286,6 +341,9 @@ class Adapter:
             return "kvpark is running. " + json.dumps(self.call("doctor"))
         if action == "connect" and not rest:
             return self.connect()
+        if action == "doctor" and not rest:
+            from .hermes_doctor import report
+            return "\n".join(report(self)[0])
         if action in {"retention", "budget"} and len(rest) == 1:
             value = float(rest[0])
             field = "ttl_days" if action == "retention" else "max_gib"
@@ -295,6 +353,10 @@ class Adapter:
             result = self.call("cleanup", {}) if rest == ["now"] else self.call("settings", {"cleanup_enabled": rest == ["on"]})
             return "Cleanup: " + json.dumps(result) + ". Snapshot files only; live RAM and transcripts are unchanged."
         if action in {"save", "forget"} and len(rest) <= 1:
+            if action == "save" and not target(self.settings()).snapshots:
+                raise ValueError("Disk save/resume is unavailable for this backend connection. "
+                                 "kvpark can route chat requests, but cannot save this server's KV state. "
+                                 "Repeating setup will not enable it. Use /kvpark status to inspect the connection.")
             result = self.call(action, {"key": self.current_key(rest[0] if rest else None)})
             return (f"Parked {result['tokens']:,} tokens. " if action == "save" else "Deleted saved snapshot. ") + result["note"]
         if action in {"status", "slots"} and not rest:
@@ -309,15 +371,21 @@ class Adapter:
             for entry in status["entries"]:
                 lines.append(f"{entry['key']} — {entry['tokens']:,} tokens, {entry['gib']} GiB, {entry['age_days']} days old")
             return "\n".join(lines)
-        raise ValueError("Unknown command or arguments. Use /kvpark setup for available commands.")
+        raise ValueError("Unknown command or arguments. Use /kvpark help for commands, "
+                         "or /kvpark status to check your existing connection. "
+                         "To choose model 1 from the setup list, use /kvpark setup 1.")
 
     async def command(self, raw_args):
         try:
             result = await asyncio.to_thread(self.handle, raw_args)
-            if shlex.split(raw_args) == ["update"]:
-                from importlib.metadata import version
+            if command_args(raw_args) == ["update"]:
+                from importlib.metadata import PackageNotFoundError, version
                 from . import __version__
-                if version("kvpark") != __version__ and self.gateway is not None:
+                try:
+                    installed = version("kvpark")
+                except PackageNotFoundError:
+                    installed = __version__
+                if installed != __version__ and self.gateway is not None:
                     from gateway.restart import is_container_restart_context, is_gateway_supervisor_process
                     supervised = is_gateway_supervisor_process() or is_container_restart_context()
                     # Let the command response be sent before Hermes drains and
@@ -328,35 +396,50 @@ class Adapter:
             return result
         except (OSError, ValueError, RuntimeError) as exc:
             return "kvpark: " + str(exc)
+        except (ImportError, AttributeError) as exc:
+            from .hermes_doctor import TESTED, hermes_version
+            return (f"kvpark: {exc}. This Hermes ({hermes_version()}) differs from the {TESTED}.x series kvpark is "
+                    "tested with. Run `kvpark doctor --hermes` in a terminal and see docs/hermes.md.")
         finally:
             _command_context.set(None)
 
 
 def register(ctx):
     adapter = Adapter(ctx)
-    ctx.register_command("kvpark", adapter.command,
-                         description="Park model state, resume conversations, and manage saved caches",
-                         args_hint="setup | save | status | forget | cleanup | retention | base-url | update | uninstall", argument_mode="mixed")
+    command = dict(description="Park model state, resume conversations, and manage saved caches",
+                   args_hint="setup | save | status | doctor | forget | cleanup | retention | base-url | update | uninstall")
+    try:
+        ctx.register_command("kvpark", adapter.command, argument_mode="mixed", **command)
+        adapter.support["argument_mode"] = True
+    except TypeError:
+        # Hermes before 0.21.0 has no argument modes; the command works without suggestions.
+        ctx.register_command("kvpark", adapter.command, **command)
     # Hermes 0.21 exposes argument mode through register_command, but its CLI
     # completer and desktop catalog both read options from this shared registry.
-    from hermes_cli.commands import SUBCOMMANDS
-    options = ["setup", "save", "status", "forget", "slots", "start", "connect",
-               "retention", "budget", "cleanup", "autostart", "base-url", "update", "uninstall", "help"]
-    previous = SUBCOMMANDS.get("/kvpark")
-    SUBCOMMANDS["/kvpark"] = options
+    try:
+        from hermes_cli.commands import SUBCOMMANDS
+    except ImportError:
+        SUBCOMMANDS = None
+    if SUBCOMMANDS is not None:
+        options = ["setup", "save", "status", "doctor", "forget", "slots", "start", "connect",
+                   "retention", "budget", "cleanup", "autostart", "base-url", "update", "uninstall", "help"]
+        previous = SUBCOMMANDS.get("/kvpark")
+        SUBCOMMANDS["/kvpark"] = options
+        adapter.support["completion"] = True
 
-    def remove_completions():
-        if SUBCOMMANDS.get("/kvpark") is options:
-            if previous is None:
-                SUBCOMMANDS.pop("/kvpark", None)
-            else:
-                SUBCOMMANDS["/kvpark"] = previous
+        def remove_completions():
+            if SUBCOMMANDS.get("/kvpark") is options:
+                if previous is None:
+                    SUBCOMMANDS.pop("/kvpark", None)
+                else:
+                    SUBCOMMANDS["/kvpark"] = previous
 
-    ctx.on_unload(remove_completions)
+        ctx.on_unload(remove_completions)
     ctx.register_hook("pre_gateway_dispatch", adapter.capture_gateway)
     ctx.register_hook("pre_command", adapter.capture_command)
     ctx.register_middleware("llm_request", adapter.middleware)
     ctx.on_unload(adapter.service.closed.set)
     config = adapter.settings()
-    if config["autostart"] and (config["external"] or config["model"]):
+    # Installers and doctors load the plugin to verify it; they must not start services.
+    if config["autostart"] and (config["external"] or config["model"]) and not os.environ.get("KVPARK_NO_AUTOSTART"):
         adapter.service.start_async()

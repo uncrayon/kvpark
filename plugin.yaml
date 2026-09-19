@@ -1,0 +1,15 @@
+# Hermes plugin manifest. `hermes plugins install uncrayon/kvpark` clones this
+# repository into ~/.hermes/plugins/kvpark and loads the __init__.py next to it.
+name: kvpark
+version: 0.3.0a3
+description: Park model state, resume conversations, and manage saved caches
+author: Ulises Rayon
+kind: standalone
+# Manifest v1: Hermes 0.21.0's installer refuses newer manifest versions.
+license: MIT
+homepage: https://github.com/uncrayon/kvpark
+tags: [llama.cpp, kv-cache, local-models]
+# Hermes pins both already; listed so `hermes plugins show kvpark` is complete.
+python_dependencies:
+  - psutil>=5.9
+  - packaging>=23

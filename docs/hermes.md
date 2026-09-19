@@ -1,7 +1,9 @@
 # Hermes adapter and onboarding
 
-These instructions install alpha `0.3.0a2`, including portable startup, automatic
+These instructions install alpha `0.3.0a3`, including portable startup, automatic
 port selection, and release updates. See [backend setup](backends.md) for capabilities.
+kvpark is tested with Hermes 0.21.x; Hermes 0.20.1 or newer loads the plugin, and
+argument suggestions in the composer need 0.21.0.
 
 The adapter ships inside kvpark as a native Hermes plugin. It uses plugin
 discovery, request middleware, commands, and profile settings. It does not patch
@@ -11,8 +13,20 @@ Hermes source or replace its semantic memory provider.
 
 If you already installed sloth-memory, use the [rename migration](updates.md#migrate-from-sloth-memory) instead of enabling a second plugin.
 
-On macOS, Linux, or WSL, the installer finds Hermes' Python, installs kvpark
-there, verifies discovery, and enables the plugin:
+The simplest path is Hermes' own plugin installer, on any operating system:
+
+```bash
+hermes plugins install uncrayon/kvpark
+hermes plugins enable kvpark
+```
+
+Confirm the scanner's *caution* prompt (this repository also holds installer
+scripts and tests), restart Hermes, and type `/kvpark setup`. Updates use
+`hermes plugins update kvpark`. See [installation](install.md#hermes-users-install-as-a-plugin).
+
+Alternatively, on macOS, Linux, or WSL, the package installer finds Hermes' Python,
+installs kvpark there, enables the plugin, and loads it the way Hermes does to
+confirm it works:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/uncrayon/kvpark/main/install.sh | bash -s -- --hermes
@@ -22,6 +36,48 @@ Choose a discovered model in the installer, or type `/kvpark setup` in Hermes
 later. For a custom installation, pass
 `--hermes-python "/path/to/hermes/venv/bin/python"`. See [installer options](install.md).
 The manual alternatives below are useful for native Windows and troubleshooting.
+When both a package and a plugin directory are present, Hermes loads the package.
+
+### Check the installation
+
+From a terminal, with the Python that runs Hermes (the installed `kvpark`
+command uses it):
+
+```bash
+kvpark doctor --hermes
+```
+
+It loads plugins exactly as Hermes does, without starting services, and prints:
+
+```text
+Hermes 0.21.0 (kvpark is tested with 0.21.x; 0.20.1 or newer loads) · Python ~/.hermes/hermes-agent/venv/bin/python
+kvpark 0.3.0a3 from installed package
+Plugin: loaded (entrypoint); /kvpark registered; argument suggestions on
+Connection: backend ollama · model gemma:latest · upstream http://127.0.0.1:11434 · cache mode routing
+Hermes route: http://127.0.0.1:11434/v1 — the model server itself; kvpark inserts its proxy per request while it runs.
+Connection check: OK — Routing only: this adapter cannot park or restore disk snapshots. Backend-managed caches are independent.
+```
+
+A plugin that Hermes cannot load, is not enabled, or cannot find is reported on
+the `Plugin:` line with the fix, and the command exits with status 1. Inside
+Hermes, `/kvpark doctor` prints the same report for the running plugin.
+
+### Commands rejected in the desktop composer
+
+Before `0.3.0a3`, nonbreaking spaces from rich-text input could make valid commands
+such as `status` and `uninstall` return "Unknown command or arguments." This was
+a command-parsing problem, independent of the model backend. `0.3.0a3` accepts
+these separators while preserving whitespace inside quoted model IDs.
+
+To check removal outside the composer, open an operating-system terminal and run:
+
+```bash
+~/.local/bin/kvpark uninstall --hermes
+```
+
+This only previews changes for the selected Hermes profile. It does not uninstall
+anything. The installer creates this command in Hermes' own Python environment.
+If you chose a custom command directory, use that printed command path instead.
 
 <details>
 <summary>Manual installation and troubleshooting (advanced)</summary>
@@ -38,14 +94,15 @@ do not require activating or leaving your current virtual environment:
 ```bash
 HERMES_PY="$HOME/.hermes/hermes-agent/venv/bin/python"
 "$HERMES_PY" -c "import sys, hermes_cli; print('Hermes Python:', sys.executable)"
-"$HERMES_PY" -m pip install --upgrade https://github.com/uncrayon/kvpark/releases/download/v0.3.0a2/kvpark-0.3.0a2-py3-none-any.whl
+"$HERMES_PY" -m pip install --upgrade https://github.com/uncrayon/kvpark/releases/download/v0.3.0a3/kvpark-0.3.0a3-py3-none-any.whl
 "$HERMES_PY" -c "from importlib.metadata import distribution; d = distribution('kvpark'); print('kvpark', d.version); print([(e.name, e.value) for e in d.entry_points if e.group == 'hermes_agent.plugins'])"
 "$HERMES_PY" -m hermes_cli.main plugins enable kvpark
-"$HERMES_PY" -m hermes_cli.main plugins list --plain --no-bundled
+"$HERMES_PY" -m kvpark doctor --hermes
 ```
 
-The discovery check should print `kvpark 0.3.0a2` and
-`[('kvpark', 'kvpark.hermes')]`. If the first command fails because the interpreter
+The discovery check should print `kvpark 0.3.0a3` and
+`[('kvpark', 'kvpark.hermes')]`, and the doctor should report `Plugin: loaded`.
+If the first command fails because the interpreter
 does not exist, stop and locate your actual Hermes installation before continuing.
 For a custom installation, change `HERMES_PY` to that installation's Python.
 `command -v hermes` locates the launcher, which may be a wrapper pointing to a
@@ -53,7 +110,7 @@ different interpreter. A separately configured gateway must use the environment
 where you install the plugin too. Keep the same Hermes profile selected throughout.
 
 If Hermes' environment has no pip module, use
-`uv pip install --python "$HERMES_PY" https://github.com/uncrayon/kvpark/releases/download/v0.3.0a2/kvpark-0.3.0a2-py3-none-any.whl`
+`uv pip install --python "$HERMES_PY" https://github.com/uncrayon/kvpark/releases/download/v0.3.0a3/kvpark-0.3.0a3-py3-none-any.whl`
 for the installation step, then continue with the discovery and enable commands.
 
 ### Install from a checkout or on Windows
@@ -62,22 +119,25 @@ With **Hermes' own virtual environment** activated, use:
 
 ```bash
 # With your Hermes virtual environment activated:
-git clone --branch v0.3.0a2 https://github.com/uncrayon/kvpark.git
+git clone --branch v0.3.0a3 https://github.com/uncrayon/kvpark.git
 cd kvpark
 python -m pip install --upgrade .
 hermes plugins enable kvpark
+python -m kvpark doctor --hermes
 ```
 
 If Hermes asks whether the plugin may replace built-in tools, answer **No**.
 kvpark registers commands and middleware; it needs no tool overrides.
-Use `hermes plugins list --plain --no-bundled` to check that it is enabled.
+Use `hermes plugins list --plain --no-bundled` to check that it is enabled and
+the doctor to check that Hermes loads it.
 
 Existing kvpark installations can use `/kvpark update`; sloth-memory installations
 need the [one-time rename migration](updates.md#migrate-from-sloth-memory), because
 the old updater cannot replace a differently named package. Run `kvpark --version` in
-Hermes' environment to confirm `0.3.0a2`. Restart Hermes after installation to
+Hermes' environment to confirm `0.3.0a3`. Restart Hermes after installation to
 load the entry point. The adapter is tested against Hermes
-0.21.0, upstream commit `9dd6634c5635321cf38840cc30e9b51226689128`.
+0.21.0, upstream commit `9dd6634c5635321cf38840cc30e9b51226689128`; Hermes
+0.20.1 or newer exposes the plugin APIs kvpark uses.
 Use Python 3.11–3.13 for Hermes; the standalone service also supports 3.10/3.14.
 
 On Windows, activate Hermes' environment using its `Scripts\Activate.ps1`, or
@@ -109,6 +169,16 @@ installation above, then verify its entry point and enable the plugin with that
 same interpreter. Reinstalling the model server or restarting the gateway alone
 will not fix a missing package in Hermes' environment.
 
+### `/kvpark` is unknown, or its options never appear
+
+`hermes plugins enable` only edits configuration; Hermes loads plugins when it
+starts, and a plugin whose `register()` fails is skipped with a warning in the
+Hermes log. Run `kvpark doctor --hermes` with Hermes' Python: it performs that load
+and prints the failure. Common causes are a Hermes older than 0.20.1, a Hermes
+plugin API change (update kvpark), or a kvpark older than `0.3.0a2`, which
+registered no argument suggestions. In the TUI and desktop app, the command
+catalog is read once at startup, so restart them after enabling the plugin.
+
 For managed disk snapshots, build the [compatible runtime](compatibility.md)
 and obtain your own GGUF model before setup:
 
@@ -138,7 +208,9 @@ snapshots; rebooting does not reset their age.
 A gateway restart reuses an existing compatible proxy so it does not interrupt
 shared inference. It does not automatically replace that proxy's Python code.
 Use `/kvpark update check` to see all three versions and `/kvpark update` for the
-coordinated release update. See [updates and recovery](updates.md).
+coordinated release update. See [updates and recovery](updates.md). A plugin
+installed with `hermes plugins install` is updated with `hermes plugins update kvpark`
+and a Hermes restart; `/kvpark update` says so instead of downloading a package.
 
 ## Guided setup
 
@@ -168,6 +240,13 @@ Then confirm with `/kvpark setup yes`, or cancel with `/kvpark setup 0`.
 After a successful connection, restart Hermes and start a new conversation.
 The exact model ID is carried through automatically. Existing conversations
 retain their saved route.
+
+Setup points Hermes at the chosen model server, not at kvpark's proxy. While the
+proxy is running, the plugin inserts it into each request; when it is not, or
+when Hermes cannot load the plugin, requests continue to the server directly and
+parking is simply unavailable. Installations configured with `0.3.0a2` or older
+pointed Hermes at the proxy itself; `/kvpark doctor` flags that route as legacy,
+and `/kvpark connect` switches to the server route.
 
 If nothing appears, open your model app and load a model, then run
 `/kvpark setup scan`. For a server on another computer, paste its address after
@@ -227,12 +306,14 @@ configure the included patched runtime with the advanced command below:
 /kvpark status
 ```
 
-Complete setup starts services and saves the selected proxy `/v1` URL through
-Hermes' config writer for **new sessions**. Managed llama.cpp uses the model alias
-`local`; an existing backend uses the exact model ID you configure. `start` and
-`connect` remain available to retry startup or explicitly select the route.
-Restart Hermes and start a new conversation for the initial test. Existing
-sessions using the configured upstream or a previously selected proxy can be
+Complete setup starts services and saves the model server's `/v1` URL through
+Hermes' config writer for **new sessions**: `http://127.0.0.1:8090/v1` with the
+alias `local` for managed llama.cpp, or the existing backend's own address and the
+exact model ID you configure. The plugin's request middleware inserts the proxy
+while it is healthy; otherwise requests continue to the server directly. `start`
+and `connect` remain available to retry startup or explicitly select the route.
+Restart Hermes and start a new conversation for the initial test. Sessions
+already using the configured server, or a previously selected proxy address, are
 redirected by the native OpenAI client middleware; unrelated routes are unchanged.
 
 ### Try an existing llama.cpp server on your Mac
@@ -479,6 +560,12 @@ The compatibility surface includes
 session/persistence fields, and native plugin APIs. If Hermes changes that
 surface, parking fails closed. CI exercises actual discovery, middleware, settings,
 and commands against the pinned upstream version; no transport patch is required.
+
+Optional plugin APIs are detected when the plugin loads: argument suggestions use
+`register_command(..., argument_mode=...)` and the shared completion registry from
+Hermes 0.21.0, and the command still registers without them. A missing Hermes
+internal surfaces as a `/kvpark` reply naming the Hermes version rather than a
+silent load failure; `kvpark doctor --hermes` reports the same.
 
 All archive inference must pass through the proxy. Background calls and compaction
 can displace or change a prefix; park before leaving an important conversation.

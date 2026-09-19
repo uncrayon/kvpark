@@ -1,4 +1,30 @@
-# One-command installation
+# Installation
+
+## Hermes users: install as a plugin
+
+Hermes can install kvpark itself, on every operating system Hermes runs on:
+
+```bash
+hermes plugins install uncrayon/kvpark
+hermes plugins enable kvpark
+```
+
+Hermes clones this repository into `~/.hermes/plugins/kvpark` and loads the
+`__init__.py` at its root. Its plugin scanner reports a *caution* verdict because
+the repository also contains installer scripts, tests, and documentation with
+`curl | bash` examples; confirm the prompt, or pass `--force --no-enable` for a
+scripted install and enable afterwards. kvpark needs only `psutil` and
+`packaging`, which Hermes already pins. Restart Hermes and type `/kvpark setup`.
+
+Update with `hermes plugins update kvpark` and a Hermes restart; remove with
+`hermes plugins remove kvpark` after [disconnecting](uninstall.md). If a kvpark
+package is also installed in Hermes' Python, Hermes loads that package instead of
+the directory; `kvpark doctor --hermes` shows which one loaded.
+
+kvpark is tested with Hermes 0.21.x. Hermes 0.20.1 or newer loads the plugin;
+argument suggestions in the composer need 0.21.0.
+
+## One-command installer
 
 On macOS, Linux, or WSL:
 
@@ -12,11 +38,14 @@ checksum before installing. You do not need Git, pip, or a Python virtual
 environment for the package installation.
 
 If Hermes is present, the installer selects its Python environment, verifies the
-plugin entry point, and enables kvpark without granting tool overrides. It honors
-`HERMES_HOME` and `HERMES_INSTALL_DIR`. After installation, a model chooser opens
-in the same terminal, even with `curl | bash`. Choose a number, then confirm with
-`yes`. Choose `0` to finish later. Restart Hermes and start a new conversation
-after connecting. You can reopen the chooser with `/kvpark setup` in Hermes.
+plugin entry point, enables kvpark without granting tool overrides, and then loads
+the plugin exactly as Hermes does. That load check prints a short report; when
+Hermes cannot load kvpark, the installer stops with the reason instead of leaving
+an enabled plugin that Hermes silently skips. It honors `HERMES_HOME` and
+`HERMES_INSTALL_DIR`. After installation, a model chooser opens in the same
+terminal, even with `curl | bash`. Choose a number, then confirm with `yes`.
+Choose `0` to finish later. Restart Hermes and start a new conversation after
+connecting. You can reopen the chooser with `/kvpark setup` in Hermes.
 
 Without Hermes, it creates a private environment. The installer prints an
 absolute command that works immediately; `kvpark` is available by name in a new
@@ -50,7 +79,7 @@ curl -fsSL https://raw.githubusercontent.com/uncrayon/kvpark/main/install.sh | b
 | `--no-path` | Leave shell startup files unchanged; use the printed absolute command |
 | `--install-dir PATH` | Choose the private environment and optional runtime location |
 | `--bin-dir PATH` | Choose where to put the `kvpark` command |
-| `--version 0.3.0a2` | Select an exact published release (currently the default) |
+| `--version 0.3.0a3` | Select an exact published release (currently the default) |
 | `--package PATH` | Install a local wheel or checkout for development |
 
 Run `bash install.sh --help` from a checkout to see the same options. From a local
@@ -101,7 +130,8 @@ No system packages are replaced and no sudo command is executed.
 Before removing anything, [disconnect services and restore your agent's backend](uninstall.md).
 For a standalone installer environment, remove its `venv` directory after stopping
 its services. For Hermes, uninstall the package from Hermes' own interpreter as
-described in that guide. Remove the installer-created command and its PATH entry
+described in that guide, or run `hermes plugins remove kvpark` for a plugin-directory
+installation. Remove the installer-created command and its PATH entry
 if no longer needed. Standalone setup writes a connection record under the data
 directory and keeps each selected connection in its own `connections` subdirectory.
 `kvpark uninstall --confirm` clears the selected connection after stopping its
@@ -113,7 +143,16 @@ removing Python does not remove model weights or saved archives.
 - **Hermes not found:** pass `--hermes-python` with the Python inside the
   environment that runs Hermes. Activating kvpark's standalone environment does
   not make Hermes discover its plugin. Multiple Hermes environments require an
-  explicit selection.
+  explicit selection. Or skip the installer: `hermes plugins install uncrayon/kvpark`.
+- **Hermes did not load kvpark:** the installer's load check failed and printed
+  the reason, typically a Hermes older than 0.20.1, a Hermes plugin API change,
+  or a broken environment. Update Hermes or kvpark, then rerun the installer or
+  `kvpark doctor --hermes`.
+- **`/kvpark` is unknown inside Hermes:** run `kvpark doctor --hermes` with the
+  Python that runs Hermes (the installed `kvpark` command does). It reports where
+  kvpark loads from, whether the plugin is enabled and loadable, the Hermes profile's
+  route, and whether the proxy answers. `hermes plugins enable` alone never loads
+  a plugin, so it cannot detect these problems.
 - **Download failed:** check your connection or proxy, then rerun the same
   command. The installer reports the failed URL; it does not bypass TLS checks.
 - **Command not found:** use the absolute command printed at completion, or open

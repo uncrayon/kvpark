@@ -81,6 +81,9 @@ def main():
             cmd.add_argument("--ttl-days", type=float)
             cmd.add_argument("--max-gib", type=float)
             cmd.add_argument("--cleanup", action=argparse.BooleanOptionalAction, default=None)
+        if name == "doctor":
+            cmd.add_argument("--hermes", action="store_true",
+                             help="check how Hermes loads the plugin in this Python environment; starts nothing")
     args = parser.parse_args()
     if args.command == "park":
         args.command = "save"
@@ -137,6 +140,12 @@ def main():
             archive = directory(args.archive_dir)
             result = updates.check(archive) if args.action == "check" else updates.apply(archive)
             print(json.dumps(result, indent=2))
+        elif args.command == "doctor" and args.hermes:
+            from .hermes_doctor import report
+            lines, ok = report()
+            print("\n".join(lines))
+            if not ok:
+                raise SystemExit(1)
         elif args.command == "serve":
             if not 1 <= args.port <= 65535 or not 1 <= args.upstream_port <= 65535:
                 parser.error("ports must be between 1 and 65535")

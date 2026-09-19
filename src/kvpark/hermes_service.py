@@ -70,6 +70,17 @@ def target(config):
     return Backend(config["backend"], url, config["cache_mode"])
 
 
+def route_for(config):
+    """The Hermes model route for a connection: the model server itself, never the proxy.
+
+    kvpark inserts its proxy per request while the proxy is healthy, so Hermes keeps
+    working against the server when the plugin or the proxy is unavailable.
+    """
+    managed = config["backend"] == "llama.cpp" and not config["upstream_url"]
+    model = "local" if managed else config["model"] or "local"
+    return {"provider": "custom", "default": model, "base_url": target(config).url + "/v1", "api_mode": "chat_completions"}
+
+
 class Service:
     def __init__(self, settings, persist=None):
         self.settings = settings
@@ -111,6 +122,13 @@ class Service:
             return None
         caps = status.get("capabilities", {"backend": "llama.cpp", "cache_mode": "native"})
         return status if (caps.get("backend"), caps.get("cache_mode")) == (config["backend"], config["cache_mode"]) else None
+
+    def available(self, config=None):
+        """Whether a compatible proxy answers at the configured address, without starting anything."""
+        try:
+            return self._existing(validate_service(config or self.settings())) is not None
+        except (OSError, ValueError, RuntimeError):
+            return False
 
     def _remember(self, config):
         previous = self.settings()["base_url"]
@@ -232,9 +250,13 @@ class Service:
     def _spawn(argv, log):
         if log.exists() and log.stat().st_size > 1024**2:
             log.replace(log.with_suffix(".previous.log"))
+        # A Hermes plugin directory or source checkout is not on the child's default path.
+        env = dict(os.environ)
+        package_root = str(Path(__file__).resolve().parent.parent)
+        env["PYTHONPATH"] = os.pathsep.join(filter(None, [package_root, env.get("PYTHONPATH")]))
         with log.open("ab") as output:
             process = subprocess.Popen([sys.executable, "-m", "kvpark", *argv], stdin=subprocess.DEVNULL,
-                stdout=output, stderr=subprocess.STDOUT, **detached_options())
+                stdout=output, stderr=subprocess.STDOUT, env=env, **detached_options())
         threading.Thread(target=process.wait, name="kvpark-reaper", daemon=True).start()
         return process
 
