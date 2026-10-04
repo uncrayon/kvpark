@@ -73,6 +73,8 @@ def main():
     backend.add_argument("--archive-dir")
     backend.add_argument("--port", type=int, default=8090)
     backend.add_argument("server_args", nargs=argparse.REMAINDER, help="extra llama-server arguments after --")
+    from .bridge.cli import add_parser as add_bridge_parser
+    add_bridge_parser(sub)
     for name in ("status", "save", "forget", "doctor", "settings", "cleanup"):
         cmd = sub.add_parser(name, aliases=["park"] if name == "save" else [], help={"status": "show archives and measured reuse", "save": "park the resident conversation", "forget": "delete a saved archive", "doctor": "check runtime, backend, and topology", "settings": "view or update saved cleanup preferences", "cleanup": "delete expired archives now"}[name])
         cmd.add_argument("--url", default=os.environ.get("KVPARK_URL"))
@@ -95,7 +97,7 @@ def main():
         configured = None
         explicit_backend = args.command == "serve" and (args.backend or args.upstream_url)
         hermes_uninstall = args.command == "uninstall" and args.hermes
-        if args.command not in {"setup", "migrate", "backend"} and not args.archive_dir and not explicit_backend and not hermes_uninstall:
+        if args.command not in {"setup", "migrate", "backend", "bridge"} and not args.archive_dir and not explicit_backend and not hermes_uninstall:
             from .setup import saved_settings
             configured = saved_settings()
             if configured:
@@ -170,6 +172,9 @@ def main():
             archive = directory(args.archive_dir)
             result = updates.check(archive) if args.action == "check" else updates.apply(archive)
             print(json.dumps(result, indent=2))
+        elif args.command == "bridge":
+            from .bridge.cli import run as run_bridge
+            run_bridge(args)
         elif args.command == "doctor" and args.hermes:
             from .hermes_doctor import report
             lines, ok = report()

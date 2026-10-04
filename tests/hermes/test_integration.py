@@ -453,6 +453,104 @@ class HermesIntegrationTests(unittest.TestCase):
         result = apply_llm_request_middleware(original, session_id="session-a", base_url="https://example.com/v1", api_mode="chat_completions")
         self.assertEqual(result.payload, original)
 
+    def test_bridge_switch_is_staged_by_command_and_run_by_middleware(self):
+        from hermes_cli.middleware import apply_llm_request_middleware
+        from gateway.session_context import set_session_vars, clear_session_vars
+        import struct
+        from kvpark.bridge import registry
+        gguf = self.home / "model.gguf"
+        # a tensorless GGUF v3 header: the bridge reads general.architecture at registration
+        key, arch = b"general.architecture", b"qwen3"
+        gguf.write_bytes(b"GGUF" + struct.pack("<IQQ", 3, 0, 1) + struct.pack("<Q", len(key)) + key
+                         + struct.pack("<IQ", 8, len(arch)) + arch)
+        slots = self.home / "slots"
+        slots.mkdir()
+        config_path = self.home / "bridge" / "bridge.json"
+        config = registry.empty()
+        registry.add_model(config, "qwen38", url="http://127.0.0.1:18090", gguf=gguf, slot_dir=slots)
+        registry.add_model(config, "muse", url="http://127.0.0.1:18083", gguf=gguf, slot_dir=slots)
+        registry.save(config, config_path)
+        env = patch.dict(os.environ, {"KVPARK_BRIDGE_CONFIG": str(config_path)})
+        env.start()
+        self.addCleanup(env.stop)
+        tokens = set_session_vars(session_id="session-b", session_key="discord:thread-b")
+        self.addCleanup(clear_session_vars, tokens)
+        self.assertIn("No bridge switch", self.command_text("switch status"))
+        self.assertIn("name the model you are leaving", self.command_text("switch muse"))
+        self.assertIn("unknown bridge model", self.command_text("switch nope from qwen38"))
+        # staging also prewarms the engine for the pair, in the background
+        with patch("kvpark.bridge.stage.prewarm") as prewarm:
+            self.assertIn("Ready", self.command_text("switch muse from qwen38"))
+        self.assertEqual(prewarm.call_args[0][1:], ("qwen38", "muse", config_path.parent))
+        conversation = {"model": "muse", "messages": [{"role": "system", "content": "s"},
+                                                      {"role": "user", "content": "hello"}]}
+        calls = []
+
+        def fake_switch(config, conversation, source, target, **kwargs):
+            calls.append((conversation, source, target, kwargs))
+            return {"restored_tokens": 10, "target_prompt_tokens": 12, "engine_mode": "daemon",
+                    "engine": {"t0": 10, "backend": "torch", "engine_mode": "daemon"},
+                    "timings": {"total_s": 1.5, "engine_s": 0.45}}
+
+        with patch("kvpark.bridge.switch.switch", fake_switch):
+            # a request to another server leaves the stage in place
+            apply_llm_request_middleware(conversation, session_id="session-b", base_url="http://127.0.0.1:9/v1",
+                                         api_mode="chat_completions")
+            self.assertEqual(calls, [])
+            result = apply_llm_request_middleware(conversation, session_id="session-b",
+                                                  base_url="http://127.0.0.1:18083/v1", api_mode="chat_completions")
+            self.assertEqual(result.payload, conversation)      # the request itself is unchanged
+            # consumed: a second request does not switch again
+            apply_llm_request_middleware(conversation, session_id="session-b",
+                                         base_url="http://127.0.0.1:18083/v1", api_mode="chat_completions")
+        self.assertEqual(len(calls), 1)
+        moved, source, target, kwargs = calls[0]
+        self.assertEqual((source, target, kwargs["warm"], kwargs["template_options"]), ("qwen38", "muse", False, {}))
+        self.assertEqual(moved["messages"][1], {"role": "user", "content": "hello"})
+        self.assertIn("restored 10 of 12 prompt tokens in 1.5 s (engine: daemon on the GPU, 0.45 s)",
+                      self.command_text("switch status"))
+        # what Hermes sends for a custom provider (agent.reasoning_effort at the top level, the provider's
+        # extra_body chat_template_kwargs) reaches the switch as the request's template options; the engine
+        # renders the target with them
+        self.command_text("switch muse from qwen38")
+        hermes_request = {**conversation, "reasoning_effort": "medium",
+                          "extra_body": {"chat_template_kwargs": {"preserve_reasoning": True}}}
+
+        def options_switch(config, conversation, source, target, **kwargs):
+            calls.append((conversation, source, target, kwargs))
+            return {"restored_tokens": 10, "target_prompt_tokens": 12, "timings": {"total_s": 1.5},
+                    "template_options": {"options": sorted(kwargs["template_options"]), "shared_tokens": 3,
+                                         "engine": True}}
+        with patch("kvpark.bridge.switch.switch", options_switch):
+            apply_llm_request_middleware(hermes_request, session_id="session-b",
+                                         base_url="http://127.0.0.1:18083/v1", api_mode="chat_completions")
+        self.assertEqual(calls[-1][3]["template_options"], {"reasoning_effort": "medium",
+                                                            "chat_template_kwargs": {"preserve_reasoning": True}})
+        self.assertIn("rendered with the request's chat_template_kwargs, reasoning_effort",
+                      self.command_text("switch status"))
+        # a skipped switch (e.g. images for a target without vision) is reported with its reason
+        self.command_text("switch muse from qwen38")
+        image = {"model": "muse", "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]}]}
+        skipped = {"skipped": "target-no-vision", "note": "the conversation has vision input and muse's server has no "
+                   "vision encoder (mmproj); the target prefills the conversation natively", "timings": {"total_s": 0.1}}
+        with patch("kvpark.bridge.switch.switch", return_value=skipped) as run:
+            result = apply_llm_request_middleware(image, session_id="session-b",
+                                                  base_url="http://127.0.0.1:18083/v1", api_mode="chat_completions")
+        self.assertEqual(result.payload, image)
+        # the image reaches the bridge as a placeholder, without its bytes
+        self.assertEqual(run.call_args[0][1]["messages"][0]["content"][1], {"type": "media", "modality": "vision"})
+        status = self.command_text("switch status")
+        self.assertIn("skipped (target-no-vision)", status)
+        self.assertIn("no vision encoder", status)
+        # a failing switch never blocks the request
+        self.command_text("switch muse from qwen38")
+        with patch("kvpark.bridge.switch.switch", side_effect=RuntimeError("engine exploded")):
+            result = apply_llm_request_middleware(conversation, session_id="session-b",
+                                                  base_url="http://127.0.0.1:18083/v1", api_mode="chat_completions")
+        self.assertEqual(result.payload, conversation)
+        self.assertIn("engine exploded", self.command_text("switch status"))
+
     def test_unknown_active_context_is_unverified(self):
         from hermes_cli.middleware import apply_llm_request_middleware
         result = apply_llm_request_middleware({"messages": []}, session_id="unknown", base_url=self.url + "/v1", api_mode="chat_completions")

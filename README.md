@@ -10,6 +10,22 @@ it when you return, using the managed patched llama.cpp runtime.
 Built for people running open-weight models on their own hardware.
 MIT licensed. No cloud service or account. The portable runtime uses psutil.
 
+## Experimental: switch a conversation between models
+
+`kvpark bridge` translates a conversation's cache from one local model to another through a
+shared latent, so the new model continues without re-reading the conversation. In live tests
+on a 128 GB Ryzen AI Max+ 395, with the translation engine resident on the integrated GPU
+(0.5–3.7 s per translation), conversations of 11–14K tokens moved between Qwen3.8-27B (the
+production DFlash2 build), Muse-Glimmer-30B and Qwen3-4B in 8–18 s instead of 15–86 s of
+native prefill, every target reusing exactly the translated tokens. Draft models (DFlash2,
+MTP) keep drafting after a switch, an image in the conversation is read natively by a vision
+target, and Hermes' reasoning settings are rendered as the server renders them. A hybrid
+target such as Qwen3.8 can start its recurrent state from a per-model mean, which removes most
+of the reset's cost on chats. Quality is close to native for chat and noticeably lower for long
+documents and tool-heavy agent work. More cache families (DeepSeek-style MLA and DSA, Kimi's
+KDA hybrids, Mamba-style hybrids, DeepSeek V4 as a target) are supported but verified on small
+test models only. See [docs/bridge.md](docs/bridge.md).
+
 ## Server support
 
 **Disk save/resume currently requires the managed patched llama.cpp runtime with one slot.**
@@ -333,6 +349,15 @@ interpreting timing results.
   budget, and atomic replacement temporarily needs space for both generations.
 - Treat archive files as sensitive and trusted local data. They contain model
   state and prompt tokens. See [security](SECURITY.md).
+
+## Cross-model research
+
+The [offline Qwen → Muse prototype](experiments/linear_transfer/README.md)
+collects attention values, fits affine maps, and evaluates them on held-out
+documents. [experiments/universal_kv](experiments/universal_kv/README.md)
+generalizes it to one shared latent for many models; it is the engine behind
+`kvpark bridge` and runs as a separate Python, outside the installed package.
+Native archives retain their model identity checks.
 
 ## Contribute
 

@@ -1,0 +1,2567 @@
+{
+  "meta": {
+    "title": "Top-20 open-weights models by Artificial Analysis Intelligence Index - architecture survey for a KV-cache translator",
+    "retrieved": "2026-10-02",
+    "ranking_source": "https://artificialanalysis.ai/leaderboards/models?open_weights=open_source",
+    "ranking_method": "AA leaderboard page payload (Next.js RSC models array), isOpenWeights=true and deprecated=false; reasoning-effort variants of the same weights collapsed to their best score. Index version: v4.3 (AutomationBench-AA added, tau3-Banking removed, Terminal-Bench 4.0). Latest release date in the AA payload: 2026-09-30.",
+    "kv_convention": "bf16 (2 bytes). GQA: n_kv x (d_k + d_v) x 2B per KV-bearing layer. MLA: (kv_lora_rank + qk_rope_head_dim) x 2B per layer. SWA layers are bounded (fixed_swa_bytes_bf16) and excluded from per-token growth. Indexer keys (DSA/MSA/QSA/CSA) reported separately. Recurrent states (GDN/KDA) reported as fixed per-sequence bytes; *_fp32_state uses fp32 for the matrix state (common in kernels; Qwen configs set mamba_ssm_dtype=float32).",
+    "excluded_deprecated_open_weights_above_cutoff": [
+      {
+        "name": "DeepSeek V4 Flash 0731 (Max)",
+        "score": 34.33,
+        "note": "deepseek_v4 arch, 43 layers, 284B/13B (same family as V4 Pro)"
+      },
+      {
+        "name": "GLM-5.2 (Max)",
+        "score": 33.71,
+        "note": "same glm_moe_dsa shapes as GLM-5.3"
+      },
+      {
+        "name": "DeepSeek V4 Pro 0424 (Max)",
+        "score": 30.45,
+        "note": "same weights family as V4 Pro 0813"
+      },
+      {
+        "name": "GLM-5 (Reasoning)",
+        "score": 27.91,
+        "note": "glm_moe_dsa, no IndexShare"
+      },
+      {
+        "name": "Kimi K2.6 (Reasoning)",
+        "score": 26.98,
+        "note": "DeepSeek-V3 MLA, same as K2.7 Code"
+      },
+      {
+        "name": "GLM-5.1 (Reasoning)",
+        "score": 26.06,
+        "note": "glm_moe_dsa"
+      },
+      {
+        "name": "MiMo-V2.5-Pro (Reasoning)",
+        "score": 25.99,
+        "note": "MiMo family"
+      },
+      {
+        "name": "MiMo-V2.5",
+        "score": 25.17,
+        "note": "MiMo family"
+      }
+    ],
+    "next_after_cutoff": [
+      {
+        "rank": 21,
+        "name": "Ling-3.0-flash-VL (InclusionAI)",
+        "score": 24.57,
+        "arch": "KDA + gated MLA 5:1 hybrid, 124B/5.5B, llama.cpp bailingmoe3"
+      },
+      {
+        "rank": 22,
+        "name": "Nemotron 3 Ultra 550B A55B (NVIDIA)",
+        "score": 22.93,
+        "arch": "Mamba-2 + attention (2 kv heads) + LatentMoE, 108 blocks, llama.cpp nemotron_h"
+      }
+    ],
+    "translator_family_legend": {
+      "F1_full_gqa": "per-token GQA K/V in every layer with RoPE",
+      "F2_swa_global_gqa": "sliding-window layers (bounded) + global per-token layers",
+      "F3_mla_latent": "MLA-style per-token latent (kv_lora_rank + rope dims) shared by heads",
+      "F4_compressed_latent": "DeepSeek V4 family: 128-token window + learned pooled (compressed) latent entries, no per-token global KV",
+      "F5_linear_hybrid": "recurrent/linear-attention layers (Gated DeltaNet or KDA) with fixed state + per-token cache in ~1/4 of layers",
+      "nope": "cached keys carry no rotary phase (NoPE / learned relative bias)"
+    },
+    "tokenizer_groups": {
+      "T_QWEN3_151K": [
+        "MiMo-V2.6-Pro",
+        "MiMo-V2.6-Flash"
+      ],
+      "T_GLM5_155K": [
+        "GLM-5.3",
+        "GLM-5.3-Flash"
+      ],
+      "T_KIMI_164K": [
+        "Kimi K3",
+        "Kimi K2.7 Code"
+      ],
+      "T_QWEN35_248K": [
+        "Qwen3.8-2.4T-A95B",
+        "Qwen3.8-Flash-Next",
+        "Qwen3.8-27B",
+        "Nex-N2-Pro (Qwen3.5-397B-A17B fine-tune)"
+      ],
+      "T_DEEPSEEK_128K": [
+        "DeepSeek V4.1 Flash",
+        "DeepSeek V4 Pro 0813"
+      ],
+      "T_MOTIF_220K": [
+        "Motif 3"
+      ],
+      "T_K2H_250K": [
+        "K2 Horizon 375B A23B",
+        "K2 Horizon MoVA 36B A4B"
+      ],
+      "T_MINIMAX_200K": [
+        "MiniMax-M3"
+      ],
+      "T_O200K": [
+        "Inkling Small",
+        "Inkling"
+      ],
+      "T_HY_120K": [
+        "Hy3"
+      ],
+      "T_SOLAR_197K": [
+        "Solar Open2 250B"
+      ]
+    },
+    "tokenizer_comparison": {
+      "method": "full vocab+merges comparison of tokenizer.json (byte-level BPE decoded to raw bytes) and tiktoken.model; added/special tokens compared separately",
+      "pairwise_overlap_between_groups": {
+        "Qwen3.5/3.8 (248k) | MiMo=Qwen2/3 (151k)": [
+          131586,
+          86.8,
+          281
+        ],
+        "Qwen3.5/3.8 (248k) | GLM-5 (155k)": [
+          143038,
+          92.4,
+          281
+        ],
+        "Qwen3.5/3.8 (248k) | DeepSeek (128k)": [
+          108771,
+          85.0,
+          8
+        ],
+        "Qwen3.5/3.8 (248k) | Kimi tiktoken (164k)": [
+          121754,
+          74.4,
+          261
+        ],
+        "Qwen3.5/3.8 (248k) | Motif-3 (220k)": [
+          101663,
+          46.2,
+          1
+        ],
+        "Qwen3.5/3.8 (248k) | K2-Horizon (250k)": [
+          128881,
+          52.0,
+          7
+        ],
+        "Qwen3.5/3.8 (248k) | MiniMax (200k)": [
+          138334,
+          69.2,
+          6
+        ],
+        "Qwen3.5/3.8 (248k) | Inkling=o200k (200k)": [
+          135143,
+          67.6,
+          265
+        ],
+        "Qwen3.5/3.8 (248k) | Hy3 (120k)": [
+          95266,
+          79.4,
+          125
+        ],
+        "Qwen3.5/3.8 (248k) | Solar Open2 (197k)": [
+          93966,
+          47.8,
+          2
+        ],
+        "MiMo=Qwen2/3 (151k) | GLM-5 (155k)": [
+          125095,
+          82.5,
+          7952
+        ],
+        "MiMo=Qwen2/3 (151k) | DeepSeek (128k)": [
+          84030,
+          65.6,
+          8
+        ],
+        "MiMo=Qwen2/3 (151k) | Kimi tiktoken (164k)": [
+          95367,
+          62.9,
+          262
+        ],
+        "MiMo=Qwen2/3 (151k) | Motif-3 (220k)": [
+          84230,
+          55.5,
+          3
+        ],
+        "MiMo=Qwen2/3 (151k) | K2-Horizon (250k)": [
+          93882,
+          61.9,
+          2
+        ],
+        "MiMo=Qwen2/3 (151k) | MiniMax (200k)": [
+          97727,
+          64.4,
+          5
+        ],
+        "MiMo=Qwen2/3 (151k) | Inkling=o200k (200k)": [
+          98863,
+          65.2,
+          265
+        ],
+        "MiMo=Qwen2/3 (151k) | Hy3 (120k)": [
+          77819,
+          64.8,
+          127
+        ],
+        "MiMo=Qwen2/3 (151k) | Solar Open2 (197k)": [
+          80178,
+          52.9,
+          1
+        ],
+        "GLM-5 (155k) | DeepSeek (128k)": [
+          93471,
+          73.0,
+          8
+        ],
+        "GLM-5 (155k) | Kimi tiktoken (164k)": [
+          103074,
+          66.6,
+          262
+        ],
+        "GLM-5 (155k) | Motif-3 (220k)": [
+          88559,
+          57.2,
+          3
+        ],
+        "GLM-5 (155k) | K2-Horizon (250k)": [
+          100216,
+          64.7,
+          2
+        ],
+        "GLM-5 (155k) | MiniMax (200k)": [
+          105757,
+          68.3,
+          4
+        ],
+        "GLM-5 (155k) | Inkling=o200k (200k)": [
+          108198,
+          69.9,
+          267
+        ],
+        "GLM-5 (155k) | Hy3 (120k)": [
+          84927,
+          70.8,
+          128
+        ],
+        "GLM-5 (155k) | Solar Open2 (197k)": [
+          80644,
+          52.1,
+          1
+        ],
+        "DeepSeek (128k) | Kimi tiktoken (164k)": [
+          91237,
+          71.3,
+          8
+        ],
+        "DeepSeek (128k) | Motif-3 (220k)": [
+          85985,
+          67.2,
+          6
+        ],
+        "DeepSeek (128k) | K2-Horizon (250k)": [
+          87908,
+          68.7,
+          8
+        ],
+        "DeepSeek (128k) | MiniMax (200k)": [
+          105258,
+          82.2,
+          10
+        ],
+        "DeepSeek (128k) | Inkling=o200k (200k)": [
+          82268,
+          64.3,
+          8
+        ],
+        "DeepSeek (128k) | Hy3 (120k)": [
+          90735,
+          75.6,
+          9
+        ],
+        "DeepSeek (128k) | Solar Open2 (197k)": [
+          76247,
+          59.6,
+          2
+        ],
+        "Kimi tiktoken (164k) | Motif-3 (220k)": [
+          77926,
+          47.6,
+          0
+        ],
+        "Kimi tiktoken (164k) | K2-Horizon (250k)": [
+          83997,
+          51.3,
+          2
+        ],
+        "Kimi tiktoken (164k) | MiniMax (200k)": [
+          100319,
+          61.3,
+          7
+        ],
+        "Kimi tiktoken (164k) | Inkling=o200k (200k)": [
+          85824,
+          52.5,
+          271
+        ],
+        "Kimi tiktoken (164k) | Hy3 (120k)": [
+          96104,
+          80.1,
+          133
+        ],
+        "Kimi tiktoken (164k) | Solar Open2 (197k)": [
+          72322,
+          44.2,
+          0
+        ],
+        "Motif-3 (220k) | K2-Horizon (250k)": [
+          110971,
+          50.4,
+          3
+        ],
+        "Motif-3 (220k) | MiniMax (200k)": [
+          108201,
+          54.1,
+          0
+        ],
+        "Motif-3 (220k) | Inkling=o200k (200k)": [
+          97775,
+          48.9,
+          4
+        ],
+        "Motif-3 (220k) | Hy3 (120k)": [
+          74478,
+          62.1,
+          5
+        ],
+        "Motif-3 (220k) | Solar Open2 (197k)": [
+          132477,
+          67.4,
+          0
+        ],
+        "K2-Horizon (250k) | MiniMax (200k)": [
+          128339,
+          64.2,
+          2
+        ],
+        "K2-Horizon (250k) | Inkling=o200k (200k)": [
+          130335,
+          65.2,
+          7
+        ],
+        "K2-Horizon (250k) | Hy3 (120k)": [
+          73704,
+          61.4,
+          2
+        ],
+        "K2-Horizon (250k) | Solar Open2 (197k)": [
+          97163,
+          49.4,
+          1
+        ],
+        "MiniMax (200k) | Inkling=o200k (200k)": [
+          111082,
+          55.5,
+          9
+        ],
+        "MiniMax (200k) | Hy3 (120k)": [
+          91269,
+          76.1,
+          7
+        ],
+        "MiniMax (200k) | Solar Open2 (197k)": [
+          96541,
+          49.1,
+          3
+        ],
+        "Inkling=o200k (200k) | Hy3 (120k)": [
+          67069,
+          55.9,
+          131
+        ],
+        "Inkling=o200k (200k) | Solar Open2 (197k)": [
+          88222,
+          44.9,
+          0
+        ],
+        "Hy3 (120k) | Solar Open2 (197k)": [
+          69575,
+          58.0,
+          3
+        ]
+      },
+      "pairwise_overlap_columns": [
+        "shared byte-strings",
+        "percent of smaller vocab",
+        "tokens with the same id in both"
+      ],
+      "notes": [
+        "Qwen3.5/3.8 248k vocab is not an id-preserving superset of the Qwen3 151k vocab (281 shared ids)",
+        "largest cross-group same-id overlap: Qwen3 151k (MiMo) vs GLM-5 = 7,952 ids"
+      ]
+    }
+  },
+  "models": [
+    {
+      "rank": 1,
+      "model": "MiMo-V2.6-Pro",
+      "creator": "Xiaomi",
+      "aa": {
+        "name": "MiMo-V2.6-Pro",
+        "intelligence_index": 46.32,
+        "intelligence_index_raw": 46.3242065310383,
+        "estimated": false,
+        "release_date": "2026-09-21",
+        "context_window_tokens": 1000000,
+        "variants": [
+          {
+            "name": "MiMo-V2.6-Pro",
+            "score": 46.32,
+            "estimated": false
+          }
+        ]
+      },
+      "hf_repo": "XiaomiMiMo/MiMo-V2.6-Pro-RL",
+      "hf_repo_alternates": [
+        "XiaomiMiMo/MiMo-V2.6-Pro-MOPD (2026-09-27; identical config.json)"
+      ],
+      "release_date": "2026-09-21",
+      "hf_created_at": "2026-09-21",
+      "total_params_b": 1020,
+      "active_params_b": 42,
+      "params_source": "model card: 1.02T total / 42B activated",
+      "params_inferred": null,
+      "hf_safetensors_params": 1024216603392,
+      "moe": {
+        "kind": "MoE",
+        "routed_experts": 384,
+        "active_experts": 8,
+        "shared_experts": 0,
+        "note": "layer 0 dense FFN (moe_layer_freq[0]=0); no shared experts"
+      },
+      "num_hidden_layers": 70,
+      "hidden_size": 6144,
+      "vocab_size": 152576,
+      "tokenizer": {
+        "family": "Qwen2/Qwen3 byte-level BPE (151,643 base tokens, identical vocab+merges to Qwen3)",
+        "group": "T_QWEN3_151K"
+      },
+      "attention": {
+        "type": "hybrid SWA + global GQA (attention-sink bias on SWA layers)",
+        "layer_pattern": "hybrid_layer_pattern (0=global,1=SWA): 10 global + 60 SWA; layer 0 global, then ~6-7 SWA : 1 global",
+        "global_layers": 10,
+        "swa_layers": 60,
+        "sliding_window": 128,
+        "num_attention_heads": 128,
+        "num_key_value_heads": 8,
+        "head_dim_k": 192,
+        "head_dim_v": 128,
+        "swa_num_attention_heads": 128,
+        "swa_num_key_value_heads": 8,
+        "swa_head_dim_k": 192,
+        "swa_head_dim_v": 128,
+        "extras": "attention_value_scale=0.612; fused_qkv; MTP 5 SWA layers (window 1024) not counted"
+      },
+      "positional": {
+        "type": "partial RoPE",
+        "style": "NeoX / rotate-half (HF modeling_mimo_v2.py; llama.cpp LLAMA_ROPE_TYPE_NEOX)",
+        "rotary_dims": 64,
+        "partial_rotary_factor": 0.334,
+        "rope_theta": 10000000,
+        "swa_rope_theta": 10000,
+        "scaling": null,
+        "nope_layers": null
+      },
+      "max_context": {
+        "config_max_position_embeddings": 1048576,
+        "card": "1M"
+      },
+      "kv": {
+        "per_token_bytes_bf16": 51200,
+        "formula": "10 global layers x 8 kv x (192+128) x 2B",
+        "fixed_swa_bytes_bf16": 39321600,
+        "fixed_swa_formula": "60 SWA layers x 128 tokens x 8 kv x 320 x 2B",
+        "per_token_kib_bf16": 50.0,
+        "total_at_128k_ctx_gib_bf16": 6.29
+      },
+      "llama_cpp": {
+        "supported": true,
+        "gguf_arch": "mimo2",
+        "note": "MiMoV2ForCausalLM registered in conversion/mimo.py"
+      },
+      "q4_k_m": {
+        "est_weights_gb": 618.4,
+        "fits_128gb_unified": "no",
+        "note": "est. 4.85 bits/weight x total stored params; 'yes' <=100 GB leaves room for KV/compute on a 128 GB Ryzen AI Max+ 395"
+      },
+      "aa_slug": "mimo-v2-6-pro",
+      "sources": [
+        "https://artificialanalysis.ai/leaderboards/models?open_weights=open_source",
+        "https://artificialanalysis.ai/models/mimo-v2-6-pro",
+        "https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-RL/blob/main/config.json",
+        "https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-RL/blob/main/README.md",
+        "https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-RL/blob/main/modeling_mimo_v2.py",
+        "https://huggingface.co/api/models/XiaomiMiMo/MiMo-V2.6-Pro-RL",
+        "https://github.com/ggml-org/llama.cpp/blob/master/src/llama-arch.cpp",
+        "https://github.com/ggml-org/llama.cpp/tree/master/conversion"
+      ],
+      "translator_families": [
+        "F2_swa_global_gqa"
+      ]
+    },
+    {
+      "rank": 2,
+      "model": "GLM-5.3",
+      "creator": "Z AI (Zhipu)",
+      "aa": {
+        "name": "GLM-5.3 (Max)",
+        "intelligence_index": 44.78,
+        "intelligence_index_raw": 44.777392385614,
+        "estimated": false,
+        "release_date": "2026-08-18",
+        "context_window_tokens": 1000000,
+        "variants": [
+          {
+            "name": "GLM-5.3 (Max)",
+            "score": 44.78,
+            "estimated": false
+          },
+          {
+            "name": "GLM-5.3 (Low)",
+            "score": 34.3,
+            "estimated": false
+          }
+        ]
+      },
+      "hf_repo": "zai-org/GLM-5.3",
+      "hf_repo_alternates": [
+        "zai-org/GLM-5.3-BF16"
+      ],
+      "release_date": "2026-08-18",
+      "hf_created_at": "2026-08-25",
+      "total_params_b": 744,
+      "active_params_b": 40,
+      "params_source": "GLM-5.3 card says it uses the GLM-5.2 base; config shapes identical to GLM-5 whose card states 744B total / 40B active (inferred carry-over). HF safetensors count 753.3B incl. MTP layer.",
+      "params_inferred": true,
+      "hf_safetensors_params": 753329940480,
+      "moe": {
+        "kind": "MoE",
+        "routed_experts": 256,
+        "active_experts": 8,
+        "shared_experts": 1,
+        "note": "first 3 layers dense"
+      },
+      "num_hidden_layers": 78,
+      "hidden_size": 6144,
+      "vocab_size": 154880,
+      "tokenizer": {
+        "family": "GLM-5 byte-level BPE (154,820 base tokens; identical to GLM-5)",
+        "group": "T_GLM5_155K"
+      },
+      "attention": {
+        "type": "MLA + DSA (DeepSeek Sparse Attention: lightning indexer, top-2048) with IndexShare",
+        "layer_pattern": "all 78 layers MLA; indexer_types: 21 'full' indexer layers, 57 'shared' (reuse previous top-k; index_topk_freq=4)",
+        "global_layers": 78,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 64,
+        "kv_lora_rank": 512,
+        "q_lora_rank": 2048,
+        "qk_rope_head_dim": 64,
+        "qk_nope_head_dim": 192,
+        "v_head_dim": 256,
+        "index_n_heads": 32,
+        "index_head_dim": 128,
+        "index_topk": 2048
+      },
+      "positional": {
+        "type": "decoupled RoPE on 64-dim MLA rope part",
+        "style": "interleaved / GPT-J (rope_interleave=true; llama.cpp ROPE_TYPE_NORM)",
+        "rotary_dims": 64,
+        "rope_theta": 8000000,
+        "scaling": null,
+        "nope_layers": null
+      },
+      "max_context": {
+        "config_max_position_embeddings": 1048576,
+        "card": "1M (eval footnotes use 1M context)"
+      },
+      "kv": {
+        "per_token_bytes_bf16": 89856,
+        "formula": "78 MLA layers x (512+64) x 2B",
+        "indexer_bytes_per_token_bf16": 5376,
+        "indexer_formula": "21 full-indexer layers x 128 x 2B (production kernels store FP8 + scale)",
+        "per_token_kib_bf16": 87.75,
+        "total_at_128k_ctx_gib_bf16": 11.62
+      },
+      "llama_cpp": {
+        "supported": true,
+        "gguf_arch": "glm-dsa"
+      },
+      "q4_k_m": {
+        "est_weights_gb": 451.0,
+        "fits_128gb_unified": "no",
+        "note": "est. 4.85 bits/weight x total stored params; 'yes' <=100 GB leaves room for KV/compute on a 128 GB Ryzen AI Max+ 395"
+      },
+      "aa_slug": "glm-5-3",
+      "sources": [
+        "https://artificialanalysis.ai/leaderboards/models?open_weights=open_source",
+        "https://artificialanalysis.ai/models/glm-5-3",
+        "https://huggingface.co/zai-org/GLM-5.3/blob/main/config.json",
+        "https://huggingface.co/zai-org/GLM-5.3/blob/main/README.md",
+        "https://huggingface.co/zai-org/GLM-5/blob/main/README.md",
+        "https://github.com/ggml-org/llama.cpp/blob/master/src/models/glm-dsa.cpp",
+        "https://huggingface.co/api/models/zai-org/GLM-5.3",
+        "https://github.com/ggml-org/llama.cpp/blob/master/src/llama-arch.cpp",
+        "https://github.com/ggml-org/llama.cpp/tree/master/conversion"
+      ],
+      "translator_families": [
+        "F3_mla_latent"
+      ]
+    },
+    {
+      "rank": 3,
+      "model": "Kimi K3",
+      "creator": "Moonshot AI (Kimi)",
+      "aa": {
+        "name": "Kimi K3 (Max)",
+        "intelligence_index": 43.59,
+        "intelligence_index_raw": 43.5938229518782,
+        "estimated": false,
+        "release_date": "2026-07-16",
+        "context_window_tokens": 1048576,
+        "variants": [
+          {
+            "name": "Kimi K3 (Max)",
+            "score": 43.59,
+            "estimated": false
+          },
+          {
+            "name": "Kimi K3 (Low)",
+            "score": 30.07,
+            "estimated": false
+          }
+        ]
+      },
+      "hf_repo": "moonshotai/Kimi-K3",
+      "hf_repo_alternates": null,
+      "release_date": "2026-07-16",
+      "hf_created_at": "2026-06-13",
+      "total_params_b": 2800,
+      "active_params_b": 104,
+      "params_source": "model card: 2.8T total / 104B activated",
+      "params_inferred": null,
+      "hf_safetensors_params": 2779931837184,
+      "moe": {
+        "kind": "MoE (Stable LatentMoE, latent dim 3584)",
+        "routed_experts": 896,
+        "active_experts": 16,
+        "shared_experts": 2,
+        "note": "1 dense layer"
+      },
+      "num_hidden_layers": 93,
+      "hidden_size": 7168,
+      "vocab_size": 163840,
+      "tokenizer": {
+        "family": "Kimi tiktoken BPE (tiktoken.model, 163,584 ranks; byte-identical file to Kimi K2)",
+        "group": "T_KIMI_164K"
+      },
+      "attention": {
+        "type": "hybrid KDA (Kimi Delta Attention, linear/recurrent) + gated NoPE MLA",
+        "layer_pattern": "69 KDA + 24 MLA; MLA at 1-indexed layers 4,8,...,92 and 93 (3 KDA : 1 MLA, last two layers MLA)",
+        "global_layers": 24,
+        "linear_layers": 69,
+        "num_attention_heads": 96,
+        "num_key_value_heads": 96,
+        "kv_lora_rank": 512,
+        "q_lora_rank": 1536,
+        "qk_rope_head_dim": 64,
+        "qk_nope_head_dim": 128,
+        "v_head_dim": 128,
+        "kda_heads": 96,
+        "kda_head_dim": 128,
+        "kda_short_conv": 4,
+        "extras": "Attention Residuals (attn_res_block_size=12): depth-wise attention over earlier block outputs, not over tokens"
+      },
+      "positional": {
+        "type": "NoPE in MLA layers (mla_use_nope=true); position only via KDA recurrence + short convs",
+        "style": "none (llama.cpp LLAMA_ROPE_TYPE_NONE)",
+        "rotary_dims": 0,
+        "rope_theta": null,
+        "scaling": null,
+        "nope_layers": "all 24 MLA layers"
+      },
+      "max_context": {
+        "config_max_position_embeddings": 1048576,
+        "card": "1,048,576"
+      },
+      "kv": {
+        "per_token_bytes_bf16": 27648,
+        "formula": "24 MLA layers x (512+64) x 2B (64-dim decoupled key kept but never rotated)",
+        "recurrent_state_elems": 116158464,
+        "recurrent_state_bytes_bf16": 232316928,
+        "recurrent_state_bytes_fp32_state": 449372160,
+        "recurrent_formula": "69 KDA layers x [96 heads x 128 x 128 state + 3 x (3 x 96 x 128) conv]",
+        "per_token_kib_bf16": 27.0,
+        "total_at_128k_ctx_gib_bf16": 3.59
+      },
+      "llama_cpp": {
+        "supported": true,
+        "gguf_arch": "kimi-k3"
+      },
+      "q4_k_m": {
+        "est_weights_gb": 1697.5,
+        "fits_128gb_unified": "no",
+        "note": "est. 4.85 bits/weight x total stored params; 'yes' <=100 GB leaves room for KV/compute on a 128 GB Ryzen AI Max+ 395"
+      },
+      "aa_slug": "kimi-k3",
+      "sources": [
+        "https://artificialanalysis.ai/leaderboards/models?open_weights=open_source",
+        "https://artificialanalysis.ai/models/kimi-k3",
+        "https://huggingface.co/moonshotai/Kimi-K3/blob/main/config.json",
+        "https://huggingface.co/moonshotai/Kimi-K3/blob/main/README.md",
+        "https://github.com/ggml-org/llama.cpp/blob/master/src/models/kimi-k3.cpp",
+        "https://huggingface.co/api/models/moonshotai/Kimi-K3",
+        "https://github.com/ggml-org/llama.cpp/blob/master/src/llama-arch.cpp",
+        "https://github.com/ggml-org/llama.cpp/tree/master/conversion"
+      ],
+      "translator_families": [
+        "F5_linear_hybrid",
+        "F3_mla_latent",
+        "nope"
+      ]
+    },
+    {
+      "rank": 4,
+      "model": "GLM-5.3-Flash",
+      "creator": "Z AI (Zhipu)",
+      "aa": {
+        "name": "GLM 5.3 Flash",
+        "intelligence_index": 41.81,
+        "intelligence_index_raw": 41.807466113455,
+        "estimated": false,
+        "release_date": "2026-08-26",
+        "context_window_tokens": 1000000,
+        "variants": [
+          {
+            "name": "GLM 5.3 Flash",
+            "score": 41.81,
+            "estimated": false
+          }
+        ]
+      },
+      "hf_repo": "zai-org/GLM-5.3-Flash",
+      "hf_repo_alternates": [
+        "zai-org/GLM-5.3-Flash-BF16"
+      ],
+      "release_date": "2026-08-26",
+      "hf_created_at": "2026-08-25",
+      "total_params_b": 320,
+      "active_params_b": 18,
+      "params_source": "model card: 320B total / 18B active",
+      "params_inferred": null,
+      "hf_safetensors_params": 321323031390,
+      "moe": {
+        "kind": "MoE",
+        "routed_experts": 288,
+        "active_experts": 8,
+        "shared_experts": 1,
+        "note": "first 3 layers dense; mHC (hc_mult=4)"
+      },
+      "num_hidden_layers": 45,
+      "hidden_size": 4096,
+      "vocab_size": 154880,
+      "tokenizer": {
+        "family": "GLM-5 byte-level BPE (identical tokenizer.json to GLM-5.3)",
+        "group": "T_GLM5_155K"
+      },
+      "attention": {
+        "type": "hybrid KDA (linear) + NoPE MLA with DSA k-pool indexer",
+        "layer_pattern": "34 KDA + 11 DSA-MLA (0-indexed MLA at 3,7,...,43): 3 linear : 1 sparse, last layer KDA",
+        "global_layers": 11,
+        "linear_layers": 34,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 64,
+        "kv_lora_rank": 512,
+        "q_lora_rank": 1536,
+        "qk_rope_head_dim": 0,
+        "qk_nope_head_dim": 256,
+        "v_head_dim": 256,
+        "index_n_heads": 32,
+        "index_head_dim": 128,
+        "index_topk": 2048,
+        "index_kpool": 4,
+        "kda_heads": 64,
+        "kda_head_dim": 128,
+        "kda_short_conv": 4
+      },
+      "positional": {
+        "type": "NoPE MLA (qk_rope_head_dim=0, mla_use_nope=true); KDA carries position",
+        "style": "none (llama.cpp LLAMA_ROPE_TYPE_NONE)",
+        "rotary_dims": 0,
+        "rope_theta": null,
+        "scaling": null,
+        "nope_layers": "all 11 MLA layers",
+        "note": "indexer_rope_interleave=true suggests RoPE inside the indexer only (inferred)"
+      },
+      "max_context": {
+        "config_max_position_embeddings": 1048576,
+        "card": null
+      },
+      "kv": {
+        "per_token_bytes_bf16": 11264,
+        "formula": "11 MLA layers x (512+0) x 2B",
+        "indexer_bytes_per_token_bf16": 704,
+        "indexer_formula": "11 layers x 128 x 2B / kpool 4 (pooled keys; raw tail keys extra) - inferred",
+        "indexer_inferred": true,
+        "recurrent_state_elems": 38158336,
+        "recurrent_state_bytes_bf16": 76316672,
+        "recurrent_state_bytes_fp32_state": 147619840,
+        "recurrent_formula": "34 KDA layers x [64 heads x 128 x 128 + 3 x (3 x 64 x 128)]",
+        "per_token_kib_bf16": 11.0,
+        "total_at_128k_ctx_gib_bf16": 1.53
+      },
+      "llama_cpp": {
+        "supported": true,
+        "gguf_arch": "glm5-next"
+      },
+      "q4_k_m": {
+        "est_weights_gb": 194.0,
+        "fits_128gb_unified": "no",
+        "note": "est. 4.85 bits/weight x total stored params; 'yes' <=100 GB leaves room for KV/compute on a 128 GB Ryzen AI Max+ 395"
+      },
+      "aa_slug": "glm-5-3-flash",
+      "sources": [
+        "https://artificialanalysis.ai/leaderboards/models?open_weights=open_source",
+        "https://artificialanalysis.ai/models/glm-5-3-flash",
+        "https://huggingface.co/zai-org/GLM-5.3-Flash/blob/main/config.json",
+        "https://huggingface.co/zai-org/GLM-5.3-Flash/blob/main/README.md",
+        "https://github.com/ggml-org/llama.cpp/blob/master/src/models/glm5-next.cpp",
+        "https://huggingface.co/api/models/zai-org/GLM-5.3-Flash",
+        "https://github.com/ggml-org/llama.cpp/blob/master/src/llama-arch.cpp",
+        "https://github.com/ggml-org/llama.cpp/tree/master/conversion"
+      ],
+      "translator_families": [
+        "F5_linear_hybrid",
+        "F3_mla_latent",
+        "nope"
+      ]
+    },
+    {
+      "rank": 5,
+      "model": "Qwen3.8-2.4T-A95B",
+      "creator": "Alibaba (Qwen)",
+      "aa": {
+        "name": "Qwen3.8 2.4T A95B",
+        "intelligence_index": 39.89,
+        "intelligence_index_raw": 39.8861723105325,
+        "estimated": false,
+        "release_date": "2026-08-12",
+        "context_window_tokens": 262000,
+        "variants": [
+          {
+            "name": "Qwen3.8 2.4T A95B",
+            "score": 39.89,
+            "estimated": false
+          }
+        ]
+      },
+      "hf_repo": "Qwen/Qwen3.8-2.4T-A95B",
+      "hf_repo_alternates": [
+        "Qwen/Qwen3.8-2.4T-A95B-FP8"
+      ],
+      "release_date": "2026-08-12",
+      "hf_created_at": "2026-08-08",
+      "total_params_b": 2400,
+      "active_params_b": 95,
+      "params_source": "model card: 2.4T total / 95B activated (HF safetensors 2,446B)",
+      "params_inferred": null,
+      "hf_safetensors_params": 2446182725504,
+      "moe": {
+        "kind": "MoE",
+        "routed_experts": 512,
+        "active_experts": 10,
+        "shared_experts": 1
+      },
+      "num_hidden_layers": 92,
+      "hidden_size": 8192,
+      "vocab_size": 248320,
+      "tokenizer": {
+        "family": "Qwen3.5 byte-level BPE (248,044 base tokens)",
+        "group": "T_QWEN35_248K"
+      },
+      "attention": {
+        "type": "hybrid Gated DeltaNet (linear) + gated full GQA",
+        "layer_pattern": "69 GDN + 23 full: 23 x (3 GDN, 1 full)",
+        "global_layers": 23,
+        "linear_layers": 69,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 4,
+        "head_dim_k": 256,
+        "head_dim_v": 256,
+        "gdn_key_heads": 16,
+        "gdn_value_heads": 128,
+        "gdn_head_dim": 128,
+        "gdn_conv_kernel": 4,
+        "extras": "attn_output_gate=true"
+      },
+      "positional": {
+        "type": "partial RoPE",
+        "style": "NeoX-style rotate-half on first 64 dims (text-only config: no mrope_section)",
+        "rotary_dims": 64,
+        "partial_rotary_factor": 0.25,
+        "rope_theta": 10000000,
+        "scaling": "none in config; card: YaRN to ~1.01M",
+        "nope_layers": null
+      },
+      "max_context": {
+        "config_max_position_embeddings": 262144,
+        "card": "262,144 native, extensible to 1,010,000"
+      },
+      "kv": {
+        "per_token_bytes_bf16": 94208,
+        "formula": "23 full layers x 2 x 4 kv x 256 x 2B",
+        "recurrent_state_elems": 148942848,
+        "recurrent_state_bytes_bf16": 297885696,
+        "recurrent_state_bytes_fp32_state": 587292672,
+        "recurrent_formula": "69 GDN layers x [128 v-heads x 128 x 128 + 3 x (2x16x128 + 128x128) conv]; mamba_ssm_dtype=float32",
+        "per_token_kib_bf16": 92.0,
+        "total_at_128k_ctx_gib_bf16": 11.78
+      },
+      "llama_cpp": {
+        "supported": true,
+        "gguf_arch": "qwen35moe"
+      },
+      "q4_k_m": {
+        "est_weights_gb": 1455.0,
+        "fits_128gb_unified": "no",
+        "note": "est. 4.85 bits/weight x total stored params; 'yes' <=100 GB leaves room for KV/compute on a 128 GB Ryzen AI Max+ 395"
+      },
+      "aa_slug": "qwen3-8-2-4t-a95b",
+      "sources": [
+        "https://artificialanalysis.ai/leaderboards/models?open_weights=open_source",
+        "https://artificialanalysis.ai/models/qwen3-8-2-4t-a95b",
+        "https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B/blob/main/config.json",
+        "https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B/blob/main/README.md",
+        "https://huggingface.co/api/models/Qwen/Qwen3.8-2.4T-A95B",
+        "https://github.com/ggml-org/llama.cpp/blob/master/src/llama-arch.cpp",
+        "https://github.com/ggml-org/llama.cpp/tree/master/conversion"
+      ],
+      "translator_families": [
+        "F5_linear_hybrid"
+      ]
+    },
+    {
+      "rank": 6,
+      "model": "Qwen3.8-Flash-Next",
+      "creator": "Alibaba (Qwen)",
+      "aa": {
+        "name": "Qwen3.8-Flash-Next",
+        "intelligence_index": 39.82,
+        "intelligence_index_raw": 39.8223021864741,
+        "estimated": false,
+        "release_date": "2026-08-26",
+        "context_window_tokens": 256000,
+        "variants": [
+          {
+            "name": "Qwen3.8-Flash-Next",
+            "score": 39.82,
+            "estimated": false
+          }
+        ]
+      },
+      "hf_repo": "Qwen/Qwen3.8-Flash-Next",
+      "hf_repo_alternates": [
+        "Qwen/Qwen3.8-Flash-Next-FP8"
+      ],
+      "release_date": "2026-08-26",
+      "hf_created_at": "2026-08-24",
+      "total_params_b": 180,
+      "active_params_b": 6,
+      "params_source": "model card: 125B with 6B activated, plus 51B n-gram embedding and 4B MTP (HF safetensors 180.0B)",
+      "params_inferred": null,
+      "hf_safetensors_params": 179999981459,
+      "moe": {
+        "kind": "MoE",
+        "routed_experts": 512,
+        "active_experts": 10,
+        "shared_experts": 1,
+        "note": "Gated Residual (hc_count=4), 3-gram embeddings, PLE at layer 2"
+      },
+      "num_hidden_layers": 48,
+      "hidden_size": 2560,
+      "vocab_size": 248320,
+      "tokenizer": {
+        "family": "Qwen3.5 byte-level BPE (248,044 base tokens)",
+        "group": "T_QWEN35_248K"
+      },
+      "attention": {
+        "type": "hybrid Gated DeltaNet + QSA (Qwen Sparse Attention: block-level indexer over GQA)",
+        "layer_pattern": "36 GDN + 12 QSA: 12 x (3 GDN, 1 QSA)",
+        "global_layers": 12,
+        "linear_layers": 36,
+        "num_attention_heads": 24,
+        "num_key_value_heads": 2,
+        "head_dim_k": 256,
+        "head_dim_v": 256,
+        "indexer_n_heads": 4,
+        "indexer_kv_heads": 1,
+        "indexer_head_dim": 128,
+        "indexer_budget": 2048,
+        "indexer_compress_ratio": 4,
+        "gdn_key_heads": 16,
+        "gdn_value_heads": 48,
+        "gdn_head_dim": 128,
+        "gdn_conv_kernel": 4
+      },
+      "positional": {
+        "type": "partial interleaved M-RoPE (IMRoPE)",
+        "style": "mrope_interleaved, sections [11,11,10]; llama.cpp LLAMA_ROPE_TYPE_IMROPE (text = 1-D positions)",
+        "rotary_dims": 64,
+        "partial_rotary_factor": 0.25,
+        "rope_theta": 10000000,
+        "scaling": "none in config; YaRN for >262K per card",
+        "nope_layers": null
+      },
+      "max_context": {
+        "config_max_position_embeddings": 262144,
+        "card": "262,144 native, extensible to 1,000,000"
+      },
+      "kv": {
+        "per_token_bytes_bf16": 24576,
+        "formula": "12 QSA layers x 2 x 2 kv x 256 x 2B",
+        "indexer_bytes_per_token_bf16": 3072,
+        "indexer_formula": "12 layers x 1 indexer kv head x 128 x 2B (raw keys; llama.cpp also stores pooled keys per 4-token block) - inferred",
+        "indexer_inferred": true,
+        "recurrent_state_elems": 29417472,
+        "recurrent_state_bytes_bf16": 58834944,
+        "recurrent_state_bytes_fp32_state": 115458048,
+        "recurrent_formula": "36 GDN layers x [48 x 128 x 128 + 3 x (2x16x128 + 48x128)]; plus small PLE conv state",
+        "per_token_kib_bf16": 24.0,
+        "total_at_128k_ctx_gib_bf16": 3.43
+      },
+      "llama_cpp": {
+        "supported": true,
+        "gguf_arch": "qwen4exp"
+      },
+      "q4_k_m": {
+        "est_weights_gb": 109.1,
+        "fits_128gb_unified": "borderline",
+        "note": "est. 4.85 bits/weight x total stored params; 'yes' <=100 GB leaves room for KV/compute on a 128 GB Ryzen AI Max+ 395"
+      },
+      "aa_slug": "qwen3-8-flash-next",
+      "sources": [
+        "https://artificialanalysis.ai/leaderboards/models?open_weights=open_source",
+        "https://artificialanalysis.ai/models/qwen3-8-flash-next",
+        "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/config.json",
+        "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/README.md",
+        "https://github.com/ggml-org/llama.cpp/blob/master/src/models/qwen4exp.cpp",
+        "https://huggingface.co/api/models/Qwen/Qwen3.8-Flash-Next",
+        "https://github.com/ggml-org/llama.cpp/blob/master/src/llama-arch.cpp",
+        "https://github.com/ggml-org/llama.cpp/tree/master/conversion"
+      ],
+      "translator_families": [
+        "F5_linear_hybrid"
+      ]
+    },
+    {
+      "rank": 7,
+      "model": "DeepSeek V4.1 Flash",
+      "creator": "DeepSeek",
+      "aa": {
+        "name": "DeepSeek V4.1 Flash (Max)",
+        "intelligence_index": 39.46,
+        "intelligence_index_raw": 39.456167472527,
+        "estimated": false,
+        "release_date": "2026-09-10",
+        "context_window_tokens": 1000000,
+        "variants": [
+          {
+            "name": "DeepSeek V4.1 Flash (Max)",
+            "score": 39.46,
+            "estimated": false
+          },
+          {
+            "name": "DeepSeek V4.1 Flash (Non-reasoning)",
+            "score": 24.67,
+            "estimated": false
+          }
+        ]
+      },
+      "hf_repo": "deepseek-ai/DeepSeek-V4.1-Flash",
+      "hf_repo_alternates": null,
+      "release_date": "2026-09-10",
+      "hf_created_at": "2026-09-10",
+      "total_params_b": 552,
+      "active_params_b": 16,
+      "quant_params_b": 748,
+      "params_source": "model card: 552B backbone params; 8B activated in prefill / 16B in decode; plus 196B Engram tables (HF safetensors 763B)",
+      "params_inferred": null,
+      "hf_safetensors_params": 763205315794,
+      "moe": {
+        "kind": "MoE",
+        "routed_experts": 384,
+        "active_experts": 6,
+        "shared_experts": 1,
+        "note": "mHC hc_mult=4; Engram n-gram memory at layers 1,14; DSpark draft layers"
+      },
+      "num_hidden_layers": 40,
+      "hidden_size": 5120,
+      "vocab_size": 129280,
+      "tokenizer": {
+        "family": "DeepSeek byte-level BPE (128,000 base; same vocab+merges as DeepSeek-V3/V3.2/V4; added tokens differ from V4)",
+        "group": "T_DEEPSEEK_128K"
+      },
+      "attention": {
+        "type": "CSA2: shared-latent MQA (K=V latent 512, 1 kv head) + 128-token sliding window + compressed global KV with sparse indexer; Causal Encoder-Decoder",
+        "layer_pattern": "compress_ratios (40 layers): 2 window-only, 18 ratio-2 (encoder), 20 ratio-1 (decoder); compressed KV produced only by kv_source layers [2, 8, 14, 20] and shared by the rest; decoder global KV projected from final encoder hidden states",
+        "global_layers": 4,
+        "swa_layers": 40,
+        "sliding_window": 128,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 1,
+        "head_dim_k": 512,
+        "head_dim_v": 512,
+        "qk_rope_head_dim": 64,
+        "q_lora_rank": 1280,
+        "o_lora_rank": 1024,
+        "index_n_heads": 32,
+        "index_head_dim": 128,
+        "index_topk": 512,
+        "index_source_layer_ids": [
+          2,
+          8,
+          14,
+          20,
+          24,
+          28,
+          32,
+          36
+        ],
+        "candidate_source_layer_id": 20
+      },
+      "positional": {
+        "type": "RoPE on last 64 of 512 latent dims",
+        "style": "interleaved complex (DeepSeek freqs_cis; llama.cpp ROPE_TYPE_NORM)",
+        "rotary_dims": 64,
+        "rope_theta": 10000,
+        "compress_rope_theta": 160000,
+        "scaling": "YaRN factor 16, original 65536 (compressed layers only; window-only layers use plain theta 1e4)",
+        "nope_layers": null
+      },
+      "max_context": {
+        "config_max_position_embeddings": 1048576,
+        "card": "1M"
+      },
+      "kv": {
+        "per_token_bytes_bf16": 2560,
+        "formula": "kv_source layers 2,8,14 (ratio 2) + 20 (ratio 1): 512 x 2B / ratio each = 3x512 + 1024 (inferred from inference/model.py)",
+        "indexer_bytes_per_token_bf16": 640,
+        "indexer_formula": "index K owned by the same 4 source layers: 128 x 2B / ratio",
+        "official_bytes_per_token": "890 B/token global KV (FP4 main KV, per model card)",
+        "fixed_swa_bytes_bf16": 5242880,
+        "fixed_swa_formula": "40 layers x 128-token window x 512 x 2B",
+        "inferred": true,
+        "per_token_kib_bf16": 2.5,
+        "total_at_128k_ctx_gib_bf16": 0.4
+      },
+      "llama_cpp": {
+        "supported": false,
+        "gguf_arch": null,
+        "note": "DeepseekV41ForCausalLM not in master; open PR ggml-org/llama.cpp#28696 (2026-09-10). antirez/deepseek-v4.1-flash-gguf targets a separate engine"
+      },
+      "q4_k_m": {
+        "est_weights_gb": 453.5,
+        "fits_128gb_unified": "no",
+        "note": "est. 4.85 bits/weight x total stored params (552B backbone + 196B Engram); 'yes' <=100 GB leaves room for KV/compute on a 128 GB Ryzen AI Max+ 395"
+      },
+      "aa_slug": "deepseek-v4-1-flash",
+      "sources": [
+        "https://artificialanalysis.ai/leaderboards/models?open_weights=open_source",
+        "https://artificialanalysis.ai/models/deepseek-v4-1-flash",
+        "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/config.json",
+        "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/README.md",
+        "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/inference/model.py",
+        "https://github.com/ggml-org/llama.cpp/pull/28696",
+        "https://huggingface.co/api/models/deepseek-ai/DeepSeek-V4.1-Flash",
+        "https://github.com/ggml-org/llama.cpp/blob/master/src/llama-arch.cpp",
+        "https://github.com/ggml-org/llama.cpp/tree/master/conversion"
+      ],
+      "translator_families": [
+        "F4_compressed_latent",
+        "F2_swa_global_gqa"
+      ]
+    },
+    {
+      "rank": 8,
+      "model": "MiMo-V2.6-Flash",
+      "creator": "Xiaomi",
+      "aa": {
+        "name": "MiMo-V2.6-Flash",
+        "intelligence_index": 37.88,
+        "intelligence_index_raw": 37.8843590141754,
+        "estimated": false,
+        "release_date": "2026-09-21",
+        "context_window_tokens": 1000000,
+        "variants": [
+          {
+            "name": "MiMo-V2.6-Flash",
+            "score": 37.88,
+            "estimated": false
+          }
+        ]
+      },
+      "hf_repo": "XiaomiMiMo/MiMo-V2.6-Flash-RL",
+      "hf_repo_alternates": [
+        "XiaomiMiMo/MiMo-V2.6-Flash-MOPD (identical config.json)"
+      ],
+      "release_date": "2026-09-21",
+      "hf_created_at": "2026-09-21",
+      "total_params_b": 309,
+      "active_params_b": 15,
+      "params_source": "model card: 309B total / 15B activated",
+      "params_inferred": null,
+      "hf_safetensors_params": 310756322688,
+      "moe": {
+        "kind": "MoE",
+        "routed_experts": 256,
+        "active_experts": 8,
+        "shared_experts": 0,
+        "note": "layer 0 dense"
+      },
+      "num_hidden_layers": 48,
+      "hidden_size": 4096,
+      "vocab_size": 152576,
+      "tokenizer": {
+        "family": "Qwen2/Qwen3 byte-level BPE (151,643 base)",
+        "group": "T_QWEN3_151K"
+      },
+      "attention": {
+        "type": "hybrid SWA + global GQA (sink bias on SWA)",
+        "layer_pattern": "9 global + 39 SWA: layer 0 global then 8 x (5 SWA, 1 global) (model card: 48 / 39 SWA / 9 GA)",
+        "global_layers": 9,
+        "swa_layers": 39,
+        "sliding_window": 128,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 4,
+        "head_dim_k": 192,
+        "head_dim_v": 128,
+        "swa_num_attention_heads": 64,
+        "swa_num_key_value_heads": 8,
+        "swa_head_dim_k": 192,
+        "swa_head_dim_v": 128,
+        "extras": "attention_value_scale=0.707"
+      },
+      "positional": {
+        "type": "partial RoPE",
+        "style": "NeoX / rotate-half",
+        "rotary_dims": 64,
+        "partial_rotary_factor": 0.334,
+        "rope_theta": 10000000.0,
+        "swa_rope_theta": 10000.0,
+        "scaling": null,
+        "nope_layers": null
+      },
+      "max_context": {
+        "config_max_position_embeddings": 1048576,
+        "card": "1M"
+      },
+      "kv": {
+        "per_token_bytes_bf16": 23040,
+        "formula": "9 global x 4 kv x (192+128) x 2B",
+        "fixed_swa_bytes_bf16": 25559040,
+        "fixed_swa_formula": "39 SWA x 128 x 8 kv x 320 x 2B",
+        "per_token_kib_bf16": 22.5,
+        "total_at_128k_ctx_gib_bf16": 2.84
+      },
+      "llama_cpp": {
+        "supported": true,
+        "gguf_arch": "mimo2",
+        "note": "ggml-org/MiMo-V2.6-Flash-RL-GGUF published"
+      },
+      "q4_k_m": {
+        "est_weights_gb": 187.3,
+        "fits_128gb_unified": "no",
+        "note": "est. 4.85 bits/weight x total stored params; 'yes' <=100 GB leaves room for KV/compute on a 128 GB Ryzen AI Max+ 395"
+      },
+      "aa_slug": "mimo-v2-6-flash",
+      "sources": [
+        "https://artificialanalysis.ai/leaderboards/models?open_weights=open_source",
+        "https://artificialanalysis.ai/models/mimo-v2-6-flash",
+        "https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL/blob/main/config.json",
+        "https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL/blob/main/README.md",
+        "https://huggingface.co/ggml-org/MiMo-V2.6-Flash-RL-GGUF",
+        "https://huggingface.co/api/models/XiaomiMiMo/MiMo-V2.6-Flash-RL",
+        "https://github.com/ggml-org/llama.cpp/blob/master/src/llama-arch.cpp",
+        "https://github.com/ggml-org/llama.cpp/tree/master/conversion"
+      ],
+      "translator_families": [
+        "F2_swa_global_gqa"
+      ]
+    },
+    {
+      "rank": 9,
+      "model": "DeepSeek V4 Pro 0813",
+      "creator": "DeepSeek",
+      "aa": {
+        "name": "DeepSeek V4 Pro 0813 (Max)",
+        "intelligence_index": 36.0,
+        "intelligence_index_raw": 35.9967791278402,
+        "estimated": false,
+        "release_date": "2026-08-13",
+        "context_window_tokens": 1000000,
+        "variants": [
+          {
+            "name": "DeepSeek V4 Pro 0813 (Max)",
+            "score": 36.0,
+            "estimated": false
+          },
+          {
+            "name": "DeepSeek V4 Pro 0813 (Non-reasoning)",
+            "score": 20.36,
+            "estimated": false
+          }
+        ]
+      },
+      "hf_repo": "deepseek-ai/DeepSeek-V4-Pro-0813",
+      "hf_repo_alternates": [
+        "deepseek-ai/DeepSeek-V4-Pro (2026-04-22 preview, same architecture)"
+      ],
+      "release_date": "2026-08-13",
+      "hf_created_at": "2026-08-13",
+      "total_params_b": 1600,
+      "active_params_b": 49,
+      "params_source": "DeepSeek-V4-Pro card: 1.6T total / 49B activated (HF safetensors 1,650B)",
+      "params_inferred": null,
+      "hf_safetensors_params": 1650497936906,
+      "moe": {
+        "kind": "MoE",
+        "routed_experts": 384,
+        "active_experts": 6,
+        "shared_experts": 1,
+        "note": "first 3 layers hash-routed (num_hash_layers=3); mHC hc_mult=4"
+      },
+      "num_hidden_layers": 61,
+      "hidden_size": 7168,
+      "vocab_size": 129280,
+      "tokenizer": {
+        "family": "DeepSeek byte-level BPE (128,000 base; identical vocab+merges to V3/V3.2/V4-Flash)",
+        "group": "T_DEEPSEEK_128K"
+      },
+      "attention": {
+        "type": "hybrid CSA (compressed sparse, ratio 4 + lightning indexer top-1024) / HCA (heavily compressed, ratio 128, dense over compressed) + 128-token SWA in every layer; shared K=V latent MQA (1 kv head, dim 512)",
+        "layer_pattern": "compress_ratios[:61]: 31 HCA(128) + 30 CSA(4) + 0 window-only; layers 0-1 HCA then alternating CSA/HCA",
+        "global_layers": 61,
+        "swa_layers": 61,
+        "sliding_window": 128,
+        "num_attention_heads": 128,
+        "num_key_value_heads": 1,
+        "head_dim_k": 512,
+        "head_dim_v": 512,
+        "qk_rope_head_dim": 64,
+        "q_lora_rank": 1536,
+        "o_lora_rank": 1024,
+        "index_n_heads": 64,
+        "index_head_dim": 128,
+        "index_topk": 1024
+      },
+      "positional": {
+        "type": "RoPE on last 64 of 512 latent dims",
+        "style": "interleaved complex (llama.cpp ROPE_TYPE_NORM)",
+        "rotary_dims": 64,
+        "rope_theta": 10000,
+        "compress_rope_theta": 160000,
+        "scaling": "YaRN factor 16, original 65536 on compressed layers",
+        "nope_layers": null
+      },
+      "max_context": {
+        "config_max_position_embeddings": 1048576,
+        "card": "1M"
+      },
+      "kv": {
+        "per_token_bytes_bf16": 7928,
+        "formula": "30 CSA x 512 x 2B / 4 + 31 HCA x 512 x 2B / 128",
+        "indexer_bytes_per_token_bf16": 1920,
+        "indexer_formula": "30 CSA layers x 128 x 2B / 4",
+        "fixed_swa_bytes_bf16": 7995392,
+        "fixed_swa_formula": "61 layers x 128 x 512 x 2B",
+        "official_bytes_per_token": "card: 10% of DeepSeek-V3.2 KV at 1M context (FP8 storage in production)",
+        "inferred": false,
+        "per_token_kib_bf16": 7.74,
+        "total_at_128k_ctx_gib_bf16": 1.21
+      },
+      "llama_cpp": {
+        "supported": true,
+        "gguf_arch": "deepseek4"
+      },
+      "q4_k_m": {
+        "est_weights_gb": 970.0,
+        "fits_128gb_unified": "no",
+        "note": "est. 4.85 bits/weight x total stored params; 'yes' <=100 GB leaves room for KV/compute on a 128 GB Ryzen AI Max+ 395"
+      },
+      "aa_slug": "deepseek-v4-pro",
+      "sources": [
+        "https://artificialanalysis.ai/leaderboards/models?open_weights=open_source",
+        "https://artificialanalysis.ai/models/deepseek-v4-pro",
+        "https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro-0813/blob/main/config.json",
+        "https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/README.md",
+        "https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro-0813/blob/main/inference/model.py",
+        "https://arxiv.org/abs/2606.19348",
+        "https://huggingface.co/api/models/deepseek-ai/DeepSeek-V4-Pro-0813",
+        "https://github.com/ggml-org/llama.cpp/blob/master/src/llama-arch.cpp",
+        "https://github.com/ggml-org/llama.cpp/tree/master/conversion"
+      ],
+      "translator_families": [
+        "F4_compressed_latent",
+        "F2_swa_global_gqa"
+      ]
+    },
+    {
+      "rank": 10,
+      "model": "Qwen3.8-27B",
+      "creator": "Alibaba (Qwen)",
+      "aa": {
+        "name": "Qwen3.8 27B (Xhigh)",
+        "intelligence_index": 33.7,
+        "intelligence_index_raw": 33.6962858057476,
+        "estimated": false,
+        "release_date": "2026-08-14",
+        "context_window_tokens": 256000,
+        "variants": [
+          {
+            "name": "Qwen3.8 27B (Xhigh)",
+            "score": 33.7,
+            "estimated": false
+          },
+          {
+            "name": "Qwen3.8 27B (Medium)",
+            "score": 27.55,
+            "estimated": false
+          },
+          {
+            "name": "Qwen3.8 27B (Low)",
+            "score": 26.2,
+            "estimated": false
+          },
+          {
+            "name": "Qwen3.8 27B (Non-reasoning)",
+            "score": 20.15,
+            "estimated": false
+          }
+        ]
+      },
+      "hf_repo": "Qwen/Qwen3.8-27B",
+      "hf_repo_alternates": [
+        "Qwen/Qwen3.8-27B-FP8"
+      ],
+      "release_date": "2026-08-14",
+      "hf_created_at": "2026-08-05",
+      "total_params_b": 27,
+      "active_params_b": 27,
+      "params_source": "model card: 27B (HF safetensors 27.8B incl. vision)",
+      "params_inferred": null,
+      "hf_safetensors_params": 27781427952,
+      "moe": {
+        "kind": "dense",
+        "routed_experts": null,
+        "active_experts": null,
+        "shared_experts": null
+      },
+      "num_hidden_layers": 64,
+      "hidden_size": 5120,
+      "vocab_size": 248320,
+      "tokenizer": {
+        "family": "Qwen3.5 byte-level BPE (248,044 base)",
+        "group": "T_QWEN35_248K"
+      },
+      "attention": {
+        "type": "hybrid Gated DeltaNet + gated full GQA",
+        "layer_pattern": "48 GDN + 16 full: 16 x (3 GDN, 1 full)",
+        "global_layers": 16,
+        "linear_layers": 48,
+        "num_attention_heads": 24,
+        "num_key_value_heads": 4,
+        "head_dim_k": 256,
+        "head_dim_v": 256,
+        "gdn_key_heads": 16,
+        "gdn_value_heads": 48,
+        "gdn_head_dim": 128,
+        "gdn_conv_kernel": 4
+      },
+      "positional": {
+        "type": "partial interleaved M-RoPE (IMRoPE)",
+        "style": "mrope_interleaved, sections [11,11,10]; llama.cpp IMROPE",
+        "rotary_dims": 64,
+        "partial_rotary_factor": 0.25,
+        "rope_theta": 10000000,
+        "scaling": "none in config; card: YaRN to 1M",
+        "nope_layers": null
+      },
+      "max_context": {
+        "config_max_position_embeddings": 262144,
+        "card": "262,144 native, extensible to 1,000,000"
+      },
+      "kv": {
+        "per_token_bytes_bf16": 65536,
+        "formula": "16 full x 2 x 4 kv x 256 x 2B",
+        "recurrent_state_elems": 39223296,
+        "recurrent_state_bytes_bf16": 78446592,
+        "recurrent_state_bytes_fp32_state": 153944064,
+        "recurrent_formula": "48 GDN x [48 x 128 x 128 + 3 x (2x16x128 + 48x128)]",
+        "per_token_kib_bf16": 64.0,
+        "total_at_128k_ctx_gib_bf16": 8.07
+      },
+      "llama_cpp": {
+        "supported": true,
+        "gguf_arch": "qwen35",
+        "note": "the kvpark Qwen server model"
+      },
+      "q4_k_m": {
+        "est_weights_gb": 16.4,
+        "fits_128gb_unified": "yes",
+        "note": "est. 4.85 bits/weight x total stored params; 'yes' <=100 GB leaves room for KV/compute on a 128 GB Ryzen AI Max+ 395"
+      },
+      "aa_slug": "qwen3-8-27b",
+      "sources": [
+        "https://artificialanalysis.ai/leaderboards/models?open_weights=open_source",
+        "https://artificialanalysis.ai/models/qwen3-8-27b",
+        "https://huggingface.co/Qwen/Qwen3.8-27B/blob/main/config.json",
+        "https://huggingface.co/Qwen/Qwen3.8-27B/blob/main/README.md",
+        "https://huggingface.co/api/models/Qwen/Qwen3.8-27B",
+        "https://github.com/ggml-org/llama.cpp/blob/master/src/llama-arch.cpp",
+        "https://github.com/ggml-org/llama.cpp/tree/master/conversion"
+      ],
+      "translator_families": [
+        "F5_linear_hybrid"
+      ]
+    },
+    {
+      "rank": 11,
+      "model": "Motif 3",
+      "creator": "Motif Technologies",
+      "aa": {
+        "name": "Motif 3",
+        "intelligence_index": 33.57,
+        "intelligence_index_raw": 33.566562209723,
+        "estimated": true,
+        "release_date": "2026-08-12",
+        "context_window_tokens": 262144,
+        "variants": [
+          {
+            "name": "Motif 3",
+            "score": 33.57,
+            "estimated": true
+          }
+        ]
+      },
+      "hf_repo": "Motif-Technologies/Motif-3",
+      "hf_repo_alternates": null,
+      "release_date": "2026-08-12",
+      "hf_created_at": "2026-08-07",
+      "total_params_b": 314,
+      "active_params_b": 13.2,
+      "params_source": "model card: ~314B total / ~13.2B activated",
+      "params_inferred": null,
+      "hf_safetensors_params": 314841775750,
+      "moe": {
+        "kind": "MoE",
+        "routed_experts": 384,
+        "active_experts": 8,
+        "shared_experts": 1,
+        "note": "2 dense first layers; Expert-Specific PolyNorm; mHC x4"
+      },
+      "num_hidden_layers": 53,
+      "hidden_size": 4096,
+      "vocab_size": 220160,
+      "tokenizer": {
+        "family": "Motif byte-level BPE (220,160 vocab; own)",
+        "group": "T_MOTIF_220K"
+      },
+      "attention": {
+        "type": "GDLA (Grouped Differential Latent Attention): MLA-style latent KV with 16 KV heads, differential signal/noise heads; SWA interleave",
+        "layer_pattern": "layer_idx % 4 == 0 global (14 layers: 0,4,...,52), other 39 SWA (window 128+1)",
+        "global_layers": 14,
+        "swa_layers": 39,
+        "sliding_window": 128,
+        "num_attention_heads": 80,
+        "num_key_value_heads": 16,
+        "num_noise_heads": 16,
+        "head_dim_k": 192,
+        "head_dim_v": 128,
+        "kv_lora_rank": 512,
+        "q_lora_rank": 1024,
+        "qk_rope_head_dim": 64,
+        "qk_nope_head_dim": 128,
+        "v_head_dim": 128,
+        "extras": "elementwise output gate; k_pe shared across kv heads"
+      },
+      "positional": {
+        "type": "decoupled RoPE on 64 dims (MLA-style)",
+        "style": "see modeling_motif.py apply_rotary_pos_emb_single",
+        "rotary_dims": 64,
+        "rope_theta": 10000.0,
+        "swa_rope_theta": 10000.0,
+        "scaling": "rope_scaling yarn factor 64 / orig 4096 present but apply_yarn_scaling=false; mscale applied to softmax scale on global layers",
+        "nope_layers": null
+      },
+      "max_context": {
+        "config_max_position_embeddings": 262144,
+        "card": "262,144"
+      },
+      "kv": {
+        "per_token_bytes_bf16": 16128,
+        "formula": "14 global x (512+64) x 2B (latent cache, as with vLLM FLASH_ATTN_MLA recommended in the card)",
+        "alt_per_token_bytes_bf16_hf_expanded": 143360,
+        "alt_formula": "HF DynamicCache stores expanded K (16x192) and V (16x128): 10,240 B per global layer",
+        "fixed_swa_bytes_bf16": 5795712,
+        "fixed_swa_formula": "39 SWA x 129 x 576 x 2B (latent)",
+        "per_token_kib_bf16": 15.75,
+        "total_at_128k_ctx_gib_bf16": 1.97
+      },
+      "llama_cpp": {
+        "supported": false,
+        "gguf_arch": null,
+        "note": "MotifForCausalLM not in master (checked 2026-10-02); open PR ggml-org/llama.cpp#26298; AesSedai/Motif-3-GGUF states it requires that PR"
+      },
+      "q4_k_m": {
+        "est_weights_gb": 190.4,
+        "fits_128gb_unified": "no",
+        "note": "est. 4.85 bits/weight x total stored params; 'yes' <=100 GB leaves room for KV/compute on a 128 GB Ryzen AI Max+ 395"
+      },
+      "aa_slug": "motif-3",
+      "sources": [
+        "https://artificialanalysis.ai/leaderboards/models?open_weights=open_source",
+        "https://artificialanalysis.ai/models/motif-3",
+        "https://huggingface.co/Motif-Technologies/Motif-3/blob/main/config.json",
+        "https://huggingface.co/Motif-Technologies/Motif-3/blob/main/README.md",
+        "https://huggingface.co/Motif-Technologies/Motif-3/blob/main/modeling_motif.py",
+        "https://github.com/ggml-org/llama.cpp/pull/26298",
+        "https://huggingface.co/api/models/Motif-Technologies/Motif-3",
+        "https://github.com/ggml-org/llama.cpp/blob/master/src/llama-arch.cpp",
+        "https://github.com/ggml-org/llama.cpp/tree/master/conversion"
+      ],
+      "translator_families": [
+        "F3_mla_latent",
+        "F2_swa_global_gqa"
+      ]
+    },
+    {
+      "rank": 12,
+      "model": "K2 Horizon 375B A23B",
+      "creator": "Institute of Foundation Models (MBZUAI IFM)",
+      "aa": {
+        "name": "K2 Horizon 375B A23B",
+        "intelligence_index": 30.5,
+        "intelligence_index_raw": 30.5015302696723,
+        "estimated": false,
+        "release_date": "2026-09-03",
+        "context_window_tokens": 524288,
+        "variants": [
+          {
+            "name": "K2 Horizon 375B A23B",
+            "score": 30.5,
+            "estimated": false
+          }
+        ]
+      },
+      "hf_repo": "IFM/K2-Horizon-375B-A23B",
+      "hf_repo_alternates": null,
+      "release_date": "2026-09-03",
+      "hf_created_at": "2026-09-01",
+      "total_params_b": 375,
+      "active_params_b": 23,
+      "params_source": "model card: 375B stored / 23B per token (HF safetensors 379.2B)",
+      "params_inferred": null,
+      "hf_safetensors_params": 379167159168,
+      "moe": {
+        "kind": "MoE",
+        "routed_experts": 192,
+        "active_experts": 8,
+        "shared_experts": 1,
+        "note": "layers 0-2 dense"
+      },
+      "num_hidden_layers": 61,
+      "hidden_size": 6144,
+      "vocab_size": 250624,
+      "tokenizer": {
+        "family": "K2 Horizon byte-level BPE (250,000 base; own)",
+        "group": "T_K2H_250K"
+      },
+      "attention": {
+        "type": "full GQA (no SWA, no gate)",
+        "layer_pattern": "all 61 layers full attention",
+        "global_layers": 61,
+        "num_attention_heads": 48,
+        "num_key_value_heads": 8,
+        "head_dim_k": 128,
+        "head_dim_v": 128
+      },
+      "positional": {
+        "type": "partial RoPE",
+        "style": "64 of 128 dims selected through an interleaved-layout split (modeling_k2_horizon.py split_to_interleaved)",
+        "rotary_dims": 64,
+        "partial_rotary_factor": 0.5,
+        "rope_theta": 10000000.0,
+        "scaling": null,
+        "nope_layers": null
+      },
+      "max_context": {
+        "config_max_position_embeddings": 524288,
+        "card": "512K"
+      },
+      "kv": {
+        "per_token_bytes_bf16": 249856,
+        "formula": "61 x 2 x 8 kv x 128 x 2B",
+        "per_token_kib_bf16": 244.0,
+        "total_at_128k_ctx_gib_bf16": 30.5
+      },
+      "llama_cpp": {
+        "supported": false,
+        "gguf_arch": null,
+        "note": "K2HorizonForCausalLM not in master; open PR ggml-org/llama.cpp#29535 (2026-09-27); IFM GGUF cards point to the MBZUAI-IFM llama.cpp fork (branch model/K2Hori...)"
+      },
+      "q4_k_m": {
+        "est_weights_gb": 227.3,
+        "fits_128gb_unified": "no",
+        "note": "est. 4.85 bits/weight x total stored params; 'yes' <=100 GB leaves room for KV/compute on a 128 GB Ryzen AI Max+ 395"
+      },
+      "aa_slug": "k2-horizon-375b-a23b",
+      "sources": [
+        "https://artificialanalysis.ai/leaderboards/models?open_weights=open_source",
+        "https://artificialanalysis.ai/models/k2-horizon-375b-a23b",
+        "https://huggingface.co/IFM/K2-Horizon-375B-A23B/blob/main/config.json",
+        "https://huggingface.co/IFM/K2-Horizon-375B-A23B/blob/main/README.md",
+        "https://huggingface.co/IFM/K2-Horizon-MoVA-36B-A4B/blob/main/modeling_k2_horizon.py",
+        "https://github.com/ggml-org/llama.cpp/pull/29535",
+        "https://huggingface.co/api/models/IFM/K2-Horizon-375B-A23B",
+        "https://github.com/ggml-org/llama.cpp/blob/master/src/llama-arch.cpp",
+        "https://github.com/ggml-org/llama.cpp/tree/master/conversion"
+      ],
+      "translator_families": [
+        "F1_full_gqa"
+      ]
+    },
+    {
+      "rank": 13,
+      "model": "MiniMax-M3",
+      "creator": "MiniMax",
+      "aa": {
+        "name": "MiniMax-M3",
+        "intelligence_index": 29.22,
+        "intelligence_index_raw": 29.2202932236316,
+        "estimated": false,
+        "release_date": "2026-06-01",
+        "context_window_tokens": 1000000,
+        "variants": [
+          {
+            "name": "MiniMax-M3",
+            "score": 29.22,
+            "estimated": false
+          }
+        ]
+      },
+      "hf_repo": "MiniMaxAI/MiniMax-M3",
+      "hf_repo_alternates": [
+        "MiniMaxAI/MiniMax-M3-MXFP8"
+      ],
+      "release_date": "2026-06-01",
+      "hf_created_at": "2026-06-02",
+      "total_params_b": 428,
+      "active_params_b": 23,
+      "params_source": "model card: ~428B / ~23B activated (HF safetensors 427.0B)",
+      "params_inferred": null,
+      "hf_safetensors_params": 427040140160,
+      "moe": {
+        "kind": "MoE",
+        "routed_experts": 128,
+        "active_experts": 4,
+        "shared_experts": 1,
+        "note": "first 3 layers dense"
+      },
+      "num_hidden_layers": 60,
+      "hidden_size": 6144,
+      "vocab_size": 200064,
+      "tokenizer": {
+        "family": "MiniMax byte-level BPE (200,000 base; identical vocab+merges to MiniMax-M2.7)",
+        "group": "T_MINIMAX_200K"
+      },
+      "attention": {
+        "type": "GQA + MSA (MiniMax Sparse Attention: block-sparse, 128-token blocks, top-16 blocks + local block, single-key indexer)",
+        "layer_pattern": "3 dense-attention layers then 57 MSA layers; KV for all 60 layers",
+        "global_layers": 60,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 4,
+        "head_dim_k": 128,
+        "head_dim_v": 128,
+        "index_n_heads": 4,
+        "index_head_dim": 128,
+        "sparse_block_size": 128,
+        "sparse_topk_blocks": 16,
+        "extras": "per-head QK norm"
+      },
+      "positional": {
+        "type": "partial RoPE",
+        "style": "NeoX (llama.cpp LLAMA_ROPE_TYPE_NEOX)",
+        "rotary_dims": 64,
+        "partial_rotary_factor": 0.5,
+        "rope_theta": 5000000,
+        "scaling": null,
+        "nope_layers": null
+      },
+      "max_context": {
+        "config_max_position_embeddings": 1048576,
+        "card": "1M"
+      },
+      "kv": {
+        "per_token_bytes_bf16": 122880,
+        "formula": "60 x 2 x 4 kv x 128 x 2B",
+        "indexer_bytes_per_token_bf16": 14592,
+        "indexer_formula": "57 MSA layers x one 128-dim index key x 2B (llama.cpp index_k_proj {n_embd,128})",
+        "per_token_kib_bf16": 120.0,
+        "total_at_128k_ctx_gib_bf16": 16.78
+      },
+      "llama_cpp": {
+        "supported": true,
+        "gguf_arch": "minimax-m3",
+        "note": "MSA via llama-kv-cache-msa"
+      },
+      "q4_k_m": {
+        "est_weights_gb": 259.5,
+        "fits_128gb_unified": "no",
+        "note": "est. 4.85 bits/weight x total stored params; 'yes' <=100 GB leaves room for KV/compute on a 128 GB Ryzen AI Max+ 395"
+      },
+      "aa_slug": "minimax-m3",
+      "sources": [
+        "https://artificialanalysis.ai/leaderboards/models?open_weights=open_source",
+        "https://artificialanalysis.ai/models/minimax-m3",
+        "https://huggingface.co/MiniMaxAI/MiniMax-M3/blob/main/config.json",
+        "https://huggingface.co/MiniMaxAI/MiniMax-M3/blob/main/README.md",
+        "https://github.com/ggml-org/llama.cpp/blob/master/src/models/minimax-m3.cpp",
+        "https://github.com/MiniMax-AI/MSA",
+        "https://huggingface.co/api/models/MiniMaxAI/MiniMax-M3",
+        "https://github.com/ggml-org/llama.cpp/blob/master/src/llama-arch.cpp",
+        "https://github.com/ggml-org/llama.cpp/tree/master/conversion"
+      ],
+      "translator_families": [
+        "F1_full_gqa"
+      ]
+    },
+    {
+      "rank": 14,
+      "model": "Nex-N2-Pro (Qwen3.5-397B-A17B fine-tune)",
+      "creator": "Nex AGI",
+      "aa": {
+        "name": "Nex-N2-Pro (Based on Qwen3.5-397B-A17B)",
+        "intelligence_index": 28.2,
+        "intelligence_index_raw": 28.1990972887912,
+        "estimated": true,
+        "release_date": "2026-06-02",
+        "context_window_tokens": 262000,
+        "variants": [
+          {
+            "name": "Nex-N2-Pro (Based on Qwen3.5-397B-A17B)",
+            "score": 28.2,
+            "estimated": true
+          }
+        ]
+      },
+      "hf_repo": "nex-agi/Nex-N2-Pro",
+      "hf_repo_alternates": [
+        "nex-agi/Nex-N2-Pro-fp8"
+      ],
+      "release_date": "2026-06-02",
+      "hf_created_at": "2026-06-03",
+      "total_params_b": 397,
+      "active_params_b": 17,
+      "params_source": "base Qwen3.5-397B-A17B card: 397B total / 17B activated (inferred for the fine-tune; HF safetensors 396.8B)",
+      "params_inferred": true,
+      "hf_safetensors_params": 396802360816,
+      "moe": {
+        "kind": "MoE",
+        "routed_experts": 512,
+        "active_experts": 10,
+        "shared_experts": 1
+      },
+      "num_hidden_layers": 60,
+      "hidden_size": 4096,
+      "vocab_size": 248320,
+      "tokenizer": {
+        "family": "Qwen3.5 byte-level BPE (248,044 base; vocab/merges/added tokens identical to Qwen3.8)",
+        "group": "T_QWEN35_248K"
+      },
+      "attention": {
+        "type": "hybrid Gated DeltaNet + gated full GQA",
+        "layer_pattern": "45 GDN + 15 full: 15 x (3 GDN, 1 full)",
+        "global_layers": 15,
+        "linear_layers": 45,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim_k": 256,
+        "head_dim_v": 256,
+        "gdn_key_heads": 16,
+        "gdn_value_heads": 64,
+        "gdn_head_dim": 128,
+        "gdn_conv_kernel": 4
+      },
+      "positional": {
+        "type": "partial interleaved M-RoPE",
+        "style": "IMRoPE sections [11,11,10]",
+        "rotary_dims": 64,
+        "partial_rotary_factor": 0.25,
+        "rope_theta": 10000000,
+        "scaling": null,
+        "nope_layers": null
+      },
+      "max_context": {
+        "config_max_position_embeddings": 262144,
+        "card": null
+      },
+      "kv": {
+        "per_token_bytes_bf16": 30720,
+        "formula": "15 full x 2 x 2 kv x 256 x 2B",
+        "recurrent_state_elems": 48844800,
+        "recurrent_state_bytes_bf16": 97689600,
+        "recurrent_state_bytes_fp32_state": 192061440,
+        "recurrent_formula": "45 GDN x [64 x 128 x 128 + 3 x (2x16x128 + 64x128)]",
+        "per_token_kib_bf16": 30.0,
+        "total_at_128k_ctx_gib_bf16": 3.84
+      },
+      "llama_cpp": {
+        "supported": true,
+        "gguf_arch": "qwen35moe"
+      },
+      "q4_k_m": {
+        "est_weights_gb": 240.7,
+        "fits_128gb_unified": "no",
+        "note": "est. 4.85 bits/weight x total stored params; 'yes' <=100 GB leaves room for KV/compute on a 128 GB Ryzen AI Max+ 395"
+      },
+      "aa_slug": "nex-n2-pro",
+      "sources": [
+        "https://artificialanalysis.ai/leaderboards/models?open_weights=open_source",
+        "https://artificialanalysis.ai/models/nex-n2-pro",
+        "https://huggingface.co/nex-agi/Nex-N2-Pro/blob/main/config.json",
+        "https://huggingface.co/nex-agi/Nex-N2-Pro/blob/main/README.md",
+        "https://huggingface.co/Qwen/Qwen3.5-397B-A17B/blob/main/README.md",
+        "https://huggingface.co/api/models/nex-agi/Nex-N2-Pro",
+        "https://github.com/ggml-org/llama.cpp/blob/master/src/llama-arch.cpp",
+        "https://github.com/ggml-org/llama.cpp/tree/master/conversion"
+      ],
+      "translator_families": [
+        "F5_linear_hybrid"
+      ]
+    },
+    {
+      "rank": 15,
+      "model": "Kimi K2.7 Code",
+      "creator": "Moonshot AI (Kimi)",
+      "aa": {
+        "name": "Kimi K2.7 Code",
+        "intelligence_index": 25.81,
+        "intelligence_index_raw": 25.8121062401836,
+        "estimated": false,
+        "release_date": "2026-06-12",
+        "context_window_tokens": 256000,
+        "variants": [
+          {
+            "name": "Kimi K2.7 Code",
+            "score": 25.81,
+            "estimated": false
+          }
+        ]
+      },
+      "hf_repo": "moonshotai/Kimi-K2.7-Code",
+      "hf_repo_alternates": null,
+      "release_date": "2026-06-12",
+      "hf_created_at": "2026-06-11",
+      "total_params_b": 1000,
+      "active_params_b": 32,
+      "params_source": "model card: 1T total / 32B activated",
+      "params_inferred": null,
+      "hf_safetensors_params": 1026879376368,
+      "moe": {
+        "kind": "MoE",
+        "routed_experts": 384,
+        "active_experts": 8,
+        "shared_experts": 1,
+        "note": "1 dense layer; DeepSeek-V3 architecture"
+      },
+      "num_hidden_layers": 61,
+      "hidden_size": 7168,
+      "vocab_size": 163840,
+      "tokenizer": {
+        "family": "Kimi tiktoken BPE (163,584 ranks; byte-identical tiktoken.model to Kimi K3 and K2)",
+        "group": "T_KIMI_164K"
+      },
+      "attention": {
+        "type": "MLA (DeepSeek-V3 style), all layers",
+        "layer_pattern": "61 MLA layers",
+        "global_layers": 61,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 64,
+        "kv_lora_rank": 512,
+        "q_lora_rank": 1536,
+        "qk_rope_head_dim": 64,
+        "qk_nope_head_dim": 128,
+        "v_head_dim": 128
+      },
+      "positional": {
+        "type": "decoupled RoPE (64 dims) + YaRN",
+        "style": "interleaved (DeepSeek; llama.cpp ROPE_TYPE_NORM)",
+        "rotary_dims": 64,
+        "rope_theta": 50000.0,
+        "scaling": "YaRN factor 64.0, original 4096, beta_fast 32, beta_slow 1",
+        "nope_layers": null
+      },
+      "max_context": {
+        "config_max_position_embeddings": 262144,
+        "card": "256K"
+      },
+      "kv": {
+        "per_token_bytes_bf16": 70272,
+        "formula": "61 x (512+64) x 2B",
+        "per_token_kib_bf16": 68.62,
+        "total_at_128k_ctx_gib_bf16": 8.58
+      },
+      "llama_cpp": {
+        "supported": true,
+        "gguf_arch": "deepseek2",
+        "note": "KimiK25ForConditionalGeneration -> DEEPSEEK2"
+      },
+      "q4_k_m": {
+        "est_weights_gb": 606.2,
+        "fits_128gb_unified": "no",
+        "note": "est. 4.85 bits/weight x total stored params; 'yes' <=100 GB leaves room for KV/compute on a 128 GB Ryzen AI Max+ 395"
+      },
+      "aa_slug": "kimi-k2-7-code",
+      "sources": [
+        "https://artificialanalysis.ai/leaderboards/models?open_weights=open_source",
+        "https://artificialanalysis.ai/models/kimi-k2-7-code",
+        "https://huggingface.co/moonshotai/Kimi-K2.7-Code/blob/main/config.json",
+        "https://huggingface.co/moonshotai/Kimi-K2.7-Code/blob/main/README.md",
+        "https://huggingface.co/api/models/moonshotai/Kimi-K2.7-Code",
+        "https://github.com/ggml-org/llama.cpp/blob/master/src/llama-arch.cpp",
+        "https://github.com/ggml-org/llama.cpp/tree/master/conversion"
+      ],
+      "translator_families": [
+        "F3_mla_latent"
+      ]
+    },
+    {
+      "rank": 16,
+      "model": "Inkling Small",
+      "creator": "Thinking Machines Lab",
+      "aa": {
+        "name": "Inkling Small",
+        "intelligence_index": 25.66,
+        "intelligence_index_raw": 25.6582584411942,
+        "estimated": false,
+        "release_date": "2026-07-30",
+        "context_window_tokens": 1000000,
+        "variants": [
+          {
+            "name": "Inkling Small",
+            "score": 25.66,
+            "estimated": false
+          }
+        ]
+      },
+      "hf_repo": "thinkingmachines/Inkling-Small",
+      "hf_repo_alternates": [
+        "thinkingmachines/Inkling-Small-NVFP4"
+      ],
+      "release_date": "2026-07-30",
+      "hf_created_at": "2026-07-27",
+      "total_params_b": 276,
+      "active_params_b": 12,
+      "params_source": "model card: 276B total, 12B active",
+      "params_inferred": null,
+      "hf_safetensors_params": 265956439090,
+      "moe": {
+        "kind": "MoE",
+        "routed_experts": 256,
+        "active_experts": 6,
+        "shared_experts": 2,
+        "note": "dense MLP at layer index < 2 (dense_mlp_idx=2) (inferred)"
+      },
+      "num_hidden_layers": 42,
+      "hidden_size": 4096,
+      "vocab_size": 201024,
+      "tokenizer": {
+        "family": "o200k (OpenAI GPT-4o/gpt-oss) byte-level BPE: 199,998 base tokens identical to openai/gpt-oss-20b; own special tokens",
+        "group": "T_O200K"
+      },
+      "attention": {
+        "type": "hybrid local SWA (window 512) + global GQA; short convolutions on K and V (kernel 4) and on the residual stream",
+        "layer_pattern": "35 local + 7 global (global at [5, 11, 17, 23, 29, 35, 41]): 5 local : 1 global",
+        "global_layers": 7,
+        "swa_layers": 35,
+        "sliding_window": 512,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim_k": 128,
+        "head_dim_v": 128,
+        "swa_num_attention_heads": 32,
+        "swa_num_key_value_heads": 8,
+        "swa_head_dim": 128
+      },
+      "positional": {
+        "type": "no RoPE: learned query-dependent relative logit bias (d_rel=16; extent 1024 global / 512 local, zero beyond) + K/V short conv + log-length attention scaling (n_floor 128000, alpha 0.1)",
+        "style": "none",
+        "rotary_dims": 0,
+        "rope_theta": null,
+        "scaling": null,
+        "nope_layers": "all layers (cached K/V carry no rotary phase)"
+      },
+      "max_context": {
+        "config_max_position_embeddings": 1048576,
+        "card": null,
+        "note": "text_config.model_max_length"
+      },
+      "kv": {
+        "per_token_bytes_bf16": 28672,
+        "formula": "7 global x 2 x 8 kv x 128 x 2B",
+        "fixed_swa_bytes_bf16": 73400320,
+        "fixed_swa_formula": "35 local x 512 x 2 x 8 kv x 128 x 2B",
+        "conv_state_note": "plus fp32 short-conv states: 3 tokens x (2 x kv_dim + 2 x hidden) per layer",
+        "per_token_kib_bf16": 28.0,
+        "total_at_128k_ctx_gib_bf16": 3.57
+      },
+      "llama_cpp": {
+        "supported": false,
+        "gguf_arch": null,
+        "note": "InklingForConditionalGeneration not in master; open PR ggml-org/llama.cpp#25731 (2026-07-15); unsloth GGUFs exist and are run via Unsloth Studio (its bundled engine not verified)"
+      },
+      "q4_k_m": {
+        "est_weights_gb": 167.3,
+        "fits_128gb_unified": "no",
+        "note": "est. 4.85 bits/weight x total stored params; 'yes' <=100 GB leaves room for KV/compute on a 128 GB Ryzen AI Max+ 395"
+      },
+      "aa_slug": "inkling-small",
+      "sources": [
+        "https://artificialanalysis.ai/leaderboards/models?open_weights=open_source",
+        "https://artificialanalysis.ai/models/inkling-small",
+        "https://huggingface.co/thinkingmachines/Inkling-Small/blob/main/config.json",
+        "https://huggingface.co/thinkingmachines/Inkling-Small/blob/main/README.md",
+        "https://github.com/huggingface/transformers/blob/main/src/transformers/models/inkling/modeling_inkling.py",
+        "https://github.com/ggml-org/llama.cpp/pull/25731",
+        "https://huggingface.co/api/models/thinkingmachines/Inkling-Small",
+        "https://github.com/ggml-org/llama.cpp/blob/master/src/llama-arch.cpp",
+        "https://github.com/ggml-org/llama.cpp/tree/master/conversion"
+      ],
+      "translator_families": [
+        "F2_swa_global_gqa",
+        "nope"
+      ]
+    },
+    {
+      "rank": 17,
+      "model": "K2 Horizon MoVA 36B A4B",
+      "creator": "Institute of Foundation Models (MBZUAI IFM)",
+      "aa": {
+        "name": "K2 Horizon MoVA 36B A4B",
+        "intelligence_index": 25.3,
+        "intelligence_index_raw": 25.3037790731435,
+        "estimated": false,
+        "release_date": "2026-09-03",
+        "context_window_tokens": 524288,
+        "variants": [
+          {
+            "name": "K2 Horizon MoVA 36B A4B",
+            "score": 25.3,
+            "estimated": false
+          }
+        ]
+      },
+      "hf_repo": "IFM/K2-Horizon-MoVA-36B-A4B",
+      "hf_repo_alternates": [
+        "IFM/K2-Horizon-MoVA-36B-A4B-GGUF"
+      ],
+      "release_date": "2026-09-03",
+      "hf_created_at": "2026-09-01",
+      "total_params_b": 36,
+      "active_params_b": 4,
+      "params_source": "model card: 36B stored / 4B per token (HF safetensors 37.4B)",
+      "params_inferred": null,
+      "hf_safetensors_params": 37444792020,
+      "moe": {
+        "kind": "MoE (+ Mixture-of-Values attention: 64 value experts, top-4)",
+        "routed_experts": 100,
+        "active_experts": 8,
+        "shared_experts": 1,
+        "note": "layers 0-2 dense MLP + plain attention; MoVA in layers 3-47"
+      },
+      "num_hidden_layers": 48,
+      "hidden_size": 2560,
+      "vocab_size": 250624,
+      "tokenizer": {
+        "family": "K2 Horizon byte-level BPE (250,000 base; identical to K2 Horizon 375B)",
+        "group": "T_K2H_250K"
+      },
+      "attention": {
+        "type": "full GQA; V produced by routed value experts (MoVA); softplus output gate",
+        "layer_pattern": "48 full-attention layers",
+        "global_layers": 48,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim_k": 128,
+        "head_dim_v": 128,
+        "mova_experts": 64,
+        "mova_active": 4
+      },
+      "positional": {
+        "type": "full RoPE",
+        "style": "rope_head_dim == head_dim (standard apply_rotary_pos_emb)",
+        "rotary_dims": 128,
+        "partial_rotary_factor": 1.0,
+        "rope_theta": 10000000.0,
+        "scaling": null,
+        "nope_layers": null
+      },
+      "max_context": {
+        "config_max_position_embeddings": 524288,
+        "card": null
+      },
+      "kv": {
+        "per_token_bytes_bf16": 196608,
+        "formula": "48 x 2 x 8 kv x 128 x 2B",
+        "per_token_kib_bf16": 192.0,
+        "total_at_128k_ctx_gib_bf16": 24.0
+      },
+      "llama_cpp": {
+        "supported": false,
+        "gguf_arch": null,
+        "note": "not in master; open PR ggml-org/llama.cpp#29535; official IFM/K2-Horizon-MoVA-36B-A4B-GGUF (incl. Q4_K_M) requires the MBZUAI-IFM llama.cpp fork per its card"
+      },
+      "q4_k_m": {
+        "est_weights_gb": 21.8,
+        "fits_128gb_unified": "yes",
+        "note": "est. 4.85 bits/weight x total stored params; 'yes' <=100 GB leaves room for KV/compute on a 128 GB Ryzen AI Max+ 395"
+      },
+      "aa_slug": "k2-horizon-mova-36b-a4b",
+      "sources": [
+        "https://artificialanalysis.ai/leaderboards/models?open_weights=open_source",
+        "https://artificialanalysis.ai/models/k2-horizon-mova-36b-a4b",
+        "https://huggingface.co/IFM/K2-Horizon-MoVA-36B-A4B/blob/main/config.json",
+        "https://huggingface.co/IFM/K2-Horizon-MoVA-36B-A4B/blob/main/README.md",
+        "https://huggingface.co/IFM/K2-Horizon-MoVA-36B-A4B/blob/main/modeling_k2_horizon.py",
+        "https://github.com/ggml-org/llama.cpp/pull/29535",
+        "https://huggingface.co/IFM/K2-Horizon-MoVA-36B-A4B-GGUF",
+        "https://huggingface.co/api/models/IFM/K2-Horizon-MoVA-36B-A4B",
+        "https://github.com/ggml-org/llama.cpp/blob/master/src/llama-arch.cpp",
+        "https://github.com/ggml-org/llama.cpp/tree/master/conversion"
+      ],
+      "translator_families": [
+        "F1_full_gqa"
+      ]
+    },
+    {
+      "rank": 18,
+      "model": "Hy3",
+      "creator": "Tencent",
+      "aa": {
+        "name": "Hy3",
+        "intelligence_index": 25.3,
+        "intelligence_index_raw": 25.2972775731571,
+        "estimated": false,
+        "release_date": "2026-07-06",
+        "context_window_tokens": 256000,
+        "variants": [
+          {
+            "name": "Hy3",
+            "score": 25.3,
+            "estimated": false
+          }
+        ]
+      },
+      "hf_repo": "tencent/Hy3",
+      "hf_repo_alternates": [
+        "tencent/Hy3-FP8",
+        "tencent/Hy3-preview (same tokenizer vocab)"
+      ],
+      "release_date": "2026-07-06",
+      "hf_created_at": "2026-07-02",
+      "total_params_b": 295,
+      "active_params_b": 21,
+      "params_source": "model card: 295B total / 21B active (+3.8B MTP)",
+      "params_inferred": null,
+      "hf_safetensors_params": 298786155776,
+      "moe": {
+        "kind": "MoE",
+        "routed_experts": 192,
+        "active_experts": 8,
+        "shared_experts": 1,
+        "note": "first layer dense"
+      },
+      "num_hidden_layers": 80,
+      "hidden_size": 4096,
+      "vocab_size": 120832,
+      "tokenizer": {
+        "family": "Hunyuan/Hy byte-level BPE (120,000 base; DeepSeek-style pre-tokenizer regex but different vocab)",
+        "group": "T_HY_120K"
+      },
+      "attention": {
+        "type": "full GQA with QK-norm",
+        "layer_pattern": "80 full-attention layers",
+        "global_layers": 80,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 8,
+        "head_dim_k": 128,
+        "head_dim_v": 128
+      },
+      "positional": {
+        "type": "full RoPE",
+        "style": "NeoX (llama.cpp LLAMA_ROPE_TYPE_NEOX)",
+        "rotary_dims": 128,
+        "partial_rotary_factor": 1.0,
+        "rope_theta": 11158840.0,
+        "scaling": null,
+        "nope_layers": null
+      },
+      "max_context": {
+        "config_max_position_embeddings": 262144,
+        "card": "256K"
+      },
+      "kv": {
+        "per_token_bytes_bf16": 327680,
+        "formula": "80 x 2 x 8 kv x 128 x 2B",
+        "per_token_kib_bf16": 320.0,
+        "total_at_128k_ctx_gib_bf16": 40.0
+      },
+      "llama_cpp": {
+        "supported": true,
+        "gguf_arch": "hy_v3"
+      },
+      "q4_k_m": {
+        "est_weights_gb": 178.8,
+        "fits_128gb_unified": "no",
+        "note": "est. 4.85 bits/weight x total stored params; 'yes' <=100 GB leaves room for KV/compute on a 128 GB Ryzen AI Max+ 395"
+      },
+      "aa_slug": "hy3",
+      "sources": [
+        "https://artificialanalysis.ai/leaderboards/models?open_weights=open_source",
+        "https://artificialanalysis.ai/models/hy3",
+        "https://huggingface.co/tencent/Hy3/blob/main/config.json",
+        "https://huggingface.co/tencent/Hy3/blob/main/README.md",
+        "https://huggingface.co/api/models/tencent/Hy3",
+        "https://github.com/ggml-org/llama.cpp/blob/master/src/llama-arch.cpp",
+        "https://github.com/ggml-org/llama.cpp/tree/master/conversion"
+      ],
+      "translator_families": [
+        "F1_full_gqa"
+      ]
+    },
+    {
+      "rank": 19,
+      "model": "Inkling",
+      "creator": "Thinking Machines Lab",
+      "aa": {
+        "name": "Inkling (Xhigh)",
+        "intelligence_index": 24.98,
+        "intelligence_index_raw": 24.9847810999384,
+        "estimated": false,
+        "release_date": "2026-07-15",
+        "context_window_tokens": 1000000,
+        "variants": [
+          {
+            "name": "Inkling (Xhigh)",
+            "score": 24.98,
+            "estimated": false
+          }
+        ]
+      },
+      "hf_repo": "thinkingmachines/Inkling",
+      "hf_repo_alternates": [
+        "thinkingmachines/Inkling-NVFP4"
+      ],
+      "release_date": "2026-07-15",
+      "hf_created_at": "2026-07-14",
+      "total_params_b": 975,
+      "active_params_b": 41,
+      "params_source": "model card: 975B total, 41B active",
+      "params_inferred": null,
+      "hf_safetensors_params": 952377623626,
+      "moe": {
+        "kind": "MoE",
+        "routed_experts": 256,
+        "active_experts": 6,
+        "shared_experts": 2,
+        "note": "dense MLP at layer index < 2 (dense_mlp_idx=2) (inferred)"
+      },
+      "num_hidden_layers": 66,
+      "hidden_size": 6144,
+      "vocab_size": 201024,
+      "tokenizer": {
+        "family": "o200k (OpenAI GPT-4o/gpt-oss) byte-level BPE: 199,998 base tokens identical to openai/gpt-oss-20b; own special tokens",
+        "group": "T_O200K"
+      },
+      "attention": {
+        "type": "hybrid local SWA (window 512) + global GQA; short convolutions on K and V (kernel 4) and on the residual stream",
+        "layer_pattern": "55 local + 11 global (global at [5, 11, 17, 23, 29, 35, 41, 47, 53, 59, 65]): 5 local : 1 global",
+        "global_layers": 11,
+        "swa_layers": 55,
+        "sliding_window": 512,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 8,
+        "head_dim_k": 128,
+        "head_dim_v": 128,
+        "swa_num_attention_heads": 64,
+        "swa_num_key_value_heads": 16,
+        "swa_head_dim": 128
+      },
+      "positional": {
+        "type": "no RoPE: learned query-dependent relative logit bias (d_rel=16; extent 1024 global / 512 local, zero beyond) + K/V short conv + log-length attention scaling (n_floor 128000, alpha 0.1)",
+        "style": "none",
+        "rotary_dims": 0,
+        "rope_theta": null,
+        "scaling": null,
+        "nope_layers": "all layers (cached K/V carry no rotary phase)"
+      },
+      "max_context": {
+        "config_max_position_embeddings": 1048576,
+        "card": null,
+        "note": "text_config.model_max_length"
+      },
+      "kv": {
+        "per_token_bytes_bf16": 45056,
+        "formula": "11 global x 2 x 8 kv x 128 x 2B",
+        "fixed_swa_bytes_bf16": 230686720,
+        "fixed_swa_formula": "55 local x 512 x 2 x 16 kv x 128 x 2B",
+        "conv_state_note": "plus fp32 short-conv states: 3 tokens x (2 x kv_dim + 2 x hidden) per layer",
+        "per_token_kib_bf16": 44.0,
+        "total_at_128k_ctx_gib_bf16": 5.71
+      },
+      "llama_cpp": {
+        "supported": false,
+        "gguf_arch": null,
+        "note": "InklingForConditionalGeneration not in master; open PR ggml-org/llama.cpp#25731 (2026-07-15); unsloth GGUFs exist and are run via Unsloth Studio (its bundled engine not verified)"
+      },
+      "q4_k_m": {
+        "est_weights_gb": 591.1,
+        "fits_128gb_unified": "no",
+        "note": "est. 4.85 bits/weight x total stored params; 'yes' <=100 GB leaves room for KV/compute on a 128 GB Ryzen AI Max+ 395"
+      },
+      "aa_slug": "inkling",
+      "sources": [
+        "https://artificialanalysis.ai/leaderboards/models?open_weights=open_source",
+        "https://artificialanalysis.ai/models/inkling",
+        "https://huggingface.co/thinkingmachines/Inkling/blob/main/config.json",
+        "https://huggingface.co/thinkingmachines/Inkling/blob/main/README.md",
+        "https://github.com/huggingface/transformers/blob/main/src/transformers/models/inkling/modeling_inkling.py",
+        "https://github.com/ggml-org/llama.cpp/pull/25731",
+        "https://huggingface.co/api/models/thinkingmachines/Inkling",
+        "https://github.com/ggml-org/llama.cpp/blob/master/src/llama-arch.cpp",
+        "https://github.com/ggml-org/llama.cpp/tree/master/conversion"
+      ],
+      "translator_families": [
+        "F2_swa_global_gqa",
+        "nope"
+      ]
+    },
+    {
+      "rank": 20,
+      "model": "Solar Open2 250B",
+      "creator": "Upstage",
+      "aa": {
+        "name": "Solar Open2 250B",
+        "intelligence_index": 24.74,
+        "intelligence_index_raw": 24.7365297627523,
+        "estimated": true,
+        "release_date": "2026-08-12",
+        "context_window_tokens": 1048576,
+        "variants": [
+          {
+            "name": "Solar Open2 250B",
+            "score": 24.74,
+            "estimated": true
+          }
+        ]
+      },
+      "hf_repo": "upstage/Solar-Open2-250B",
+      "hf_repo_alternates": null,
+      "release_date": "2026-08-12",
+      "hf_created_at": "2026-07-22",
+      "total_params_b": 250,
+      "active_params_b": 15,
+      "params_source": "model card: 250,287,794,944 total / 15B active",
+      "params_inferred": null,
+      "hf_safetensors_params": 250287810304,
+      "moe": {
+        "kind": "MoE",
+        "routed_experts": 320,
+        "active_experts": 8,
+        "shared_experts": 1
+      },
+      "num_hidden_layers": 48,
+      "hidden_size": 4096,
+      "vocab_size": 196608,
+      "tokenizer": {
+        "family": "Solar byte-level BPE (196,608; merges identical to Solar-Open-100B, 45 vocab entries differ)",
+        "group": "T_SOLAR_197K"
+      },
+      "attention": {
+        "type": "hybrid KDA-style linear attention + gated NoPE GQA",
+        "layer_pattern": "[Softmax, Linear x3] x 12: GQA at layers [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44]",
+        "global_layers": 12,
+        "linear_layers": 36,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 8,
+        "head_dim_k": 128,
+        "head_dim_v": 128,
+        "linear_heads": 64,
+        "linear_head_dim": 128,
+        "linear_short_conv": 4,
+        "extras": "use_gqa_gate=true; kda_allow_neg_eigval=true; kda_use_full_proj=false"
+      },
+      "positional": {
+        "type": "NoPE everywhere (use_rope=false); position from linear-attention recurrence",
+        "style": "none",
+        "rotary_dims": 0,
+        "rope_theta": null,
+        "scaling": null,
+        "nope_layers": "all 12 GQA layers"
+      },
+      "max_context": {
+        "config_max_position_embeddings": 1048576,
+        "card": "1M"
+      },
+      "kv": {
+        "per_token_bytes_bf16": 49152,
+        "formula": "12 GQA x 2 x 8 kv x 128 x 2B",
+        "recurrent_state_elems": 40402944,
+        "recurrent_state_bytes_bf16": 80805888,
+        "recurrent_state_bytes_fp32_state": 156303360,
+        "recurrent_formula": "36 linear layers x [64 x 128 x 128 + 3 x (3 x 64 x 128)] (KDA-style state shape inferred from linear_attn_config)",
+        "recurrent_inferred": true,
+        "per_token_kib_bf16": 48.0,
+        "total_at_128k_ctx_gib_bf16": 6.08
+      },
+      "llama_cpp": {
+        "supported": false,
+        "gguf_arch": null,
+        "note": "SolarOpen2ForCausalLM not in master (Solar-Open-100B maps to glm4moe); feature request ggml-org/llama.cpp#26115, no PR found; prometheusAIR/Solar-Open2-250B-GGUF ships a 951-line patch (arch name solar-open2)"
+      },
+      "q4_k_m": {
+        "est_weights_gb": 151.6,
+        "fits_128gb_unified": "no",
+        "note": "est. 4.85 bits/weight x total stored params; 'yes' <=100 GB leaves room for KV/compute on a 128 GB Ryzen AI Max+ 395"
+      },
+      "aa_slug": "solar-open2-250b",
+      "sources": [
+        "https://artificialanalysis.ai/leaderboards/models?open_weights=open_source",
+        "https://artificialanalysis.ai/models/solar-open2-250b",
+        "https://huggingface.co/upstage/Solar-Open2-250B/blob/main/config.json",
+        "https://huggingface.co/upstage/Solar-Open2-250B/blob/main/README.md",
+        "https://huggingface.co/prometheusAIR/Solar-Open2-250B-GGUF",
+        "https://github.com/ggml-org/llama.cpp/issues/26115",
+        "https://huggingface.co/api/models/upstage/Solar-Open2-250B",
+        "https://github.com/ggml-org/llama.cpp/blob/master/src/llama-arch.cpp",
+        "https://github.com/ggml-org/llama.cpp/tree/master/conversion"
+      ],
+      "translator_families": [
+        "F5_linear_hybrid",
+        "nope"
+      ]
+    }
+  ]
+}

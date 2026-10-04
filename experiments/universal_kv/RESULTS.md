@@ -1,0 +1,950 @@
+# Universal KV translator: results (October 2-4, 2026)
+
+One shared latent ("hub") now translates attention caches between four local models of
+three architectures and three tokenizers, and a `kvpark bridge switch` moves real
+conversations between running llama-servers on an EVO-X2-class machine (Ryzen AI Max+ 395,
+128 GB, Radeon 8060S). Design: [ARCHITECTURE.md](ARCHITECTURE.md). Survey of the top-20 open
+models: [survey/SURVEY.md](survey/SURVEY.md).
+
+| Model | Architecture | Attention cache | Tokenizer |
+| --- | --- | --- | --- |
+| Qwen3.8-27B (Q8) | hybrid: 48 gated-DeltaNet + 16 full-attention layers | 4 × 256, partial M-RoPE | Qwen3.5 (248K) |
+| Ornith-1.5-9B (Q8) | same family, 24 + 8 layers | 4 × 256 | Qwen3.5 (same) |
+| Qwen3-4B-Instruct-2507 (Q8) | dense GQA, 36 layers | 8 × 128, NeoX RoPE | Qwen2/3 (152K) |
+| Muse-Glimmer-30B (Q8) | 39 sliding (2,048) + 13 global NoPE layers | 2 × 128 | Llama 4 (202K) |
+
+## Summary
+
+The headline numbers, each with the section that measures it. Every live number comes from one
+machine shared with other work; the sections give the load and memory at each run.
+
+| What | Result | Section |
+| --- | --- | --- |
+| Hub quality (4 models, 3 tokenizers, 4,096 dims; held-out spans) | K R² 0.67–0.77, V 0.49–0.67 in all 12 directions; Qwen3.8 → Muse reaches 97% / 93% of a dedicated pairwise map | [1](#1-one-hub-for-four-models-test-tokens) |
+| Loss on held-out long chats (4.5–15K tokens, ≈2,048-token native tail) | Qwen3.8 → Ornith +0.016, → Muse +0.029, → Qwen3-4B +0.008 nats/token (the last with the native prompt start); Qwen3-4B as the source recovers 0–15% of the gap | [2](#2-end-to-end-loss-on-the-target-model) |
+| Agent traces with tool output | +0.295 nats/token Qwen3.8 → Muse (2-model hub); KL 0.40–0.50 into Qwen3.8: not usable | [2](#2-end-to-end-loss-on-the-target-model), [7](#7-hybrid-targets-what-the-recurrent-cell-starts-from-october-4-2026) |
+| Hybrid target, recurrent cell from the model's mean instead of zeros (Qwen3.8, native attention, chats, tails ≈1.4K / 2.4K / 4.4K) | +0.053 / +0.039 / +0.029 → +0.008 / +0.002 / +0.003 nats/token; KL lower on 12 of 12 documents at every tail on Qwen3.8 and on Ornith | [7](#7-hybrid-targets-what-the-recurrent-cell-starts-from-october-4-2026) |
+| The same with translated attention (Muse → Qwen3.8) | +0.129 / +0.102 / +0.061 → +0.097 / +0.064 / +0.027 nats/token | [7](#7-hybrid-targets-what-the-recurrent-cell-starts-from-october-4-2026) |
+| Live switches among Qwen3.8 (production DFlash2 build), Muse and Qwen3-4B, 11–14K tokens | 24 of 24 hops reused exactly T0; with the GPU engine a switch took 7.7–18.0 s against 14.8–86.0 s of native prefill | [6](#6-stage-2-live-october-3-2026-engine-daemon-the-production-qwen38-build-mtp-images) |
+| Engine, warm, 13K tokens | iGPU 0.45–0.47 s (Qwen3.8 → Muse) and 0.72–0.78 s (Muse → Qwen3.8); CPU with 16 BLAS threads 2.1–2.8 s; the one-shot engine before: 13.3 s | [6](#engine-daemon-first-job-after-a-prewarm-blas-threads) |
+| Into the dense Qwen3-4B after the assemble work | assemble 0.23–0.36 → 0.13–0.15 s on the same jobs; live engine 0.77–1.10 s | [8](#8-stage-4-october-4-2026-the-recurrent-mean-in-the-bridge-a-faster-assemble-deepseek-v4-switches) |
+| Hermes' request template options (`reasoning_effort`, `preserve_reasoning`, `enable_thinking: false`) | 8 of 8 switches into the production Qwen3.8 reused exactly T0 (stage 2 skipped them) | [6](#request-template-options-stage-3-october-3-2026) |
+| Muse → production Qwen3.8 with the recurrent mean | 6 of 6 reused exactly T0 with the right group; switch 0.9–3.2 s plus an 8.0–8.4 s tail against 41–59 s of native prefill | [8](#8-stage-4-october-4-2026-the-recurrent-mean-in-the-bridge-a-faster-assemble-deepseek-v4-switches) |
+| DFlash2 after a translated restore | 37% of drafted tokens accepted against 41% natively; the aligned dummy alone: 43.4% against 43.7% with the real draft state | [6](#6-stage-2-live-october-3-2026-engine-daemon-the-production-qwen38-build-mtp-images) |
+| MTP after a translated restore | 48% against 61%; the empty head cache alone costs about 5 points (55% against 60%) | [6](#6-stage-2-live-october-3-2026-engine-daemon-the-production-qwen38-build-mtp-images) |
+| Images, Muse → Qwen3.8 (vision) | every switch reused exactly T0; an image in the newest message got the native answer; with an image in an earlier message the translated prefix changed the outcome in 3 of 3 conversations (the target's own cache restored the same way did not) | [6](#6-stage-2-live-october-3-2026-engine-daemon-the-production-qwen38-build-mtp-images) |
+| Other cache families: MLA, DSA, KDA and GQA hybrids, DeepSeek V4 as a target | translated on random-weight fixtures and restored in llama.cpp; no such model downloaded, so no quality number | [8](#8-stage-4-october-4-2026-the-recurrent-mean-in-the-bridge-a-faster-assemble-deepseek-v4-switches), [ARCHITECTURE.md](ARCHITECTURE.md#what-the-translator-supports-today) |
+
+## 1. One hub for four models (test tokens)
+
+Fitted in closed form on the CPU (2 h) from 185,672 training spans: tokens that end at the
+same byte of the same chat segment in all four renderings (89% of the pairwise-aligned
+tokens). Hub of 4,096 dimensions per token, one for keys and one for values. Variance-
+weighted R² of the translated K / V against each target model's own cache, on 18,415
+held-out spans:
+
+| from \ to | Qwen3.8 | Muse | Qwen3-4B | Ornith |
+| --- | --- | --- | --- | --- |
+| Qwen3.8 | (0.87 / 0.81) | **0.747 / 0.616** | 0.769 / 0.539 | 0.749 / 0.668 |
+| Muse (global layers only) | 0.669 / 0.526 | (0.86 / 0.67) | 0.738 / 0.494 | 0.683 / 0.545 |
+| Qwen3-4B | 0.689 / 0.546 | 0.746 / 0.605 | (0.90 / 0.79) | 0.707 / 0.578 |
+| Ornith | 0.715 / 0.632 | 0.731 / 0.601 | 0.755 / 0.538 | (0.90 / 0.85) |
+
+- **Against a dedicated pairwise map** (Qwen3.8 → Muse, the v3 mapper, same spans): K 0.768,
+  V 0.665. The 4-model hub reaches 97% of the pairwise K R² and 93% of V while serving all
+  12 directions with 8 adapters. A 2-model hub at 2,048 dimensions reached 96% / 89%; Muse's
+  value spectrum needed the wider hub.
+- **The models share most of their cache geometry.** The top canonical eigenvalues of the
+  4-view CCA are 3.99 (K) and 3.98 (V) out of a maximum of 4: the leading directions are
+  near-perfectly shared by all four models. Even the 4,096th direction carries 1.35.
+- **Sliding-window sources work from their global layers.** Old tokens of Muse keep only its
+  13 global layers; the hub's dedicated encoder from those layers still reaches K 0.67–0.74.
+- **Same family is easiest.** Qwen3.8 ↔ Ornith (same tokenizer and layer types) has the best
+  values (0.67 / 0.63); values into Qwen3-4B are the hardest (0.49–0.55).
+
+### Adding a model without refitting the others
+
+Qwen3-4B was added to the existing Qwen3.8 + Muse hub (2,048 dims) with `fit_hub.py --base`,
+using Qwen3.8 and Muse as pivots and only Qwen3-4B's own captures; the other models' adapters
+stayed bit-identical. Against a 3-model hub fitted jointly at the same size:
+
+| Pair | K onboarded | K joint | V onboarded | V joint |
+| --- | --- | --- | --- | --- |
+| Qwen3.8 → Qwen3-4B | 0.754 | 0.756 | 0.514 | 0.516 |
+| Muse → Qwen3-4B | 0.727 | 0.729 | 0.468 | 0.471 |
+| Qwen3-4B → Qwen3.8 | 0.655 | 0.675 | 0.482 | 0.511 |
+| Qwen3-4B → Muse | 0.715 | 0.735 | 0.533 | 0.555 |
+| Qwen3.8 → Muse (existing) | 0.740 | 0.737 | 0.591 | 0.587 |
+
+Decoding *into* the new model is as good as a joint fit; encoding *from* it loses 0.02–0.03.
+A new model therefore costs one capture run on the hub corpus and a few ridge fits (15 minutes
+on the CPU for a 36-layer model), not a refit of every adapter.
+
+## 2. End to end: loss on the target model
+
+Seed-score on the GPU: the target restores the translated cache for [0, T0), natively
+prefills a tail of ≈2,048 tokens, and is scored (teacher-forced) on the first 256 tokens of the
+reply against its own full prefill. Restoring the target's own native state gives exactly 0
+in every run (sanity).
+
+**Qwen3.8 → Muse, 22 held-out conversations (2-model hub, 2,048 dims; table fill):**
+
+| Content | Hub | Dedicated pairwise map |
+| --- | --- | --- |
+| Chat, 4–8K tokens (10) | **+0.038** | +0.021 |
+| Real multi-turn chat, 8–16K (3) | **+0.034** | +0.029 |
+| Concatenated sessions, 8–16K (5) | +0.060 | +0.056 |
+| Agent traces with tool output, 8–16K (4) | +0.295 | +0.282 |
+| All, token-weighted | +0.059 [0.036, 0.089] | +0.048 [0.026, 0.075] |
+
+The hub costs +0.012 [0.004, 0.023] nats/token over a map trained for exactly this pair; chat
+stays within the 0.05 target. Agent traces fail with either (see experiments/linear_transfer
+RESULTS_v3b.md: two-thirds of that loss is in table-filled template cells).
+
+**All four models, 4-model hub (4,096 dims), 8 held-out long chats per pair (4.5K–15K tokens;
+SmolTalk2 real and concatenated multi-turn), loss increase vs the target's own prefill
+(token-weighted, document-bootstrap 95% CI) and mean KL.** Conditions: `hub` = translated
+cache, uncovered cells filled with the decoder mean; `floor` = no information (every cell the
+mean); `_prefix` = the same with the target's own values for its prompt start (system message,
+14–30 tokens), which a live switch gets from a short native prefill; `hub_table_prefix` = prefix
+plus per-token-id table fill.
+
+| Source → target | Docs | hub | floor | hub_prefix | floor_prefix | hub_table_prefix |
+| --- | ---: | --- | --- | --- | --- | --- |
+| Qwen3.8 → Ornith | 8 | +0.016 [-0.011, +0.044] · KL 0.05 | +0.737 [+0.120, +1.559] · KL 0.80 | +0.027 [+0.004, +0.052] · KL 0.06 | +0.054 [+0.026, +0.095] · KL 0.10 | — |
+| Qwen3.8 → Muse | 8 | +0.029 [-0.011, +0.061] · KL 0.07 | +0.066 [+0.029, +0.106] · KL 0.13 | +0.083 [+0.038, +0.123] · KL 0.06 | +0.156 [+0.099, +0.221] · KL 0.14 | — |
+| Qwen3.8 → Qwen3-4B | 8 | +0.201 [+0.045, +0.362] · KL 0.77 | +0.188 [+0.053, +0.341] · KL 0.68 | +0.008 [-0.036, +0.059] · KL 0.06 | +0.033 [-0.016, +0.085] · KL 0.10 | +0.011 [-0.033, +0.066] · KL 0.06 |
+| Qwen3-4B → Muse | 8 | +0.066 [+0.011, +0.115] · KL 0.09 | +0.066 [+0.029, +0.106] · KL 0.13 | +0.126 [+0.068, +0.178] · KL 0.09 | +0.156 [+0.099, +0.221] · KL 0.14 | +0.098 [+0.079, +0.119] · KL 0.09 |
+| Qwen3-4B → Qwen3.8 | 8 | +0.068 [+0.036, +0.112] · KL 0.08 | +0.080 [+0.042, +0.128] · KL 0.10 | +0.067 [+0.040, +0.104] · KL 0.07 | +0.077 [+0.042, +0.119] · KL 0.09 | +0.070 [+0.044, +0.104] · KL 0.07 |
+| Qwen3-4B → Qwen3-4B (control: its own cache through the hub) | 8 | +0.193 [+0.027, +0.370] · KL 0.77 | +0.188 [+0.053, +0.341] · KL 0.68 | +0.014 [-0.020, +0.054] · KL 0.05 | +0.033 [-0.016, +0.085] · KL 0.10 | +0.014 [-0.021, +0.052] · KL 0.05 |
+
+What the pairs show:
+
+- **The attention sink decides dense and hybrid Qwen targets.** Qwen3-4B (dense) and the
+  Qwen3.5-family hybrids collapse when the first tokens of the prompt hold mean values: even
+  Qwen3-4B's *own* cache passed through the hub scores +0.193 (KL 0.77) that way, and +0.014
+  (KL 0.05, top-1 93%) once its first 14 tokens are native. With the native prompt start,
+  Qwen3.8 → Qwen3-4B meets the target (+0.008).
+- **Muse is the opposite:** it does better with the hub's values for its prompt start (+0.029)
+  than with its own (+0.083). The bridge therefore enables the native prefix per target model.
+- **Same family is easiest:** Qwen3.8 → Ornith +0.016 even with Ornith's recurrent state reset.
+- **The source matters more than R² suggests.** Qwen3.8 → Muse recovers 56% of the gap
+  (+0.029 vs floor +0.066) while Qwen3-4B → Muse recovers nothing (+0.066 vs +0.066) on the same
+  eight conversations, although both have K/V R² ≈ 0.75 / 0.61 into Muse; Qwen3-4B → Qwen3.8
+  recovers 15%. A small model's cache carries less of what a larger model needs from the old
+  context. Translating *into* the small model works (+0.008).
+- **Token tables** add nothing measurable on chat (+0.008 vs +0.011 into Qwen3-4B) but soften the
+  native-prefix penalty on Muse (+0.126 → +0.098); their value should show on template-heavy
+  agent conversations, which these pairs did not test.
+
+Recommended per-target setting (`kvpark bridge add`): native prefix **on** for the Qwen family
+(dense Qwen3, hybrid Qwen3.5/3.8/Ornith), **off** for Muse, and for the hybrids the recurrent
+mean of section 7 (`--recurrent-mean`); prefer a larger model as the source. Pairs that recover less than the floor gap are no better than a native prefill of the
+tail alone, so a switch from Qwen3-4B into a larger model is fast but adds no memory of the
+old context beyond what the native tail gives.
+
+
+## 3. Hybrid targets: resetting the recurrent state
+
+A hybrid target's recurrent state (gated DeltaNet) has no per-token form. Strategy R0 zeroes it
+and lets the native tail rebuild it. Measured alone (Qwen3.8 with its *native* attention cache,
+recurrent state zeroed at T0), six conversations:
+
+| Native tail | Chat (4 docs) | Agent trace (16.8K) |
+| --- | --- | --- |
+| ≈2.1–2.4K tokens | +0.028 to +0.064 | +0.112 |
+| ≈3.9–4.6K tokens | +0.016 to +0.033 | +0.123 |
+
+R0 is a usable baseline for chat with a 4K tail. Section 7 starts the cell from the model's mean
+of native cells instead, which removes most of this cost on chats; replaying the delta rule from
+decoded per-token inputs is future work.
+
+## 4. Live: switching freely between three running models
+
+Throwaway upstream llama-servers (85d5703a3, Vulkan, F16 cache, flash attention, one slot,
+`--slot-save-path`) for Qwen3.8-27B, Muse-Glimmer-30B and Qwen3-4B, all resident at once
+(MemAvailable 37 GB left). Two held-out long chats, each primed on Qwen3.8 and then moved with
+`kvpark bridge switch` along Qwen3.8 → Muse → Qwen3-4B → Qwen3.8 (4-model hub; native prefix
+on the Qwen targets). Before each hop the target also prefilled the same prompt natively, for
+the reference time.
+
+| Hop | Tokens reused by the target (= T0) | Time to first token: bridge vs native | Engine |
+| --- | --- | --- | --- |
+| Qwen3.8 → Muse | 12,962 | 9.7 s vs 63.7 s | 41.6 s (first use: model profiles built) |
+| Muse → Qwen3-4B | 6,136 | 2.8 s vs 7.8 s | 24.4 s (first use) |
+| Qwen3-4B → Qwen3.8 | 13,307 | 11.9 s vs 72.2 s | 15.8 s |
+| Qwen3.8 → Muse | 6,258 | 9.4 s vs 34.8 s | 9.2 s |
+| Muse → Qwen3-4B | 1,167 | 1.5 s vs 2.1 s | 6.5 s |
+| Qwen3-4B → Qwen3.8 | 6,464 | 10.8 s vs 39.0 s | 8.8 s |
+
+- **Every hop restored exactly T0 tokens and the target reused all of them**, across three
+  architectures and three tokenizers, in both directions and in a round trip.
+- **Cost of a hop with warm caches: engine 6–16 s (the one-shot CPU engine of the time; the
+  engine daemon of section 6 takes 0.5–3.7 s) + the native tail (~10 s on the big models)**,
+  i.e. 15–28 s against 35–72 s of native prefill for 6–13K-token conversations on the 27–30B
+  models; the gap grows with length (native ≈ P / 150 tok/s). Into the small Qwen3-4B a native
+  prefill is already quick (2–8 s), so a switch into it is not worth translating; the bridge's
+  per-target `min_handover` lets small models opt out.
+- **A bug the live runs found:** the bridge stored the engine interpreter with symlinks
+  resolved, so a venv's `bin/python` became the base interpreter and the engine ran on the
+  system numpy with reference (single-threaded) BLAS: 350 s instead of 6–10 s per translation.
+  Fixed (`registry.set_engine` keeps the venv path; regression test) together with a
+  per-model profile cache (GGUF metadata parsed once) and batched RoPE.
+- Earlier runs with two models (Qwen3.8 ↔ Muse, three chats) gave the same picture: 5 of 6 hops
+  restored and reused T0 (the sixth found a recurrent-state format detail, since fixed).
+
+## 5. Reproduce
+
+All under evidence/universal-kv/ (not shipped): captures (Qwen3-4B, Ornith; Qwen3.8 and Muse
+reuse linear-transfer run-v2/run-v3), hub2-d2048, hub4-d4096 (+ .log.jsonl), e2e-hub2-qwen38-muse,
+recurrent-reset-qwen38, live-bridge-qwen38-muse, live-bridge-3models-v2, pair-*, pair2-*, pair-self-*, token-tables. Commands are in each script's `--help`:
+fit_hub.py, score_translate.py, pair_eval.py, recurrent_reset.py, live_bridge.py. Sections 6-8
+list their own evidence directories.
+
+## 6. Stage 2 live (October 3, 2026): engine daemon, the production Qwen3.8 build, MTP, images
+
+The bridge now runs its engine as a resident daemon (`engine_daemon.py`, started and fed by
+`kvpark.bridge.engine_client`; the switch sends the job over a socket) on the iGPU (torch fp16,
+`~/venvs/rocm`) or the CPU (numpy, OpenBLAS). Same machine as section 4; every server was a
+throwaway instance on ports 18530-18536 with slot directories in scratch space, started and
+stopped by `live_bridge.py`. The load average and MemAvailable are recorded next to every timing
+in the evidence; other agents compiled and tested on the same machine during the runs (load
+up to 26), and the table gives the 1-minute load at each switch.
+
+- **Qwen3.8-27B (Q8)**: the production binary itself (kvpark-patched ROCm build with the
+  `.resume` sidecar, the DFlash2 Q8 M-RoPE draft at depth 7, the F16 mmproj, the contiguous
+  draft-position patch, reasoning effort xhigh, 8 context checkpoints) with the production
+  flags. Context 65,536 for the three-server hop table (memory: with all three servers and two
+  engine daemons MemAvailable was 20-27 GB and dipped to 4.9 GB while other agents ran builds;
+  262,144 would have taken 12 GB more), the production 262,144 for the draft, MTP and image runs.
+- **Muse-Glimmer-30B (Q8)** and **Qwen3-4B-Instruct-2507 (Q8)**: the upstream Vulkan build
+  85d5703a3 with the flags of section 4 (context 36,864).
+- **Engine**: hub4-d4096 converted to format 2. GPU: the daemon under the ROCm venv (torch
+  2.12, ROCm 7.14, `--device gpu`). CPU: the daemon under the experiment venv (numpy 2.5.3,
+  OpenBLAS, `--device cpu`, 16 BLAS threads, the new default). Before every switch the pair was
+  prewarmed as staging a switch in Hermes does. Native prompt start on for the Qwen targets.
+
+### Hop table: every ordered pair, GPU and CPU engine
+
+Two held-out chats that every template renders long: `multi_turn_reasoning_if_think:23743`
+(13,627 / 12,916 / 12,662 tokens on Qwen3.8 / Muse / Qwen3-4B) and `:18676` (12,076 / 11,862 /
+11,201). Each was primed on Qwen3.8 and moved along Qwen3.8 → Muse → Qwen3-4B → Qwen3.8 →
+Qwen3-4B → Muse → Qwen3.8, so every ordered pair ran once per conversation and engine. At each
+hop the target first prefilled the prompt natively (reference), then the bridge switched with
+the GPU engine and again with the CPU engine; a warm request prefilled the native tail
+(2,048 tokens). Engine s: the switch's engine step (client to daemon and back, translated slot
+written); switch total: everything from the source's save to the end of the tail prefill.
+
+| Conv. | Hop | T0 / P | Engine | Engine s | Restore s | Tail prefill s | Switch total s | Native prefill s | Reuse (cache_n = T0) | Load |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: |
+| 23743 | Qwen3.8 → Muse | 10,868 / 12,916 | GPU | 0.50 | 0.02 | 12.4 | 13.5 | 73.2 | yes | 2 |
+| 23743 | Qwen3.8 → Muse | 10,868 / 12,916 | CPU | 2.57 | 0.02 | 12.8 | 15.9 | 73.2 | yes | 2 |
+| 23743 | Muse → Qwen3-4B | 10,614 / 12,662 | GPU | 2.88 | 0.19 | 4.1 | 7.7 | 15.6 | yes | 3 |
+| 23743 | Muse → Qwen3-4B | 10,614 / 12,662 | CPU | 9.39 | 0.19 | 4.1 | 14.3 | 15.6 | yes | 3 |
+| 23743 | Qwen3-4B → Qwen3.8 | 11,579 / 13,627 | GPU | 3.65 | 0.14 | 8.5 | 14.8 | 47.2 | yes | 8 |
+| 23743 | Qwen3-4B → Qwen3.8 | 11,579 / 13,627 | CPU | 11.96 | 0.10 | 8.1 | 21.7 | 47.2 | yes | 10 |
+| 23743 | Qwen3.8 → Qwen3-4B | 10,614 / 12,662 | GPU | 3.02 | 0.21 | 4.1 | 7.7 | 15.6 | yes | 7 |
+| 23743 | Qwen3.8 → Qwen3-4B | 10,614 / 12,662 | CPU | 11.76 | 0.18 | 4.1 | 16.4 | 15.6 | yes | 9 |
+| 23743 | Qwen3-4B → Muse | 10,868 / 12,916 | GPU | 1.27 | 0.06 | 14.8 | 17.7 | 74.4 | yes | 14 |
+| 23743 | Qwen3-4B → Muse | 10,868 / 12,916 | CPU | 6.13 | 0.04 | 15.0 | 22.0 | 74.4 | yes | 19 |
+| 23743 | Muse → Qwen3.8 | 11,579 / 13,627 | GPU | 2.35 | 0.22 | 10.0 | 13.2 | 56.8 | yes | 21 |
+| 23743 | Muse → Qwen3.8 | 11,579 / 13,627 | CPU | 6.38 | 0.17 | 11.0 | 18.3 | 56.8 | yes | 23 |
+| 18676 | Qwen3.8 → Muse | 9,814 / 11,862 | GPU | 0.89 | 0.05 | 15.1 | 16.6 | 83.5 | yes | 21 |
+| 18676 | Qwen3.8 → Muse | 9,814 / 11,862 | CPU | 4.96 | 0.04 | 15.4 | 21.0 | 83.5 | yes | 21 |
+| 18676 | Muse → Qwen3-4B | 9,153 / 11,201 | GPU | 2.95 | 0.31 | 4.0 | 8.0 | 15.4 | yes | 20 |
+| 18676 | Muse → Qwen3-4B | 9,153 / 11,201 | CPU | 13.56 | 0.25 | 4.0 | 18.5 | 15.4 | yes | 20 |
+| 18676 | Qwen3-4B → Qwen3.8 | 10,028 / 12,076 | GPU | 2.59 | 0.17 | 9.2 | 12.6 | 51.4 | yes | 26 |
+| 18676 | Qwen3-4B → Qwen3.8 | 10,028 / 12,076 | CPU | 12.71 | 0.18 | 9.5 | 23.0 | 51.4 | yes | 24 |
+| 18676 | Qwen3.8 → Qwen3-4B | 9,153 / 11,201 | GPU | 3.30 | 0.28 | 4.1 | 8.3 | 14.8 | yes | 22 |
+| 18676 | Qwen3.8 → Qwen3-4B | 9,153 / 11,201 | CPU | 7.56 | 0.25 | 4.1 | 12.4 | 14.8 | yes | 23 |
+| 18676 | Qwen3-4B → Muse | 9,814 / 11,862 | GPU | 1.06 | 0.06 | 16.2 | 18.0 | 86.0 | yes | 19 |
+| 18676 | Qwen3-4B → Muse | 9,814 / 11,862 | CPU | 4.86 | 0.04 | 16.0 | 21.8 | 86.0 | yes | 19 |
+| 18676 | Muse → Qwen3.8 | 10,028 / 12,076 | GPU | 1.71 | 0.12 | 7.8 | 10.2 | 47.7 | yes | 15 |
+| 18676 | Muse → Qwen3.8 | 10,028 / 12,076 | CPU | 4.18 | 0.10 | 7.9 | 12.8 | 47.7 | yes | 13 |
+
+- **All 24 switches restored T0 cells and the next request reused exactly T0 tokens**, into
+  and out of the production DFlash2 server, across three architectures and three tokenizers.
+- **The engine is no longer the cost of a switch on the GPU.** Qwen3.8 → Muse took 0.50-0.89 s
+  (the one-shot engine: 13.3 s on a quiet machine, 9.2-41.6 s in section 4), Muse → Qwen3.8
+  1.7-2.4 s, Qwen3-4B → Muse 1.1-1.3 s. Switches into Qwen3-4B took 2.9-3.3 s and Qwen3-4B →
+  Qwen3.8 2.6-3.7 s. The dense model keeps 36 layers × 8 KV heads (36,864 values per token and
+  kind, against 16,384 for Qwen3.8's attention layers and 3,328 for Muse's global ones), so its
+  states are 1.3-1.6 GB at these lengths. Most of the extra time follows the target: into
+  Qwen3-4B, 1.4-2.0 s of each GPU switch went to the assemble stage (device-to-host copies into
+  the output arrays) against 0.05-0.2 s for the other targets (Qwen3-4B → Qwen3.8 paid it once
+  too, 2.1 s, and once 1.2 s of reading inputs at load 26 instead). The products themselves took
+  0.4-1.3 s with Qwen3-4B on either side against 0.2-0.4 s between Qwen3.8 and Muse. Section 8
+  takes the assemble stage of these targets to 0.13-0.16 s.
+- **CPU engine**: Qwen3.8 → Muse 2.6 s at load 2 and 5.0 s at load 21, Muse → Qwen3.8
+  4.2-6.4 s at load 13-23, pairs with Qwen3-4B 4.9-13.6 s (Qwen3-4B → Muse 4.9-6.1 s, the
+  others 7.6-13.6 s). A switch with it still beats the native prefill everywhere except into
+  Qwen3-4B, where it takes about as long as the 15-s native prefill.
+- **The native tail now dominates**: 12.4-16.2 s on Muse (Vulkan) for 2,048 tokens at
+  10-11K depth, 7.8-11.0 s on Qwen3.8 (ROCm), 4.0-4.1 s on Qwen3-4B. A switch with the GPU
+  engine took 13.5-18.0 s into Muse against 73-86 s of native prefill, 10.2-14.8 s into
+  Qwen3.8 against 47-57 s, and 7.7-8.3 s into Qwen3-4B against 15 s.
+- **Under load** the CPU-side stages slow down: for Qwen3.8 targets, reading the inputs
+  (renders, the hybrid template and native-prefix states) took 1.1-1.8 s in the 6 switches at
+  load 13-26 and 0.14-0.19 s at load 8-10.
+- **Prewarm (stage time, not part of a switch)**: 20-22 s for the first pair of a new bridge
+  directory (GGUF profiles parsed, hub files hashed once), then 0.2-7.7 s; the warm-up
+  products took 0.2-0.9 s on the GPU and 0.1-4.3 s on the CPU.
+- **Into the production DFlash2 server** the bridge read the draft from the template's own
+  `.resume` (base without layers, 5 sliding-window layers, M-RoPE cells), wrote the 41,216-byte
+  aligned dummy, and the server accepted the restore. The 32 tokens generated after each of the
+  8 translated restores drafted 25/40 to 25/42, 26/31 and 25/32 accepted (GPU and CPU runs
+  alike) against 23/48 and 24/39 after a native prefill. The server log has no draft-position
+  warning (`ctx_dft pos_max`), no position error and no failed decode.
+- **Agreement of the first 32 generated tokens with the native run**: into Muse 19 (`:23743`)
+  and 1 (`:18676`), into Qwen3-4B 0 and 32, into Qwen3.8 0 and 2 (its output starts with its
+  reasoning). Quality is
+  measured in sections 2-3, not here.
+- The first conversation picked (`:18905`, 12,768 tokens on Qwen3.8) renders to 121 tokens with
+  Qwen3-4B's template, which drops earlier reasoning: Muse → Qwen3-4B was correctly skipped as
+  `short`, and the run was restarted with conversations that every template renders long.
+
+### Speculative decoding after a translated restore (production Qwen3.8 target)
+
+Muse → Qwen3.8, three held-out chats, GPU engine, no warm request (as Hermes switches). The
+target generated 256 tokens at temperature 0 after a native prefill and after the switch
+(the same prompt tokens). DFlash2: the production configuration; MTP: the same binary with
+the rollback settings of the production configuration (`--spec-type draft-mtp`, the MTP-only
+Q8 head, depth 4). The bridge recognized the MTP state (one full-attention layer, `/slots`
+`draft-mtp`) and restored it with the 16-byte empty marker.
+
+| Draft | Conv. | P / T0 | Native: accepted / drafted | Translated: accepted / drafted | Tokens/s native / translated | Native prefill s | Switch + prefill s | Reuse |
+| --- | --- | --- | --- | --- | --- | ---: | --- | --- |
+| DFlash2 | 18905 | 12,768 / 10,720 | 200/381 = 0.52 | 182/499 = 0.36 | 25.4 / 19.4 | 44.1 | 2.0 + 8.1 | yes |
+| DFlash2 | 23743 | 13,627 / 11,579 | 194/420 = 0.46 | 175/547 = 0.32 | 22.8 / 17.4 | 47.2 | 1.5 + 8.1 | yes |
+| DFlash2 | 595 | 15,355 / 13,307 | 172/576 = 0.30 | 193/427 = 0.45 | 16.7 / 22.3 | 54.3 | 1.8 + 8.4 | yes |
+| MTP | 18905 | 12,768 / 10,720 | 189/264 = 0.72 | 166/349 = 0.48 | 20.5 / 15.4 | 43.6 | 2.0 + 7.8 | yes |
+| MTP | 23743 | 13,627 / 11,579 | 184/278 = 0.66 | 162/368 = 0.44 | 19.1 / 14.7 | 48.4 | 1.5 + 8.0 | yes |
+| MTP | 595 | 15,355 / 13,307 | 168/348 = 0.48 | 172/329 = 0.52 | 15.4 / 16.3 | 53.7 | 1.6 + 8.3 | yes |
+
+- **DFlash2 keeps working after a translated restore**: 550/1473 = 0.37 accepted against
+  566/1377 = 0.41 natively, overall. Per conversation the difference goes both ways (0.36 vs
+  0.52, 0.32 vs 0.46, 0.45 vs 0.30), because the two runs generate different text (they agree
+  on no generated token: the translated cache changes the answer). The aligned dummy worked
+  on the production build's draft-local position counter: no `ctx_dft pos_max` warning and no
+  position error in any of the runs above.
+- **MTP loses more**: 500/1046 = 0.48 against 541/890 = 0.61 natively (0.48 vs 0.72, 0.44 vs
+  0.66, 0.52 vs 0.48). The MTP head starts empty after a restore and sees only the native tail
+  and what follows, as expected from the empty marker. Generation ran at 14.7-16.3 tokens/s
+  after the restore against 15.4-20.5 natively. The text differs between the runs as well; the
+  controls below separate the two: the empty marker alone costs 0.05 of the 0.13.
+- Either way the switch saves most of the prefill: 1.5-2.0 s for the switch plus 7.8-8.4 s for
+  the 2,048-token tail against 44-54 s of native prefill.
+
+### Images: Muse (no vision) → Qwen3.8 (vision)
+
+The 7 messages of `:18905` with an image, a generated bar chart (five bars,
+blue, orange, green, red, purple; the red one tallest; `media/chart.png`). The source Muse has
+no vision, so it was primed on the conversation without the image; the real chat request
+then went to Qwen3.8 with the image, after a native prefill and after the switch. Question:
+"How many bars does this chart have, and which color is the tallest bar?"
+
+| Case | T0 (capped at) | Reused (cache_n) | Prefilled by the target | Native prefill | Switch | Answer after the switch |
+| --- | --- | --- | --- | --- | --- | --- |
+| image in the newest message | 11,403 (P − tail) | 11,403 | 2,201 tokens in 9.4 s | 13,604 tokens in 47.2 s | 2.6 s | 'The chart contains **5 bars** (blue, orange, green, red, and purple, from left to right). The tallest bar is **red**.' |
+| image in message 3 of 8 | 7,311 (start of message 3) | 7,311 | 6,300 tokens in 23.9 s | 13,611 tokens in 47.2 s | 1.3 s | 'the chart has 5 bars, and the tallest bar is red.' |
+
+- **Both cases reused exactly T0**; the image and everything after it were prefilled natively.
+  With the image in the newest message the request took 22.2 s end to end (prefill and 283
+  generated tokens) after a 2.6-s switch, against 62.3 s natively (326 tokens), and the answer
+  was identical to the native one ("5 bars (blue, orange, green, red, and purple, from left to
+  right). The tallest bar is red."). DFlash2 accepted 212/497 after the switch against 242/588
+  natively.
+- **Image in an earlier message**: T0 stopped at the start of that message (7,311 of 13,487
+  tokens), and the target prefilled 6,300 tokens with the image in 23.9 s against 47.2 s. The
+  final answer was right ("the chart has 5 bars, and the tallest bar is red"), but the reasoning
+  before it began by stating that no chart was attached, and ran 751 tokens against 522
+  natively. Positions and cache bookkeeping were exact (the image cells sit at native M-RoPE
+  positions after T0; no position or mtmd error in the log). The controls below restore the
+  target's own cache of the same [0, T0) the same way, and that run reasons and answers like
+  the native one: the doubt comes from the translated values in front of the image, the
+  caveat of plan section 1, not from the restore.
+- **Qwen3.8 → Muse with the image is skipped** (`target-no-vision`) before either server is
+  touched.
+- **A first attempt reused nothing** (cache_n 0 in both cases; evidence in
+  `media-thinking-off-requests`): the test's chat requests carried
+  `chat_template_kwargs: {enable_thinking: false}`. Qwen3.8's template writes the reasoning
+  effort into the system prompt and drops it without thinking, so the real request differed
+  from the bridge's rendering right after `<|im_start|>system`, and the hybrid model, which
+  cannot roll back, reprocessed everything. The bridge now also renders with the request's
+  `chat_template_kwargs` and `reasoning_effort` and stops T0 where that rendering departs from
+  the default one; for Qwen3.8 that is the system prompt, so such a switch is skipped
+  (`template-options`, verified on the same server) instead of translating cells nothing will
+  reuse (a template whose options change only the generation prompt, like classic Qwen3's
+  `enable_thinking`, loses nothing). Hermes passes these fields from the real request. Stage 3
+  made the engine render with them, and such switches now translate: see
+  [Request template options](#request-template-options-stage-3-october-3-2026) below.
+
+### Controls: the target's own cache restored like a translated one
+
+The comparisons above set a translated restore against a native prefill, and the two runs
+generate different text, so they mix three things: the draft state the bridge synthesizes,
+the translated cells, and the text those lead to. `live_bridge.py drafts-control` and
+`media-control` add the missing control with the same server setup (the production Qwen3.8
+binary at context 262,144 with the flags above; Muse on Vulkan as the source; GPU engine;
+load 2.4-4.7, MemAvailable 21.8-27.8 GiB): after the native run and the translated switch,
+the target prefills [0, T0) of the same prompt itself, saves its slot, erases it and restores
+it as a switch restores a translated file, either with the draft state the bridge synthesizes
+(the 41,216-byte DFlash aligned dummy, the 16-byte empty MTP marker) or with the server's own
+`.resume`. Its target cells are then native, so only the draft state differs between the
+two. The native and translated runs reproduced the counts above exactly (temperature 0).
+
+| Draft | Conv. | T0 / P | Native prefill | Translated switch | Own cache, synthesized draft state | Own cache, its real draft state | Own runs agree with native for |
+| --- | --- | --- | --- | --- | --- | --- | ---: |
+| DFlash2 | 18905 | 10,720 / 12,768 | 200/381 = 0.52 | 182/499 = 0.36 | 195/412 = 0.47 | 196/405 = 0.48 | 30 tokens |
+| DFlash2 | 23743 | 11,579 / 13,627 | 194/420 = 0.46 | 175/547 = 0.32 | 195/418 = 0.47 | 195/418 = 0.47 | 231 tokens |
+| DFlash2 | 595 | 13,307 / 15,355 | 172/576 = 0.30 | 193/427 = 0.45 | 184/493 = 0.37 | 184/493 = 0.37 | 20 tokens |
+| DFlash2 | all | | 566/1377 = 0.411 | 550/1473 = 0.373 | 574/1323 = 0.434 | 575/1316 = 0.437 | |
+| MTP | 18905 | 10,720 / 12,768 | 189/264 = 0.72 | 166/349 = 0.48 | 177/308 = 0.57 | 181/292 = 0.62 | 30 tokens |
+| MTP | 23743 | 11,579 / 13,627 | 184/278 = 0.66 | 162/368 = 0.44 | 180/298 = 0.60 | 185/278 = 0.67 | 231 tokens |
+| MTP | 595 | 13,307 / 15,355 | 168/348 = 0.48 | 172/329 = 0.52 | 168/344 = 0.49 | 173/327 = 0.53 | 20 tokens |
+| MTP | all | | 541/890 = 0.608 | 500/1046 = 0.478 | 525/950 = 0.553 | 539/897 = 0.601 | |
+
+- **The DFlash2 aligned dummy costs nothing measurable**: 0.434 against 0.437 with the
+  server's real draft state, the same counts in two of the three conversations (the window
+  of 2,047 native tail tokens covers everything the draft attends to at its first step).
+- **The empty MTP marker costs about 0.05**: 0.553 against 0.601, and here both own-cache runs
+  generated the same 256 tokens in every conversation, so this is the MTP head missing
+  [0, T0) and nothing else. Generation ran at 15.6-18.1 tokens/s with the marker against
+  16.3-19.2 with the real state.
+- **The rest is the translated cells and the text they lead to.** Even the target's own cache,
+  prefilled in two steps ([0, T0), then the tail) instead of one, generates text that departs
+  from the single native prefill after 20-231 tokens, and acceptance over 256 tokens moved
+  with it by -0.05, 0 and +0.07 (DFlash2). The translated runs differ from the own-cache runs
+  by -0.11, -0.15 and +0.08 (DFlash2) and -0.10, -0.16 and +0.03 (MTP against the
+  synthesized marker): with three conversations, a cost of the translated cells for drafting
+  is likely but not separated from text variance. No draft-position warning, position error
+  or failed decode in any run.
+
+The same for the image in an earlier message, on three conversations (case (ii) of the
+previous section, 1,200 answer tokens with reasoning): the image's message and everything
+after it are prefilled natively in all three runs, and only the cells in front of the image
+differ.
+
+| Conv. | Image in message | T0 / P | Native prefill | Translated switch | Own cache, restored the same way |
+| --- | --- | --- | --- | --- | --- |
+| 18905 | 3 of 8 | 7,311 / 13,487 | 5 bars, red tallest; 522 tokens | right answer, but the reasoning first says no chart is attached; 751 tokens | the native reasoning and answer, word for word; 426 tokens |
+| 23743 | 3 of 8 | 6,242 / 14,228 | 5 bars, red (the fourth) tallest; 425 tokens | the reasoning, in a terse style, finds 5 bars and red, then runs to the 1,200-token limit without an answer | the native reasoning opening, the same answer in other words; 433 tokens |
+| 595 | 15 of 26 | 9,785 / 16,052 | 5 bars, red tallest, written in capitals; 284 tokens | right answer, in normal case; 394 tokens | identical to native (the same 284 tokens and draft counts) |
+
+- **Every run reused exactly T0** (cache_n = T0) and the server logged no position, decode or
+  mtmd error. The switch took 1.4-1.8 s, and the request after it prefilled 6,300-8,110
+  tokens with the image in 24-31 s against 48-59 s natively.
+- **The restore path is not what changes the answers.** The target's own cache restored
+  through the same path (with the bridge's aligned dummy) answered like the native prefill in
+  all three conversations, so the image cells after a restored prefix sit where they should.
+  The translated prefix did change the outcomes: a doubted image, a reasoning that never
+  reached its answer within 1,200 tokens, and a formatting request from earlier in the
+  conversation that was no longer followed. This is the translation quality of sections 2-3
+  (plan section 1), seen here in a vision request.
+- **Request template options** (the stage 2 rule, on the same server; stage 3 translates such
+  switches, below): a switch whose request
+  sets `chat_template_kwargs: {enable_thinking: false}` rendered differently from token 3 on
+  (inside Qwen3.8's system prompt) and was skipped (`template-options`); one with
+  `reasoning_effort: high`, which Qwen3.8's template maps to its default, rendered the same
+  and switched as usual (T0 10,720, reused exactly).
+
+### Engine daemon: first job after a prewarm, BLAS threads
+
+`bench_engine.py prewarm` (a fresh daemon per run, started by `engine_client` as a switch
+starts it, prewarmed for the pair, then a first and a second job; run-v3b document 3b211f08,
+T0 12,962 / 13,307, load 2.4-4.2) and `bench_engine.py warm --device cpu` (load 3.7-8.8,
+partly from the runs themselves):
+
+| | Qwen3.8 → Muse | Muse → Qwen3.8 |
+| --- | --- | --- |
+| GPU, first job after a plain load | 0.69-0.71 s | 0.95-0.96 s |
+| GPU, first job after load + warm-up products (0.35 s) | 0.51-0.52 s | 0.76 s |
+| GPU, second job | 0.45-0.47 s | 0.72-0.78 s |
+| CPU, 8 BLAS threads, warm | 2.75-2.85 s | 3.94-3.96 s |
+| CPU, 16 BLAS threads, warm | 2.10-2.16 s | 2.75-2.78 s |
+
+The warm-up (the switch's products once on zero rows, the RoPE checks, both vocabularies and
+the chat template) removes most of the first-job overhead; what remains (about 0.05 s) is
+reading a new source file, allocating the output and the job's last window, whose row count
+depends on T0 and so is not one of the warmed shapes. The warm-up holds only while the sides
+stay loaded: the daemon drops them after `--idle-unload` (120 s) and exits after
+`--idle-exit` (600 s), while a staged switch lasts 15 minutes. The CPU default is now one BLAS thread
+per physical core, at most 16: the servers sit idle while a switch translates.
+
+Evidence: `evidence/universal-kv/live-stage2-20261003/` (`hops/`, `drafts-dflash2/`,
+`drafts-mtp/`, `media/`, `media-thinking-off-requests/`, `drafts-control-dflash2/`,
+`drafts-control-mtp/`, `media-control/`: server logs and JSON per switch; `engine-logs/`: the
+daemons' logs; `bench/`: the prewarm and thread benchmarks). Commands: `live_bridge.py
+hops|drafts|media|drafts-control|media-control --help`, `bench_engine.py prewarm|warm --help`.
+
+### Request template options (stage 3, October 3, 2026)
+
+The engine now renders the target with the request's `chat_template_kwargs` and
+`reasoning_effort`, building the template context llama-server builds for a request
+(`chat.server_context`: the kwargs, the effort, `preserve_reasoning`, the server's default
+variables), and checks that the target server's tokens spell that rendering byte for byte.
+`live_bridge.py options`: Muse (Vulkan 85d5703a3) primed two held-out chats and was stopped; a
+stub then served its saved slots while the production Qwen3.8 binary (DFlash2 draft, F16 mmproj,
+production flags, context 65,536) and Qwen3-4B ran with the GPU engine daemon. Each switch had
+no warm request, as Hermes switches; the real chat request followed with the same options. The
+1-minute load was 5-9 with other agents' GPU work, MemAvailable 41-47 GiB.
+
+| Conv. | Options | P | T0 = cache_n | Switch s | Engine s | Tail prefill s | Native prefill s |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 23743 | none | 13,627 | 11,579 | 4.07 | 1.45 | 20.1 | 79.7 |
+| 23743 | Hermes' `reasoning_effort: medium` | 13,589 | 11,541 | 2.86 | 1.41 | 19.2 | |
+| 23743 | Hermes' pair (`medium` and `preserve_reasoning: true`) | 13,589 | 11,541 | 1.80 | 1.30 | 19.6 | |
+| 23743 | `enable_thinking: false` | 13,591 | 11,543 | 1.43 | 1.06 | 18.7 | |
+| 18676 | none | 12,076 | 10,028 | 2.36 | 1.84 | 18.2 | 102.3 |
+| 18676 | Hermes' `reasoning_effort: medium` | 12,038 | 9,990 | 2.01 | 1.47 | 21.0 | |
+| 18676 | Hermes' pair | 12,038 | 9,990 | 1.70 | 1.17 | 18.1 | |
+| 18676 | `enable_thinking: false` | 12,040 | 9,992 | 2.12 | 1.76 | 17.0 | |
+
+- **All 8 switches reused exactly T0.** The requests with options share 3 tokens with the
+  default rendering (Qwen3.8 writes the effort into its system prompt), so stage 2 skipped them
+  (`template-options`). The template's own defaults matched the server's tokens every time
+  (`rendering: template`).
+- The switch times include the native prompt start's prefill where it was not cached yet (1.7 s
+  for the first switch, 0.9 s for the first one whose system prompt the options change). Native
+  prefill took 80-102 s and the 2,048-token tail 17-21 s here, against 47-57 s and 8-11 s in the
+  hop table above: the GPU was shared, so compare ratios, not seconds. Rendering with options
+  cost 3-12 ms per job.
+- DFlash2 got the 41,216-byte aligned dummy each time; the Qwen3.8 log has no draft-position
+  warning, position error or failed decode.
+- Into Qwen3-4B on the same run (default rendering, a warm request prefilling the tail): 4 of 4
+  reused T0 (10,614 and 9,153); engine 1.93-2.21 s, of which assemble 0.49-0.90 s; switch total
+  8.9-9.2 s with a 6.1-6.5 s tail. Section 8 has the same four hops after the assemble work.
+
+Evidence: `evidence/universal-kv/stage3-engine-20261003/` (`options/`: `options.json`, server
+and engine logs; `kept/`: the Qwen3-4B jobs; `bench-loaded/`, `bench-unloaded/`: assemble
+replays). Commands: `live_bridge.py options --help`, `bench_engine.py job --help`.
+
+## 7. Hybrid targets: what the recurrent cell starts from (October 4, 2026)
+
+Section 3 reset a hybrid target's recurrent cell to zero at T0 - 1 (R0) and let the native tail
+rebuild it. `recurrent_init.py` now builds that cell with one of several strategies, and
+`r0_experiments.py` measures each one on Qwen3.8-27B and Ornith-1.5-9B the way
+`recurrent_reset.py` did: the target keeps its own native attention cache at T0, only the
+recurrent cell (the conv rows R and delta-rule rows S of every recurrent layer) is replaced, and
+the first 256 tokens of the final message are seed-scored against the target's native full
+prefill (Vulkan probe, F16 cache, flash attention). A second experiment does the same with
+translated attention (Muse → Qwen3.8 through the hub).
+
+| Strategy | The cell at T0 - 1 |
+| --- | --- |
+| zero | every row zero (R0; what translate.py wrote before section 8, and still its default without a mean) |
+| mean | per-layer mean of the target's native cells over training conversations (all of them) |
+| mean-match | the same mean over the conversation's group: `tools` when it declares tools, else `chat` |
+| mean_conv | R from the mean, S zero |
+| mean_s0.5 | R from the mean, S half the mean |
+| prefix | the cell after the native prompt start that the bridge already prefills for Qwen targets (the bridge's rule: the system message less 2 tokens, H = 48 tokens on Qwen3.8 and 10 on Ornith; 497 / 459 for the agent traces' tool prompt) |
+
+**Calibration** (`r0_experiments.py calibrate`, once per model). The source conversations are the
+training split of corpus v2 and v3: 204 conversations, none of them an evaluation conversation.
+They are joined per source into long sessions: 16 chat sessions of about 48K characters and 3
+smolagents sessions that share one tool list. The 33 Hermes function-calling conversations each
+have their own tools and stay alone. A native save is taken every 1,024 tokens from depth 1,024
+to 16,384: on Qwen3.8 209 saves of 25 documents (227K tokens), 166 in the `chat` group and 43 in
+`tools`; on Ornith, whose tokenizer makes one chat session shorter, 208 saves (165 `chat`). The
+`tools` group is mostly smolagents: 36 of its 43 saves come from the 3 smolagents sessions (39K
+tokens), 7 from Hermes function-calling conversations of 1-2K tokens. The smolagents sessions
+share the evaluation traces' system prompt and tool list.
+
+- **The GDN state has a large shared part.** On the calibration saves the mean explains 82% of
+  the S rows' energy on Qwen3.8 and 83% on Ornith (48-85% per layer), and 63% / 65% of the R
+  rows'. On the held-out documents below, the mean's S error is 0.12-0.36 of the true state's
+  energy on chats and 0.18-0.43 on the agent traces (0.12-0.31 for the matched `tools` mean).
+  Zero's error is 1 and prefix's 0.45-0.76.
+- **One mean serves every depth.** The means of the depth bins 1K, 2-3K, 4-7K and 8-16K lie
+  within 0.2-4% of the energy from the overall mean (4% only for the 1K bin's S).
+- **The groups differ.** The `chat` and `tools` means are 9% of the S energy apart on Ornith.
+  That is more than half of what the mean leaves unexplained.
+- **Cost.** The calibration is 227K tokens of native prefill per model: 24 min for Qwen3.8 and
+  13 min for Ornith, with the two runs concurrent on the 8060S. Alone on the GPU, the save passes
+  of the exact-tail runs below prefilled about 210 tokens/s on Qwen3.8 and 720 on Ornith (model
+  load included), so the calibration alone takes about 18 min and 5 min. Reading the saves
+  adds 86 s / 45 s. Stored as float16 npz, a group takes 78 MB for Qwen3.8 and 26 MB for Ornith
+  (all three groups: 235 MB / 79 MB). A switch needs one group. Per switch, loading it takes
+  0.16 s / 0.07 s (cacheable in the engine daemon) and building the cell 2-120 ms. There is no
+  extra prefill.
+
+**Documents.** These are the 12 held-out conversations of run-v3b's 8-16K bucket, each rendered
+with the target's own template. 8 are chats (5 concatenated sessions, 3 multi-turn reasoning)
+and 4 are smolagents tool-calling traces, P = 8.5K-16.8K tokens. T0 = P - W rounded down to the
+512 grid for W = 1,024 / 2,048 / 4,096. The native tails are then 1.0-1.5K / 2.1-2.6K / 4.1-4.6K
+(means in the table headers), and T0 runs from 4,096 to 15,360. In these grid runs the sanity
+condition (the native save at T0 itself) scores exactly 0 on every document. A first attempt saved the prefix state in
+the same pass as the T0 states. That split the first ubatch at H, so the saves at T0 came from
+another ubatch partition than the reference, and the sanity condition read up to 0.005 (Ornith).
+The prefix is now saved by a separate probe record.
+
+**How to read the agent rows.** On the agent traces, the loss on the reference final message is
+not a fidelity measure. Resetting the state *lowers* it below the native prefill on all four
+traces on Ornith (-0.06 to -0.29). On Qwen3.8 it is -0.04 to -0.08 on two traces (+0.008 at one
+tail) and +0.08 to +0.14 on the other two (the 16.8K one is section 3's trace). What a switch
+should preserve is the target's own next-token distribution, so the agent tables give KL to the
+native prefill first.
+
+**The agent rows are indicative.** There are 4 traces, all smolagents, and they score 46, 48, 168
+and 44 tokens, so the 168-token trace carries 55% of every token-weighted agent mean. A bootstrap
+over 4 documents has at most 35 distinct resamples, so the agent CIs are much rougher than the
+chat ones. The per-trace KL values are in `summary.md` (column "KL doc mean": the plain mean over
+traces) and below where they matter.
+
+### Native attention + each strategy
+
+Cells: chats ΔNLL [95% document-bootstrap CI] · mean KL; agent traces KL [95% CI] · ΔNLL. In
+parentheses: on how many documents the strategy's KL is below zero's. Tails are P - W rounded
+down to the 512 grid, so the columns hold the measured mean tails; the exact tails 512, 1,024 and
+2,048 follow in their own table below.
+
+**Qwen3.8-27B, 8 chats:**
+
+| Strategy | tail ≈1.4K | tail ≈2.4K | tail ≈4.4K |
+| --- | --- | --- | --- |
+| zero | +0.053 [+0.033, +0.080] · 0.045 | +0.039 [+0.021, +0.064] · 0.037 | +0.029 [+0.013, +0.050] · 0.024 |
+| mean | +0.010 [+0.001, +0.021] · 0.015 (8/8) | +0.007 [-0.003, +0.020] · 0.012 (8/8) | +0.006 [-0.002, +0.017] · 0.010 (8/8) |
+| **mean-match** | **+0.008 [+0.002, +0.014] · 0.015 (8/8)** | **+0.002 [-0.002, +0.007] · 0.012 (8/8)** | **+0.003 [+0.001, +0.006] · 0.010 (8/8)** |
+| mean_conv | +0.035 [+0.011, +0.071] · 0.028 (8/8) | +0.029 [+0.004, +0.065] · 0.023 (8/8) | +0.016 [-0.003, +0.048] · 0.018 (8/8) |
+| mean_s0.5 | +0.020 [+0.008, +0.037] · 0.016 (8/8) | +0.011 [+0.001, +0.028] · 0.013 (8/8) | +0.006 [-0.005, +0.024] · 0.011 (8/8) |
+| prefix | +0.049 [+0.032, +0.069] · 0.045 (3/8) | +0.037 [+0.021, +0.055] · 0.033 (4/8) | +0.017 [+0.003, +0.033] · 0.021 (5/8) |
+
+**Qwen3.8-27B, 4 agent traces:**
+
+| Strategy | tail ≈1.3K | tail ≈2.3K | tail ≈4.3K |
+| --- | --- | --- | --- |
+| zero | 0.063 [0.046, 0.072] · -0.008 | 0.064 [0.046, 0.075] · -0.026 | 0.058 [0.046, 0.081] · +0.001 |
+| mean | 0.063 [0.051, 0.095] · -0.076 (1/4) | 0.061 [0.046, 0.099] · -0.075 (1/4) | 0.057 [0.045, 0.086] · -0.077 (3/4) |
+| **mean-match** | **0.026 [0.018, 0.045] · -0.050 (4/4)** | **0.019 [0.014, 0.031] · -0.036 (4/4)** | **0.015 [0.013, 0.019] · -0.034 (4/4)** |
+| mean_conv | 0.032 [0.025, 0.042] · +0.029 (4/4) | 0.032 [0.025, 0.041] · +0.023 (3/4) | 0.032 [0.025, 0.040] · +0.018 (4/4) |
+| mean_s0.5 | 0.040 [0.033, 0.056] · -0.031 (4/4) | 0.039 [0.033, 0.057] · -0.021 (4/4) | 0.038 [0.033, 0.054] · -0.029 (4/4) |
+| prefix | 0.042 [0.037, 0.050] · +0.001 (3/4) | 0.030 [0.026, 0.032] · +0.006 (4/4) | 0.020 [0.016, 0.031] · +0.022 (4/4) |
+
+**Ornith-1.5-9B, 8 chats:**
+
+| Strategy | tail ≈0.9K | tail ≈1.4K | tail ≈2.4K | tail ≈4.5K |
+| --- | --- | --- | --- | --- |
+| zero | +0.071 [+0.042, +0.106] · 0.100 | +0.065 [+0.040, +0.093] · 0.082 | +0.035 [+0.022, +0.047] · 0.046 | +0.021 [+0.009, +0.034] · 0.030 |
+| mean | -0.001 [-0.011, +0.007] · 0.018 (8/8) | -0.003 [-0.011, +0.004] · 0.016 (8/8) | -0.004 [-0.009, +0.000] · 0.012 (8/8) | -0.004 [-0.009, +0.001] · 0.009 (8/8) |
+| **mean-match** | **-0.004 [-0.016, +0.007] · 0.018 (8/8)** | **-0.006 [-0.019, +0.003] · 0.016 (8/8)** | **-0.005 [-0.014, +0.001] · 0.013 (8/8)** | **-0.005 [-0.012, +0.001] · 0.011 (8/8)** |
+| mean_conv | +0.025 [+0.013, +0.036] · 0.027 (8/8) | +0.021 [+0.011, +0.033] · 0.024 (8/8) | +0.014 [+0.004, +0.025] · 0.018 (8/8) | +0.014 [+0.003, +0.026] · 0.014 (8/8) |
+| mean_s0.5 | — | +0.006 [-0.001, +0.014] · 0.015 (8/8) | +0.002 [-0.003, +0.009] · 0.011 (8/8) | -0.001 [-0.004, +0.004] · 0.008 (8/8) |
+| prefix | — | +0.048 [+0.022, +0.079] · 0.074 (7/8) | +0.025 [+0.014, +0.036] · 0.040 (8/8) | +0.010 [+0.000, +0.020] · 0.024 (8/8) |
+
+**Ornith-1.5-9B, 4 agent traces:**
+
+| Strategy | tail ≈0.7K | tail ≈1.2K | tail ≈2.3K | tail ≈4.3K |
+| --- | --- | --- | --- | --- |
+| zero | 0.154 [0.130, 0.192] · -0.045 | 0.125 [0.080, 0.144] · -0.084 | 0.108 [0.074, 0.125] · -0.123 | 0.084 [0.069, 0.091] · -0.120 |
+| mean | 0.077 [0.063, 0.110] · -0.084 (4/4) | 0.072 [0.060, 0.098] · -0.063 (3/4) | 0.067 [0.057, 0.094] · -0.051 (3/4) | 0.070 [0.057, 0.085] · -0.051 (2/4) |
+| **mean-match** | **0.054 [0.042, 0.070] · -0.096 (4/4)** | **0.062 [0.050, 0.081] · -0.088 (4/4)** | **0.047 [0.036, 0.068] · -0.087 (4/4)** | **0.048 [0.038, 0.063] · -0.073 (4/4)** |
+| mean_conv | 0.070 [0.054, 0.116] · +0.070 (4/4) | 0.053 [0.044, 0.057] · +0.010 (4/4) | 0.050 [0.040, 0.054] · -0.018 (4/4) | 0.058 [0.040, 0.065] · -0.017 (4/4) |
+| mean_s0.5 | — | 0.054 [0.045, 0.062] · -0.017 (4/4) | 0.054 [0.042, 0.072] · -0.025 (3/4) | 0.056 [0.046, 0.065] · -0.031 (4/4) |
+| prefix | — | 0.101 [0.079, 0.163] · +0.160 (1/4) | 0.064 [0.045, 0.085] · +0.112 (4/4) | 0.059 [0.052, 0.075] · +0.116 (3/4) |
+
+The ≈0.9K / ≈0.7K columns are a separate Ornith run with W = 512 (zero, mean, mean-match and
+mean_conv only).
+
+What the tables show:
+
+- **The mean beats zero on every document, at every tail, on both models.** mean-match's KL is
+  below zero's on 12 of 12 documents at every tail, on Qwen3.8 and on Ornith. On chats it removes
+  most of the reset's cost. Qwen3.8 goes from +0.053 / +0.039 / +0.029 to +0.008 / +0.002 /
+  +0.003, and Ornith from +0.065 / +0.035 / +0.021 to -0.006 / -0.005 / -0.005, with KL 2.4-5
+  times lower.
+- **With the mean, a short tail does better than zero with a long one.** Qwen3.8 chats at ≈1.4K
+  with mean-match reach KL 0.015, against 0.024 for zero at ≈4.4K. Ornith chats at ≈0.9K reach KL
+  0.018 (ΔNLL -0.004), against 0.030 (+0.021) for zero at ≈4.5K.
+- **Agent traces need a matching group, and here the match is a best case.** The pooled mean
+  does nothing for Qwen3.8's agent traces: KL 0.063 against zero's 0.063, lower on only 1, 1 and
+  3 of 4 traces. The `tools` mean cuts KL to 0.026 / 0.019 / 0.015, lower on every trace at every
+  tail (per-trace mean 0.030 / 0.021 / 0.016 against zero's 0.061, so the gain does not come from
+  the one long trace). On Ornith the pooled mean already helps (0.072 / 0.067 / 0.070 against
+  0.125 / 0.108 / 0.084), and the `tools` mean helps more (0.062 / 0.047 / 0.048). But the
+  `tools` mean is mostly smolagents sessions with these traces' own system prompt and tool list.
+  What it shows is a group calibrated on the deployment's own agent prompts; a `tools` group from
+  other agents may do no better than the pooled mean did on Qwen3.8. Chats lose nothing from
+  matching, since the `chat` mean holds 80% of the pooled samples.
+- **The conv rows carry a large part of it.** mean_conv (mean R, zero S) closes 27-62% of the
+  chat ΔNLL gap between zero and mean-match, and 43-88% of the KL gap. On Ornith's agent traces
+  at ≈1.2K-4.3K it does about as well as mean-match (KL 0.050-0.058 against 0.047-0.062), but not
+  at ≈0.7K (0.070 against 0.054). R holds only the last three projections, so it acts only on the
+  first tail tokens. With a zero window, those tokens write wrong values into the long memory,
+  and the memory keeps them.
+- **No shrinkage.** Halving the mean's S (mean_s0.5) is worse than the matched mean on Qwen3.8
+  (chat ΔNLL +0.020 / +0.011 / +0.006, agent KL 0.040 / 0.039 / 0.038) and about level with it
+  on Ornith.
+- **The native prompt start helps only with a long prompt.** On chats H is a short generic
+  system prompt (48 tokens on Qwen3.8, 10 on Ornith). There prefix is within noise of zero on
+  Qwen3.8 at ≈1.4K and ≈2.4K (lower KL on 3 and 4 of 8 documents) and 0.013 better at ≈4.4K, and
+  on Ornith it gains 0.010-0.018. Its S error stays at 0.45-0.76 of the state's energy. On the
+  agent traces H is the 497-token tool prompt, and on Qwen3.8 prefix does cut KL, from 0.063 /
+  0.064 / 0.058 to 0.042 / 0.030 / 0.020 (3-4 of 4 traces): better than the pooled mean, though
+  not the `tools` mean. On Ornith's traces it lowers KL less and raises ΔNLL to +0.11 to +0.16.
+  Longer deployment prompts (an agent's instructions with its tool definitions) are untested;
+  there the prompt's own cell may be worth more.
+
+### Exact tails (T0 = P - W, as the engine sets it)
+
+The tables above round T0 down to the 512 grid, so their tails run W to W + 511 tokens. A
+second run (`--grid 1`) put T0 at exactly P - W for the tails a deployment would use: 1,024 and
+2,048 on Qwen3.8, 512 and 1,024 on Ornith, with zero, the pooled mean and mean-match on the same
+12 conversations. The save at T0 now ends inside one ubatch of the native prefill, and the
+restored tail starts there, so that ubatch is computed in two parts. The sanity condition (the
+native save at T0, at every tail) measures what that alone costs: KL 0.0018-0.0021 on chats and
+0.0008-0.0024 on the agent traces, ΔNLL within ±0.003 on chats (max |ΔNLL| on one document
+0.005-0.015). On Ornith's agent traces the sanity ΔNLL is +0.008 / +0.012, from scored windows of
+44-48 tokens. This floor is part of every cell below, as it is of a real switch. Before scoring,
+every native save at T0 was also rewritten through the strategy write path (`section`,
+`replace_recurrent`, `state_writer`) with its own cell, and each gave its exact bytes back, so the
+conditions differ from the sanity condition by the recurrent cell alone.
+
+| Model, tail W | Chats: zero | Chats: mean | Chats: mean-match | Agents KL: zero | mean | mean-match |
+| --- | --- | --- | --- | --- | --- | --- |
+| Qwen3.8, 1,024 | +0.057 [+0.032, +0.092] · 0.053 | +0.013 · 0.015 (8/8) | **+0.008 [-0.000, +0.017] · 0.016 (8/8)** | 0.084 [0.051, 0.099] | 0.069 (2/4) | **0.029 [0.019, 0.051] (4/4)** |
+| Qwen3.8, 2,048 | +0.041 [+0.018, +0.075] · 0.036 | +0.013 · 0.013 (8/8) | **+0.007 [-0.001, +0.015] · 0.013 (8/8)** | 0.057 [0.043, 0.071] | 0.058 (1/4) | **0.020 [0.014, 0.032] (4/4)** |
+| Ornith, 512 | +0.098 [+0.067, +0.135] · 0.132 | +0.002 · 0.024 (8/8) | **-0.002 [-0.016, +0.008] · 0.023 (8/8)** | 0.148 [0.135, 0.168] | 0.086 (4/4) | **0.065 [0.053, 0.084] (4/4)** |
+| Ornith, 1,024 | +0.076 [+0.046, +0.115] · 0.097 | -0.001 · 0.017 (8/8) | **-0.006 [-0.018, +0.002] · 0.017 (8/8)** | 0.126 [0.092, 0.168] | 0.072 (4/4) | **0.059 [0.049, 0.084] (4/4)** |
+
+Chat cells: ΔNLL [95% CI] · KL; agent cells: KL. Per trace, mean-match's agent KL on Qwen3.8 is
+0.058 / 0.016 / 0.020 / 0.043 at 1,024 and 0.039 / 0.012 / 0.018 / 0.018 at 2,048 (zero's 0.087 /
+0.033 / 0.090 / 0.109 and 0.084 / 0.052 / 0.057 / 0.033). The exact tails confirm the grid
+results at the lengths a deployment uses: with mean-match, Qwen3.8 at 1,024 (chat KL 0.016,
+agents 0.029) is better than zero at ≈4.4K (0.024 / 0.058), and Ornith at 512 (0.023 / 0.065) is
+better than zero at ≈4.5K (0.030 / 0.084). Halving Ornith's tail from 1,024 to 512 costs 0.006
+in chat KL with the mean, against 0.035 with zero.
+
+### Translated attention + each strategy (Muse → Qwen3.8)
+
+The same 12 conversations, switched the way the bridge switches into Qwen targets. Muse saves at
+its own P_s, and hub4-d4096-v2 (format 2, numpy engine, 1.4-4.3 s per translation) translates
+into Qwen3.8 at T0 with the native prompt start (H tokens copied from Qwen3.8's own save of
+them). The strategy then replaces the recurrent cell. Same metrics as above.
+
+| Strategy | Chats, tail ≈1.4K | ≈2.4K | ≈4.4K | Agent traces, tail ≈1.3K | ≈2.3K | ≈4.3K |
+| --- | --- | --- | --- | --- | --- | --- |
+| zero | +0.129 [+0.084, +0.177] · 0.130 | +0.102 [+0.060, +0.145] · 0.102 | +0.061 [+0.031, +0.095] · 0.062 | 0.496 [0.155, 0.642] · +0.339 | 0.462 [0.120, 0.610] · +0.298 | 0.454 [0.110, 0.602] · +0.293 |
+| mean | +0.100 [+0.065, +0.138] · 0.108 (6/8) | +0.069 [+0.032, +0.106] · 0.080 (8/8) | +0.031 [+0.013, +0.052] · 0.046 (8/8) | 0.446 [0.150, 0.573] · +0.242 (3/4) | 0.421 [0.109, 0.555] · +0.211 (3/4) | 0.399 [0.095, 0.529] · +0.183 (4/4) |
+| **mean-match** | **+0.097 [+0.060, +0.139] · 0.108 (8/8)** | **+0.064 [+0.031, +0.099] · 0.080 (8/8)** | **+0.027 [+0.011, +0.045] · 0.047 (8/8)** | **0.463 [0.163, 0.592] · +0.287 (3/4)** | **0.445 [0.107, 0.591] · +0.267 (2/4)** | **0.432 [0.113, 0.569] · +0.238 (2/4)** |
+| prefix | +0.128 [+0.081, +0.182] · 0.137 (3/8) | +0.101 [+0.055, +0.149] · 0.102 (3/8) | +0.045 [+0.021, +0.072] · 0.056 (7/8) | 0.479 [0.143, 0.623] · +0.365 (3/4) | 0.453 [0.123, 0.595] · +0.319 (3/4) | 0.450 [0.098, 0.602] · +0.323 (3/4) |
+
+- **The mean takes off about as much as with native attention.** On chats it saves 0.032-0.038
+  nats/token (mean-match's KL is lower on 8 of 8 documents at every tail). The rest is the
+  translated cells. At ≈4.4K the mean halves the total (+0.061 → +0.027). The mean is worth
+  about the step from a 2,048 to a 4,096 tail in ΔNLL: mean-match at ≈2.4K scores +0.064,
+  against +0.061 for zero at ≈4.4K. In KL it is worth less (0.080 against 0.062).
+- **Agent traces stay broken by the translated cells** (KL 0.40-0.50, ΔNLL +0.18 to +0.34; see
+  section 2). The mean lowers KL by 0.02-0.06. Here the pooled mean does better than the `tools`
+  mean: its paired KL difference to zero is -0.050 [-0.150, -0.003] / -0.042 [-0.112, -0.011] /
+  -0.056 [-0.130, -0.015] (lower on 3-4 of 4 traces), while the `tools` mean's CIs include 0
+  (-0.033 [-0.113, +0.011] / -0.017 [-0.086, +0.010] / -0.022 [-0.112, +0.003], lower on 2-3 of
+  4). Neither makes such a switch usable.
+- prefix is again level with zero except at ≈4.4K (+0.045).
+
+**Top-1 agreement with the native prefill** (token-weighted share of scored tokens whose argmax
+matches the native one; zero → mean-match):
+
+| Tail W (grid) | Qwen3.8 chats | Qwen3.8 agents | Ornith chats | Ornith agents | Muse → Qwen3.8 chats | Muse → Qwen3.8 agents |
+| --- | --- | --- | --- | --- | --- | --- |
+| 512 | — | — | 0.877 → 0.945 | 0.853 → 0.931 | — | — |
+| 1,024 | 0.909 → 0.941 | 0.931 → 0.964 | 0.883 → 0.944 | 0.876 → 0.922 | 0.870 → 0.888 | 0.804 → 0.824 |
+| 2,048 | 0.925 → 0.953 | 0.931 → 0.961 | 0.909 → 0.948 | 0.899 → 0.931 | 0.887 → 0.893 | 0.824 → 0.810 |
+| 4,096 | 0.937 → 0.956 | 0.938 → 0.977 | 0.917 → 0.954 | 0.912 → 0.935 | 0.912 → 0.917 | 0.830 → 0.807 |
+
+With native attention the mean takes back 2-8 points of top-1 agreement. With translated
+attention it adds 0.5-2 points on chats, and on agent traces the change (-2 to +2) is noise.
+
+### Recommendation
+
+- **Default for hybrid targets: a per-model mean recurrent cell instead of zero.** Use the `chat`
+  mean for conversations without tools. For conversations with tools, use a `tools` mean only
+  when that group was calibrated on the deployment's own agent prompts; otherwise use the pooled
+  mean (`all`). The pooled mean was level with zero or better everywhere: level on Qwen3.8's
+  agent traces with native attention (KL difference -0.015 to +0.001), better on Ornith's and in
+  every translated case. The matched `tools` mean measured here is a best case (its sessions
+  share the traces' prompt and tools). The mean comes from a per-model npz built once by `r0_experiments.py calibrate` from native
+  saves of training conversations (any `recurrent_init.MeanAccumulator` over native saves will
+  do). With native attention the chat mean beat R0 on every chat, model and tail, grid or exact;
+  with translated attention it did so on every chat. It needs no extra prefill. Per switch it
+  costs under 0.3 s: 0.16 s to load the group, which the daemon can cache, and up to 0.12 s to
+  build the cell. On disk two groups take 157 MB for Qwen3.8 and 53 MB for Ornith (float16).
+- **Tail per hybrid target with the mean** (measured at exactly these tails, above). For Qwen3.8
+  behind the production DFlash2 draft, keep 2,048, because the draft needs 2,047 native tail
+  tokens (section 6): mean-match's native-attention KL is 0.013 on chats and 0.020 on agent
+  traces there. Without a draft, use 1,024: KL 0.016 / 0.029, better than R0 with ≈4.4K (0.024 /
+  0.058). For Ornith, use 1,024: KL 0.017 / 0.059. 512 costs a little (0.023 / 0.065) and is
+  still better than R0 with ≈4.5K (0.030 / 0.084). The agent figures assume a matching `tools`
+  group. With the pooled mean they are 0.069 at 1,024 and 0.058 at 2,048 on Qwen3.8 (zero: 0.084
+  / 0.057, lower on 2 and 1 of 4 traces), and 0.072 at 1,024 and 0.086 at 512 on Ornith (zero:
+  0.126 / 0.148). With translated attention the translation's own cost still falls with
+  the tail, so the tail remains a quality lever. There the mean buys about one doubling of the
+  tail.
+- **Not recommended:** prefix with short system prompts (no gain on Qwen3.8 chats; untested with
+  long ones), and shrinking the mean.
+- **Caveats.** These are 12 conversations from one bucket (8-16K tokens). The 4 agent traces are
+  all smolagents, one of them holds 55% of the scored agent tokens, and 36 of the calibration's
+  43 `tools` saves come from smolagents sessions with the same tool list and system prompt.
+  Hermes-agent traffic (another system prompt and other tools) is untested. On Qwen3.8 the
+  pooled mean did nothing for agent traces, so a group that does not match the deployment's
+  prompts may help no more than that. Calibrating on representative conversations is the safe
+  default. A bridge can do that online at no prefill cost: each switch away from a hybrid model
+  saves that model's native slot, and the slot's recurrent cell can be added to a
+  MeanAccumulator per model and group. The mean leaves 12-43% of the S energy unexplained; that
+  remainder is the R2 replay's target.
+
+**Integration (translate.py, engine, bridge).** Stage 4 did this as listed (section 8), with two
+differences: with tools the engine takes the pooled `all` group unless the model was registered
+with `--recurrent-tools`, and the default tail is unchanged (a shorter one is a per-model `--tail`).
+
+- In `translate.build_state`, the recurrent branch should call
+  `recurrent_init.initial_state(part, t0 - 1, plan.recurrent, mean=plan.recurrent_mean,
+  prefix=plan.native_state, group=plan.recurrent_group)` instead of
+  `kvstate.recurrent_reset(part, t0 - 1)`.
+- `translate()` and `prepare()` take `recurrent="zero"`, `recurrent_mean=None` and
+  `recurrent_group="all"` into the Plan. Zero stays the default, so existing callers and tests do
+  not change. The report records the strategy and the group.
+- The prefix strategy must refuse a `native_state` that holds more than `native_prefix` tokens.
+  pair_eval passes the native save at T0 as `native_state`, and its recurrent cell is the answer
+  itself.
+- `engine.run` takes `target.recurrent_mean` (the npz path) and `target.recurrent` (default
+  `mean` when a mean is given). It picks the group with
+  `recurrent_init.match_group(RecurrentMean.stored_groups(path), conversation.get("tools"))`:
+  `tools` or `chat`, else `all` when the file lacks that group, else None (then zero).
+- The daemon caches `RecurrentMean.load(path, groups=[group])` by path, size and mtime.
+- What the file holds is the deployment's policy. Ship `chat` and `all` by default (157 MB for
+  Qwen3.8, 53 MB for Ornith), so tool conversations use the pooled mean. Add a `tools` group
+  only when it was calibrated on the deployment's own agent prompts.
+  `RecurrentMean.load(path, groups=[...]).save(new_path)` writes such a subset.
+- The bridge stores a per-model `recurrent_mean` (`kvpark bridge add --recurrent-mean`) and passes
+  it in the target job for hybrid targets. With the mean, a 1,024-token tail is enough for chat
+  targets without a draft window; tool conversations on the pooled mean keep the 2,048 default
+  (section 8).
+
+**Reproduce.** The evidence is in `evidence/universal-kv/recurrent-init-20261003/`:
+
+- `calibrate-{qwen38,ornith}/`: `recurrent-mean.npz` and `report.json` with energy shares, depth
+  bins and timings.
+- `run-qwen38/`, `run-ornith/` and `run-ornith-tail512/`: `report.json` with per-document scores
+  and state errors, `summary.json` and `summary.md`.
+- `combined-muse-qwen38/`: the translated-attention run.
+- `run-ornith-split-h/`: the first, superseded chunk with the split ubatch.
+- `run-qwen38-aborted/`: a start that waited 9 min on the memory guard while another stream's
+  Qwen3.8 server ran.
+- `run-qwen38-exact/` and `run-ornith-exact/`: the exact tails (`--grid 1`).
+- `summary.json` and `summary.md` of every run were regenerated after the summary gained the
+  per-document KL mean, the tail range, the sanity KL and a token-weighted top-1. The report.json
+  files are unchanged.
+
+Commands are in `r0_experiments.py calibrate|run|combined|summarize --help`. For example, `run
+--model GGUF --mean NPZ --select evidence/linear-transfer/run-v3b:8192-16384 --strategies
+zero,mean,mean:match,mean_conv,mean_s0.5,prefix --probe evidence/linear-transfer/
+kv-probe-build-v1gpu/kvpark-kv-probe`; the exact tails add `--tails 1024,2048 --grid 1
+--strategies zero,mean,mean:match`. The exact runs took 43 min (Qwen3.8) and 11 min (Ornith).
+
+## 8. Stage 4 (October 4, 2026): the recurrent mean in the bridge, a faster assemble, DeepSeek V4 switches
+
+Three things changed in the engine and the bridge, and one live run checks the first two on the
+production Qwen3.8 build.
+
+- **Hybrid targets start from the mean (section 7).** `kvpark bridge add NAME --recurrent-mean
+  NPZ` registers a hybrid model's mean of native recurrent cells (checked against its GGUF header:
+  architecture, layer count, and for `qwen35`, `qwen35moe` and `qwen3next` the recurrent layers
+  and row sizes). The
+  target job carries it, `translate` writes the cell at T0 - 1 with `recurrent_init.initial_state`,
+  and the engine picks the group as section 7 recommends: `chat` without tools, the pooled `all`
+  with tools, `tools` only after `--recurrent-tools` (that group was calibrated on the deployment's
+  own agent prompts). A file without the group falls back to `all`, then to zero, and so does a
+  file moved or damaged since it was registered; the report says which (`report["recurrent"]`). The engine daemon keeps the loaded group per file identity until
+  its idle unload. Zero stays the default without a mean, and `prefix` is refused when the native
+  state holds more than the native prefix. Tails are not changed for anyone: a DFlash draft keeps
+  its window rule, and the shorter tail the mean allows (section 7) is left to `--tail`. That
+  shorter tail holds for chats, and for tool conversations only with a matched `tools` group:
+  with the pooled mean, Qwen3.8's agent traces score KL 0.069 at 1,024 against zero's 0.057 at
+  the default 2,048, so a deployment whose tool traffic gets the pooled mean (all Hermes traffic
+  today) keeps the default tail.
+- **Assemble for dense targets.** The torch backend's forward K RoPE runs in float32 with
+  `torch.addcmul` (one fused multiply-add per element), which on the 8060S gives exactly the
+  bits of the float64 emulation it replaces (four RoPE variants, every float equal) at 0.034
+  instead of 0.081 s per 4,096-row Qwen3-4B window. The fresh output arrays are touched on four
+  threads while the GPU encodes and decodes (`translate.Prefault`; 1.5 GB took 0.12 s to copy into
+  fresh pages against 0.05 s into touched ones). `kvstate.truncate_state` slices a run of kept
+  cells instead of copying it (a media source read memory-mapped stays a view).
+- **DeepSeek V4 targets through the bridge** (tiny fixture only, no real model): the engine keeps
+  the T0 that `dsv4_target` rounds down to whole 128-token blocks, so the restore check, the
+  `.resume` and the reused cells follow it; DeepSeek V4 jobs run on numpy in the daemon too, with
+  the head decoders resident and no head encoders loaded; format 2 bundles keep the head files;
+  the lightning-indexer gate no longer skips DeepSeek V4 (its indexer keys are pooled LID rows the
+  head decoders fill); an upstream server with a draft is skipped like a patched one;
+  `kvpark bridge add --native-prefix` is refused for it and an older entry's flag is ignored
+  (the engine synthesizes the cache whole). A switch
+  from a qwen3 fixture at T0 = P - 40 = 332 restored 256 cells and reused 256
+  (`test_dsv4.EngineBridgeTests`). The synthesis itself is exact on the fixture (stage 3,
+  `test_dsv4.OracleTests`): a state built from the native run's own per-token compressor inputs
+  restores within 9.3e-10 of a restored native save (logit scale 9e-3; q8_0 caches identical),
+  while zeroing the raw window, any pooled rows or the CSA/LID rings moves the logits by 2.1e-7
+  to 1.5e-5. Pooling in numpy costs about 21 s per 32K tokens at V4-Flash geometry, before the
+  hub decode. No real DeepSeek V4 model has been run.
+
+### Live: Muse → production Qwen3.8 with the recurrent mean
+
+`live_bridge.py options` as in stage 3: Muse (Vulkan 85d5703a3, port 18590) primed three held-out
+conversations alone and was stopped; then the production Qwen3.8 binary (DFlash2 draft, F16 mmproj,
+production flags, context 65,536, port 18591, registered with
+`recurrent-init-20261003/calibrate-qwen38/recurrent-mean.npz` and a native prompt start) and
+Qwen3-4B (port 18592) ran next to a stub serving Muse's saved slots, with the GPU engine daemon.
+Each switch had no warm request (as Hermes switches); the real chat request followed with the same
+options. MemAvailable stayed at 52-55 GiB, the 1-minute load at 2.4-4.9.
+
+| Conv. | Options | P | T0 = cache_n | Group | Switch s | Engine s | Mean load s | Tail prefill s | Native prefill s |
+| --- | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 23743 | none | 13,627 | 11,579 | chat | 1.96 | 0.90 | 0.20 | 8.27 | 46.96 |
+| 23743 | Hermes' `medium` | 13,589 | 11,541 | chat | 1.41 | 0.63 | kept | 8.15 | 46.96 |
+| smolagents 7414 (tools) | none | 16,844 | 14,796 | all | 3.17 | 0.94 | 0.21 | 8.33 | 59.11 |
+| smolagents 7414 (tools) | Hermes' `medium` | 16,806 | 14,758 | all | 2.91 | 0.73 | kept | 8.35 | 59.11 |
+| 18676 | none | 12,076 | 10,028 | chat | 0.86 | 0.55 | kept | 8.03 | 41.48 |
+| 18676 | Hermes' `medium` | 12,038 | 9,990 | chat | 0.89 | 0.55 | kept | 8.00 | 41.48 |
+
+- **Every switch reused exactly T0** in the real chat request, with the mean of the right group:
+  `chat` for the two chats, the pooled `all` for the tool-calling trace (the file's `tools` group
+  is smolagents-calibrated, and it was registered without `--recurrent-tools`).
+- The group loads once (0.20-0.21 s, then kept by the daemon). The switch's other costs did not
+  change: the native prompt start (0.5 s when not cached; 1.8-1.9 s for the trace, whose system
+  prompt holds its tool list) and the engine (0.55-0.94 s).
+- DFlash2 got the 41,216-byte aligned dummy each time; the Qwen3.8 log has no draft-position
+  warning, position error or failed decode.
+
+Into Qwen3-4B on the same run (default rendering, a warm request prefilling the 2,048-token tail):
+
+| Conv. | Hop | T0 / P | Engine s | Assemble s | Switch total s | Reuse |
+| --- | --- | --- | ---: | ---: | ---: | --- |
+| 23743 | Muse → Qwen3-4B | 10,614 / 12,662 | 1.00 | 0.161 | 5.53 | yes |
+| 23743 | Qwen3.8 → Qwen3-4B | 10,614 / 12,662 | 1.10 | 0.159 | 5.82 | yes |
+| 18676 | Muse → Qwen3-4B | 9,153 / 11,201 | 0.77 | 0.129 | 4.65 | yes |
+| 18676 | Qwen3.8 → Qwen3-4B | 9,153 / 11,201 | 0.95 | 0.141 | 5.19 | yes |
+
+Stage 3's run of the same four hops took 1.93-2.21 s of engine, 0.49-0.90 s of assemble and
+8.9-9.2 s per switch, with another agent's work on the GPU (load 5-9; here 3.8-4.5). The
+tool-calling trace into Qwen3-4B was skipped as `template-mismatch`: chat.py's check that a template
+renders message content unchanged fails on Qwen3-4B's tool-call rendering, so the target prefilled
+natively.
+
+**The same jobs, old and new engine, same conditions.** `bench_engine.py job` on the four kept
+Qwen3-4B jobs, the stage 3 engine and this one alternating (median of the warm runs):
+
+| Job | Assemble s, idle | Assemble s, servers loaded | Engine s, servers loaded |
+| --- | --- | --- | --- |
+| 18676 Muse → Qwen3-4B | 0.234 → 0.128 | 0.234 → 0.127 | 0.84 → 0.72 |
+| 18676 Qwen3.8 → Qwen3-4B | 0.308 → 0.136 | 0.307 → 0.136 | 1.06 → 0.90 |
+| 23743 Muse → Qwen3-4B | 0.277 → 0.143 | 0.276 → 0.143 | 0.95 → 0.82 |
+| 23743 Qwen3.8 → Qwen3-4B | 0.358 → 0.150 | 0.350 → 0.154 | 1.23 → 1.04 |
+
+The RoPE change alone took assemble to 0.128 / 0.199 / 0.143 / 0.225 s. Touching the output pages
+ahead took off the rest of the Qwen3.8-sourced jobs' (0.199 → 0.135, 0.225 → 0.151 s): their
+output lands in fresh pages every run, while the Muse-sourced jobs reuse freed heap. Assemble is
+now 0.13-0.15 s; compute (0.30-0.51 s) and writing the 1.3-1.6 GB file (0.25-0.30 s) are the
+larger parts of a dense target's engine time.
+
+Evidence: `evidence/universal-kv/live-stage4-20261004/` (`options/`: run records and server logs;
+`kept/`: the Qwen3-4B jobs; `bench-loaded/` and `bench-idle/`: the old/new replays with
+`summary.txt`; `rope/`: the RoPE and first-touch micro-benchmarks; `servers.json`,
+`run-options.sh`, `after.sh`).

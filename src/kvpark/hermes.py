@@ -50,6 +50,30 @@ def foreground_role(session_id):
     return "foreground" if disabled is False else "background" if disabled is True else "unverified"
 
 
+def _engine_summary(report):
+    """How the last switch's engine ran, for /kvpark switch status: "daemon on the GPU, 0.5 s"."""
+    engine = report.get("engine") or {}
+    if not engine:
+        return None
+    mode = report.get("engine_mode") or engine.get("engine_mode") or "engine"
+    where = "the CPU" if engine.get("backend", "numpy") == "numpy" else "the GPU"
+    seconds = report.get("timings", {}).get("engine_s")
+    return f"{mode} on {where}" + (f", {seconds} s" if seconds is not None else "")
+
+
+def _options_summary(report):
+    """How the request's template options (reasoning_effort, chat_template_kwargs) were handled when
+    they change the target's rendering: rendered by the engine too, or the cache cut where the
+    renderings part (an older engine, or a server setting the engine cannot see)."""
+    options = report.get("template_options")
+    if not options:
+        return None
+    names = ", ".join(options.get("options") or ())
+    if options.get("engine"):
+        return f"rendered with the request's {names}"
+    return f"the request's {names} render differently from token {options.get('shared_tokens')} on"
+
+
 def known_route(config):
     try:
         return route_for(config)
@@ -107,10 +131,89 @@ class Adapter:
         active.base_url = destination
         return True
 
+    def bridge_switch(self, request, session_id, base_url):
+        """Run a staged `/kvpark switch` when this conversation's request reaches the target model.
+
+        Never raises: on any failure the request goes out unchanged and the target prefills
+        natively; the outcome is kept for `/kvpark switch status`."""
+        if not session_id:
+            return
+        from .bridge import registry, stage
+        bridge_dir = registry.default_path().parent
+        key = self.key(session_id)
+        staged = stage.get(bridge_dir, key)
+        if not staged:
+            return
+        try:
+            config = registry.load()
+            model = config["models"].get(staged["target"])
+            if model is None or route_key(model["url"] + "/v1") != route_key(base_url):
+                return      # not on the target yet; keep the stage until its lease ends
+            stage.drop(bridge_dir, key)
+            from .bridge.messages import conversation_from_openai, template_options
+            from .bridge.switch import switch
+            conversation = conversation_from_openai(request.get("messages"), request.get("tools"))
+            report = switch(config, conversation, staged["source"], staged["target"], warm=False,
+                            template_options=template_options(request))
+            # a skipped switch (a model, medium or prompt the translator does not handle) is not an
+            # error: the target prefills natively, and the reason is kept for the status
+            self.bridge_last = {"ok": True, "source": staged["source"], "target": staged["target"],
+                                "skipped": report.get("skipped"), "note": report.get("note"),
+                                "restored_tokens": report.get("restored_tokens"),
+                                "prompt_tokens": report.get("target_prompt_tokens"),
+                                "seconds": report["timings"].get("total_s"),
+                                "engine": _engine_summary(report), "options": _options_summary(report)}
+        except Exception as exc:  # the request must go out whatever happens here
+            self.bridge_last = {"ok": False, "source": staged.get("source"), "target": staged.get("target"),
+                                "error": f"{type(exc).__name__}: {exc}"[:300]}
+
+    def stage_switch(self, rest):
+        from .bridge import registry, stage
+        if rest == ["status"]:
+            last = getattr(self, "bridge_last", None)
+            if not last:
+                return "No bridge switch has run in this Hermes process yet."
+            if last["ok"] and last.get("skipped"):
+                return (f"Last switch {last['source']} → {last['target']} was skipped ({last['skipped']}): "
+                        f"{last['note']}.")
+            if last["ok"]:
+                details = [f"engine: {last['engine']}"] if last.get("engine") else []
+                details += [last["options"]] if last.get("options") else []
+                details = f" ({'; '.join(details)})" if details else ""
+                return (f"Last switch {last['source']} → {last['target']}: restored {last['restored_tokens']:,} of "
+                        f"{last['prompt_tokens']:,} prompt tokens in {last['seconds']} s{details}.")
+            return f"Last switch {last['source']} → {last['target']} fell back to a full prefill: {last['error']}"
+        if len(rest) not in (1, 3) or (len(rest) == 3 and rest[1] != "from"):
+            raise ValueError("use /kvpark switch MODEL [from CURRENT_MODEL], or /kvpark switch status")
+        config = registry.load()
+        target_name = rest[0]
+        registry.model(config, target_name)
+        if len(rest) == 3:
+            source_name = rest[2]
+            registry.model(config, source_name)
+        else:
+            upstream = route_key(target(self.settings()).url + "/v1")
+            matches = [name for name, model in config["models"].items() if route_key(model["url"] + "/v1") == upstream]
+            if len(matches) != 1:
+                raise ValueError("name the model you are leaving: /kvpark switch MODEL from CURRENT_MODEL")
+            source_name = matches[0]
+        if source_name == target_name:
+            raise ValueError("that is the current model")
+        session = session_value("HERMES_SESSION_ID")
+        if not session:
+            raise ValueError("run /kvpark switch inside the conversation you want to move")
+        stage.put(registry.default_path().parent, self.key(session), source=source_name, target=target_name)
+        # the engine loads the pair while the user moves to the target (never fails the stage)
+        stage.prewarm(config, source_name, target_name, registry.default_path().parent)
+        return (f"Ready: this conversation's next message to {target_name} continues from {source_name}'s cache "
+                f"(valid {stage.LEASE_SECONDS // 60} minutes). Switch Hermes to {target_name} with /model, then send "
+                f"your message. /kvpark switch status shows the result.")
+
     def middleware(self, *, request, session_id="", base_url="", api_mode="", **kwargs):
         config = self.settings()
         if config["uninstalled"] or api_mode != "chat_completions":
             return None
+        self.bridge_switch(request, session_id, base_url)
         routes = {route_key(url + "/v1") for url in [config["base_url"], *config["previous_urls"]]}
         upstream = target(config).url + "/v1" if config["connected"] else None
         if upstream:
@@ -328,6 +431,8 @@ class Adapter:
             return result
         if action in {"onboarding", "help"}:
             return self.onboarding()
+        if action == "switch" and rest:
+            return self.stage_switch(rest)
         if action == "base-url" and len(rest) == 1:
             return self.configure(["--base-url", rest[0]])
         if action == "autostart" and rest in (["on"], ["off"]):
@@ -407,7 +512,7 @@ class Adapter:
 def register(ctx):
     adapter = Adapter(ctx)
     command = dict(description="Park model state, resume conversations, and manage saved caches",
-                   args_hint="setup | save | status | doctor | forget | cleanup | retention | base-url | update | uninstall")
+                   args_hint="setup | save | status | doctor | forget | cleanup | retention | base-url | switch | update | uninstall")
     try:
         ctx.register_command("kvpark", adapter.command, argument_mode="mixed", **command)
         adapter.support["argument_mode"] = True
