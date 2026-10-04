@@ -144,7 +144,7 @@ MAX_REQUEST = 512 << 20            # bytes of one request line (a 262K-token job
 GIB = 1 << 30
 # rows of the warm-up products: a full window of the GPU backend and a partial one (GPU BLAS
 # libraries pick kernels per shape); numpy only needs its weights paged in and its threads up
-WARM_ROWS = {"torch": (4096, 1536), "numpy": (64,)}
+WARM_ROWS = {"torch": (4096, 1536), "ggml": (4096, 1536), "numpy": (64,)}
 # peak memory of a switch per byte of (source state + translated state), before any calibration:
 # 13K-token Qwen3.8 -> Muse, 1.16 + 0.25 GB of state, peaked at 2.9 GiB on the GPU (research notes)
 DEFAULT_FACTOR = {"host": 2.5, "gpu": 2.5}
@@ -286,7 +286,7 @@ def trim_memory():
 def engine_info(device=None, *, gpu=True):
     """This Python's engine setup: numpy and its BLAS (a warning for the reference BLAS), the BLAS
     threads, the requested device, and with gpu whether torch sees a GPU (importing torch takes a
-    few seconds)."""
+    few seconds) and whether the ggml backend sees a Vulkan GPU (libkvbridge)."""
     blas = blas_info()
     info = {"python": sys.executable, "numpy": np.__version__,
             "blas": {key: blas.get(key) for key in ("name", "gflops", "reference", "warning") if blas.get(key) is not None},
@@ -295,13 +295,23 @@ def engine_info(device=None, *, gpu=True):
     if gpu:
         available, detail = backends.gpu_status()
         info["gpu"] = {"available": available, "detail": str(detail)}
+        available, detail = backends.gpu_status("vulkan")
+        info["vulkan"] = {"available": available, "detail": str(detail)}
     return info
+
+
+def on_gpu(backend):
+    """Whether a backend computes on a GPU: torch, or ggml on a Vulkan device (not ggml's CPU backend)."""
+    return backend.name == "torch" or (backend.name == "ggml" and bool(getattr(backend, "on_gpu", False)))
 
 
 def warm_products(backend, encoder, decoder, rows, sections, *, spec=None, kind="k"):
     """A switch's products on `rows` zero rows: encode (stage one and the latent, centred on the
     decoder as translate.compute_cache does), each target section's decode and, with the
     target's spec, its RoPE and cache cast (backend.cache_rows, float16)."""
+    if backend.name == "ggml":
+        backend.warm_products(encoder, decoder, rows, sections, spec=spec, kind=kind)
+        return
     if backend.name == "torch":
         import torch
         half, device = backend.half, backend.device
@@ -697,8 +707,8 @@ class Daemon:
             backend = backends.select("cpu")
         before_rss = rss_bytes()
         peak_reset = reset_peak_rss()
-        gpu = backend.name == "torch" and getattr(backend, "device", None) is not None \
-            and str(backend.device).startswith("cuda")
+        gpu = (backend.name == "torch" and getattr(backend, "device", None) is not None
+               and str(backend.device).startswith("cuda")) or (backend.name == "ggml" and on_gpu(backend))
         if gpu:
             backend.reset_peak()
             gpu_before = backend.memory().get("allocated", 0)
@@ -745,8 +755,8 @@ class Daemon:
     def guard(self, job, hub, backend):
         moved = self.estimate(job)
         need = {"host": int(self.factor["host"] * moved) + RESERVE["host"]}
-        on_gpu = backend.name == "torch"
-        if on_gpu:
+        gpu = on_gpu(backend)
+        if gpu:
             need["gpu"] = int(self.factor["gpu"] * moved) + RESERVE["gpu"]
         keep = [(str(hub.directory), kind, name, role)
                 for kind, name, role in self.pair_sides(job["source"]["name"], job["target"]["name"],
@@ -758,12 +768,12 @@ class Daemon:
             short = need[where] - available[where] if available.get(where) is not None else 0
             if short > 0:
                 for other in backends.loaded().values():
-                    if (where == "gpu") == (other.name == "torch"):
+                    if (where == "gpu") == on_gpu(other):
                         out["evicted_bytes"] += other.evict(short, keep=keep)
                 available = self.available(backend)
         out["available"] = available
         host_ok = available["host"] is None or need["host"] <= available["host"]
-        if on_gpu and available.get("gpu") is not None and need["gpu"] > available["gpu"]:
+        if gpu and available.get("gpu") is not None and need["gpu"] > available["gpu"]:
             if not host_ok:
                 raise MemoryError(f"memory: a switch needs about {need['gpu'] >> 20} MiB on the GPU and "
                                   f"{need['host'] >> 20} MiB of RAM; {available['gpu'] >> 20} / "
@@ -777,7 +787,7 @@ class Daemon:
 
     def available(self, backend):
         out = {"host": mem_available()}
-        if backend.name == "torch":
+        if on_gpu(backend):
             memory = backend.memory()
             out["gpu"] = memory.get("device_free")
         return out

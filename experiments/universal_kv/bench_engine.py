@@ -2,7 +2,7 @@
 
     python bench_engine.py warm     --hub HUB --direction qwen38:muse --backend torch --runs 4 --output OUT.json
     python bench_engine.py oneshot  --hub HUB --direction qwen38:muse --engine engine.py --runs 2 --output OUT.json
-    python bench_engine.py accuracy --hub HUB --direction qwen38:muse --output OUT.json
+    python bench_engine.py accuracy --hub HUB --direction qwen38:muse --output OUT.json [--device vulkan]
     python bench_engine.py nll      --hub HUB --docs 6 --probe KV_PROBE --output-dir DIR --output OUT.json
     python bench_engine.py prewarm  --hub HUB --direction qwen38:muse --device gpu --runs 3 --bridge-dir B --output OUT.json
     python bench_engine.py job      --job KEPT/job-X.json --device gpu --runs 4 --output OUT.json [--hugepages off]
@@ -17,9 +17,9 @@ the target rendering, cut where it spells the prompt exactly, with pieces from t
             engine_daemon.py does): the first run is cold (side loads, GPU start), the rest warm
   oneshot   `python ENGINE JOB` in a fresh process per run (engine.py, or the snapshot of an
             older engine): the per-switch cost without a daemon
-  accuracy  the torch backend against numpy on the same plan: decoded K/V (before RoPE and the
-            cache cast) and the stored cache values, per section, as max |err| / max |ref| and
-            relative Frobenius error, the worst layer of each
+  accuracy  the torch backend (--device vulkan: the ggml one) against numpy on the same plan:
+            decoded K/V (before RoPE and the cache cast) and the stored cache values, per section,
+            as max |err| / max |ref| and relative Frobenius error, the worst layer of each
   nll       end to end: per document (the run's T0 for a 2048-token tail, the run's native
             state there as layout template) one translated state from numpy (float32) and one
             from torch (float16), seed-scored on the target with kv_probe (GPU) against its own
@@ -40,8 +40,10 @@ the target rendering, cut where it spells the prompt exactly, with pieces from t
             freed memory in the process (glibc mallopt) so a later job reuses faulted pages
 
 Reports engine_timings (hub_load, profiles, inputs, prepare, compute, assemble, write), peak
-RSS (VmHWM, reset per run) and GPU memory (torch peak allocated), with the 1/5/15-minute load
-average next to every timing (another process on the CPU changes CPU timings).
+RSS (VmHWM, reset per run) and GPU memory (torch: peak allocated; ggml: the peak of its device
+buffers, weights and arrays plus their pool and the graph allocator's), with the 1/5/15-minute
+load average next to every timing (another process on the CPU changes CPU timings). --device
+vulkan runs the ggml backend (libkvbridge, backends/ggml_backend.py).
 """
 
 import os
@@ -249,12 +251,15 @@ def replay(args):
 
 
 def gpu_memory(backend):
-    if backend.name != "torch":
+    if backend.name not in ("torch", "ggml"):
         return {}
     memory = backend.memory()
-    return {"gpu_peak_allocated_gib": round(memory.get("peak_allocated", 0) / 2**30, 3),
-            "gpu_allocated_gib": round(memory.get("allocated", 0) / 2**30, 3),
-            "gpu_reserved_gib": round(memory.get("reserved", 0) / 2**30, 3)}
+    out = {"gpu_peak_allocated_gib": round(memory.get("peak_allocated", 0) / 2**30, 3),
+           "gpu_allocated_gib": round(memory.get("allocated", 0) / 2**30, 3),
+           "gpu_reserved_gib": round(memory.get("reserved", 0) / 2**30, 3)}
+    if "read_staging" in memory:            # ggml: pinned host memory its reads go through
+        out["gpu_read_staging_gib"] = round(memory["read_staging"] / 2**30, 3)
+    return out
 
 
 def warm(args):
@@ -335,21 +340,22 @@ def _compare(got, ref, widths):
 
 
 def accuracy(args):
-    """torch vs numpy on one plan: decoded values and stored cache values."""
+    """torch (--device vulkan: ggml) vs numpy on one plan: decoded values and stored cache values."""
     jobs = Jobs(args)
     doc = jobs.document(args.doc)
     job = jobs.job(doc, hub=args.hub, device="cpu")
     hub = hub_module.open_hub(args.hub, cache_dir=args.cache_dir)
     # the engine's own inputs, then the stages
-    numpy_backend, torch_backend = backends.select("cpu"), backends.select("gpu")
+    numpy_backend = backends.select("cpu")
+    device_backend = backends.select("vulkan" if args.device == "vulkan" else "gpu")
     report_numpy = engine.run(job, hub=hub, backend=numpy_backend)
     stored_numpy = kvstate.read_file(job["target"]["output"], jobs.spec[jobs.target])
-    job_torch = {**job, "target": {**job["target"], "output": job["target"]["output"] + ".torch"}}
-    report_torch = engine.run(job_torch, hub=hub, backend=torch_backend)
-    stored_torch = kvstate.read_file(job_torch["target"]["output"], jobs.spec[jobs.target])
+    job_device = {**job, "target": {**job["target"], "output": job["target"]["output"] + "." + device_backend.name}}
+    report_device = engine.run(job_device, hub=hub, backend=device_backend)
+    stored_device = kvstate.read_file(job_device["target"]["output"], jobs.spec[jobs.target])
     out = {"mode": "accuracy", "direction": args.direction, "document": doc["document_id"][:12],
-           "t0": report_numpy["t0"], "stored": {}, "decoded": {}}
-    for a, b in zip(stored_torch.state.parts, stored_numpy.state.parts):
+           "t0": report_numpy["t0"], "backend": device_backend.describe(), "stored": {}, "decoded": {}}
+    for a, b in zip(stored_device.state.parts, stored_numpy.state.parts):
         if isinstance(a, kvstate.RecurrentState):
             out["stored"][a.name] = {"bytes_equal": kvstate._write_recurrent(jobs.spec[jobs.target], a)
                                      == kvstate._write_recurrent(jobs.spec[jobs.target], b)}
@@ -362,19 +368,21 @@ def accuracy(args):
             widths = [int(np.prod((sa.k if kind == "k" else sa.v)[l].shape[1:])) for l in a.layers]
             identical = float(np.mean(x == y))
             out["stored"][f"{a.name}.{kind}"] = {**_compare(x, y, widths), "f16_identical": round(identical, 4)}
-    for path in (job["target"]["output"], job_torch["target"]["output"]):
+    for path in (job["target"]["output"], job_device["target"]["output"]):
         Path(path).unlink()
     # decoded values: the same plan through compute on both backends
     source_state = kvstate.read_file(job["source"]["state"], jobs.spec[jobs.source])
     plan = _plan(jobs, job, source_state, hub, report_numpy["t0"])
     reference = translate.compute(plan, hub, numpy_backend)
-    got = translate.compute(plan, hub, torch_backend)
+    got = translate.compute(plan, hub, device_backend)
     for key, value in reference.items():
         section = next(s for s in plan.sections if s.name == key[0])
         widths = [int(np.prod(jobs.spec[jobs.target].head_shape(l, key[1]))) for l in section.layers]
-        out["decoded"][f"{key[0]}.{key[1]}"] = _compare(torch_backend.host(got[key]), value, widths)
+        out["decoded"][f"{key[0]}.{key[1]}"] = _compare(device_backend.host(got[key]), value, widths)
     out["reports"] = {"numpy_engine_seconds": report_numpy["engine_seconds"],
-                      "torch_engine_seconds": report_torch["engine_seconds"]}
+                      f"{device_backend.name}_engine_seconds": report_device["engine_seconds"]}
+    if report_device.get("fallback"):
+        out["reports"]["fallback"] = report_device["fallback"]
     return out
 
 
@@ -531,7 +539,7 @@ def main(argv=None):
     parser.add_argument("--doc", default="3b211f08c7af", help="document id prefix in the run")
     parser.add_argument("--run", type=Path, default=RUN)
     parser.add_argument("--gguf", action="append", default=[], help="NAME=PATH (defaults: /srv/models Q8 files)")
-    parser.add_argument("--device", default="auto", help="auto | cpu | gpu")
+    parser.add_argument("--device", default="auto", help="auto | cpu | gpu | vulkan (the ggml backend)")
     parser.add_argument("--threads", default="8", help="BLAS threads (read before numpy loads)")
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--engine", type=Path, default=HERE / "engine.py", help="oneshot: the engine script")
