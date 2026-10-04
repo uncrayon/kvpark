@@ -1,0 +1,21 @@
+--- a/tools/llama-bench/llama-bench.cpp
++++ b/tools/llama-bench/llama-bench.cpp
+@@ -2468,10 +2468,14 @@ int llama_bench(int argc, char ** argv) {
+                         exit(1);
+                     }
+ 
+-                    // store the context state for reuse in later runs
+-                    cstate.depth = t.n_depth;
+-                    cstate.buf.resize(llama_state_seq_get_size(ctx, 0));
+-                    llama_state_seq_get_data(ctx, cstate.buf.data(), cstate.buf.size(), 0);
++                    // Store the context only when another repetition can reuse it. At
++                    // reps=1 this copy is dead work and can duplicate a multi-GiB KV
++                    // cache, distorting the memory headroom being measured.
++                    if (params.reps > 1) {
++                        cstate.depth = t.n_depth;
++                        cstate.buf.resize(llama_state_seq_get_size(ctx, 0));
++                        llama_state_seq_get_data(ctx, cstate.buf.data(), cstate.buf.size(), 0);
++                    }
+                 } else {
+                     if (params.progress) {
+                         fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d (cached)\n", params_idx, params_count,

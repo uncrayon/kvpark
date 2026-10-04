@@ -1,6 +1,6 @@
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -37,6 +37,89 @@
+@@ -38,6 +38,89 @@
  #endif
  
  constexpr int HTTP_POLLING_SECONDS = 1;
@@ -90,7 +90,7 @@
  
  static common_speculative_output_limits server_output_limits(const common_params & params) {
      if (params.embedding ||
-@@ -2560,6 +2643,13 @@
+@@ -2715,6 +2798,13 @@
                          reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
                      if (nwrite == 0) {
                          send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
@@ -104,7 +104,7 @@
                          break;
                      }
  
-@@ -2622,6 +2712,7 @@
+@@ -2777,6 +2867,7 @@
  
                          slot->prompt.clear();
                          slot->prompt.tokens = std::move(restored);

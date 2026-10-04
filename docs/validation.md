@@ -217,3 +217,209 @@ That result motivated this project. It is not a benchmark for the standalone
 release and is not evidence of universal hybrid-model, draft, image, or GPU support.
 The original public release's tested scope was the standalone Qwen CPU flow;
 newer dated results above retain their own stated scope.
+
+## llama.cpp a7b94df2c runtime upgrade — October 4, 2026
+
+The runtime pin moved from `85d5703a3b1b47243213a39059a6e3076c92733a` to
+`a7b94df2c616bc1f62a73b964b4a71cb0dcc488e`, 583 upstream commits later.
+`patches/llama-slot-resume.patch` was rebased: only its hunk positions changed, and
+the patched `server-context.cpp` is identical to applying the old patch with offsets.
+No other patch is needed: upstream now fixes the DFlash image failure that the
+originating deployment patched locally. [Compatibility](compatibility.md#production-patch-set)
+explains the patch split. Everything ran on an AMD Ryzen AI Max+ 395 (Radeon 8060S,
+gfx1151, ROCm 7.2.2) with private servers on ports 18600-18619. The production
+services stayed stopped and were not changed. Other development work shared the
+machine during some runs, so the timings are single observations, not benchmarks.
+The evidence, including the check scripts named below, is local to the development
+checkout (`evidence/llamacpp-upgrade/`) and is not part of the repository.
+
+**Builds.** `python scripts/build_runtime.py` built the default CPU runtime end to end
+(51 s at `--jobs 24`). Three more out-of-tree builds of the same `llama-server` source
+used the flags in [compatibility](compatibility.md#building): a CPU build with tests, a
+Vulkan build, and a ROCm gfx1151 build with the production CMake options, whose source
+also carried the production `llama-bench` patch. Those three report
+`b11398-a7b94df2c`. The first script build reported the enclosing kvpark commit
+(`b34-b14e742`) and embedded the newest web UI instead of the pin's, because its export
+has no Git metadata. The script now passes the pin's build number and commit to CMake;
+its rebuild (74 s) reports `b11398-a7b94df2c`, embeds the `b11398` UI, has the same
+patched source, and passed the Qwen3-4B acceptance below again (cold 0/915 in 8.578 s,
+resident 922/22, replay after both restarts 914/1, outputs identical). On ROCm,
+`test-backend-ops -o TOP_K -b ROCm0` passed 525 of 525 cases, with no unsupported rows.
+
+**kvpark park/resume on the new CPU runtime** (`scripts/acceptance.py`, script build,
+ports from the session's range):
+
+| Model and settings | Stage | Cached | Processed | Whole response |
+| --- | --- | ---: | ---: | ---: |
+| Qwen3-4B-Instruct-2507 Q8_0, 4,096 context, 8 threads | Cold prompt | 0 | 915 | 8.785 s |
+| | Resident continuation | 922 | 22 | 0.677 s |
+| | Replay after both restarts | 914 | 1 | 0.455 s |
+| | Following continuation | 922 | 22 | 0.687 s |
+| Muse-Glimmer-30B Q8_0, the September 27 settings | Cold prompt | 0 | 2,467 | 111.462 s |
+| | Resident continuation | 2,474 | 26 | 3.645 s |
+| | Direct continuation after both restarts | 2,462 | 38 | 4.238 s |
+
+Both runs passed, and the restored messages equalled the resident ones exactly. The
+Muse snapshot (`.bin` 114,788,284 bytes, `.bin.resume` 164,988,268 bytes) has exactly
+the sizes recorded on the old pin.
+
+**Bridge sidecars on the new CPU server.**
+`experiments/universal_kv/fixtures_bridge/live_resume_check.py` passed all seven cases:
+no draft, an M-RoPE DFlash draft, a NEOX DFlash draft, MTP, media, and bridge switches
+into a DFlash target and an MTP target. Every translated restore was reused exactly
+(64, 321 and 288 tokens), and the negative checks (no `.resume`, an empty draft blob)
+were refused.
+
+**DFlash position fix.** `evidence/llamacpp-upgrade/tools/dflash_image_check.py` ran a
+tiny 5120-wide Qwen3.5 hybrid (IMROPE), a two-layer M-RoPE DFlash draft (8-token
+window) and the real Qwen3.8 F16 projector on the CPU. Each run sent 2,600 text
+tokens, then the same text followed by a 1024×1024 image (1,024 image tokens, two
+512-row microbatches). It then restored the text save twice, once with an empty draft
+blob and once with the bridge's aligned dummy, and continued:
+
+| Binary | Image after 2,600 text tokens | Draft cells after empty-draft restore (target at 2,689) |
+| --- | --- | --- |
+| Old pinned runtime (`85d5703a3` + slot resume) | HTTP 500 `failed to process mtmd chunk` (`failed to find a memory slot`) | 2,607-2,689 (aligned) |
+| Old production binary (+ contiguous-position patch), CPU device | Works, but afterwards the draft's window sits at positions 34-41 while the target is at 2,642 | 0-169 (misaligned; `process() did not run` warning) |
+| New pin (`a7b94df2c` + slot resume) | Works; the draft skips the image's positions | 2,607-2,689 (aligned) |
+
+With the aligned dummy, all three binaries kept the draft at the target's positions.
+
+A 2-second 512×512 video of the same image after the 2,600 text tokens worked on both
+pins: its eight frames arrived as five image chunks of about 260 rows, and each chunk
+fit the draft's free cells. The new pin's draft skipped the video's rows (2,634 draft
+cells for 3,914 target tokens, its window at the target's last positions); the old
+pin's draft held all 3,914.
+
+The failure also appears with the real model. With the production arguments moved to
+the CPU (devices `none`, a 16,384 context), Qwen3.8-27B Q8_0 with the DFlash2 Q8 M-RoPE
+draft and the F16 projector returned HTTP 500 `failed to process mtmd chunk` (`failed
+to find a memory slot for batch of size 438`) for the 950-token image after about
+2,650 text tokens on the old pinned runtime. The new pin's `build_runtime.py` build
+answered the same request (3,607 prompt tokens at 20 t/s on the CPU, draft acceptance
+0.49) and read all 13 checked strings of the image described below.
+
+**Production-equivalent ROCm build, Qwen3.8-27B Q8_0.** The production arguments were
+used as they are, except for the port, the slot directory, the alias and a 65,536
+context: DFlash2 Q8 M-RoPE draft (depth 7), F16 projector on ROCm0, F16 caches, flash
+attention, `--load-mode none`. Each prompt ran cold with the slot erased, at
+temperature 0 and with 256 generated tokens under the production reasoning settings.
+The old production binary ran the same script.
+
+| Request | New build, DFlash2 | Old production, DFlash2 | New build, MTP |
+| --- | --- | --- | --- |
+| 2,644-token prompt: prefill, decode, acceptance | 287.3 t/s, 19.43 t/s, 0.367 | 291.4 t/s, 20.26 t/s, 0.374 | 263.2 t/s, 14.57 t/s, 0.520 |
+| 14,295-token prompt | 294.7 t/s, 18.36 t/s, 0.385 | 284.7 t/s, 20.18 t/s, 0.396 | 309.0 t/s, 17.43 t/s, 0.589 |
+| Image (950 tokens) after about 2,650 text tokens | 263.4 t/s, 24.13 t/s, 0.491 | 243.8 t/s, 26.70 t/s, 0.553 | 289.4 t/s, 19.55 t/s, 0.645 |
+| Transcription of the image's 13 items | 13/13 | 13/13 | 13/13 |
+| Slot save, 3,718 tokens with the image (`.bin` / `.resume`) | 400.7 MB / 595.5 MB | 400.7 MB / 583.0 MB | 400.7 MB / 503.9 MB |
+| Restore, then continuation: reused / processed | 3,718 / 39, 163 ms restore | 3,719 / 38, 345 ms restore | 3,718 / 39, 143 ms restore |
+| Restored continuation equals resident continuation | Yes | Yes | Yes |
+
+The image was a synthetic 1200×800 document page with a Spanish heading, a four-row
+table and a footer. Every run read all 13 checked strings, including `7.3. Inventario
+de la Sala Norte`, `1,284`, `3,907` and `5,989`. The servers logged no `failed to
+process mtmd chunk`, memory-slot, position or restore errors. MTP used
+`--spec-type draft-mtp --spec-draft-n-max 4` with the Qwen3.8 MTP-only Q8_0 head, and
+the new build runs it unchanged.
+
+**Parking across processes, and video.** A second run of each speculative mode on the
+new build killed the server after the resident continuation and restored the slot in a
+fresh process with the same arguments, as parking does. Both reused all 3,718 tokens
+(restore 162 ms with DFlash2, 126 ms with MTP), processed 39, and repeated the resident
+answer exactly. The fresh process then took a 2-second 800×534 video of the same page
+after the 2,623 cached text tokens: eight frames, sent as five image chunks, 2,182 new
+tokens. With DFlash2 (acceptance 0.50) and with MTP (0.74) the answer contained all 13
+checked strings, and neither process logged an error.
+
+Speculative decode speed depends on what the model generates, so the decode
+differences above are not raw kernel speed. The raw comparison below used
+`llama-bench` without a draft (`-p 512 -n 128 -d 0,8192 -r 3`), alternating the new
+build and the old production libraries for four rounds, three starting with the new
+build and one with the old:
+
+| `llama-bench`, tokens/s (4 rounds × 3 samples) | New build | Old production |
+| --- | --- | --- |
+| 512-token prefill, empty context | median 332 (271-343) | median 335 (313-351) |
+| 128-token decode, empty context | median 7.68 (4.95-7.76) | median 7.75 (6.90-7.76) |
+| 512-token prefill after 8,192 tokens | median 300 (161-311) | median 293 (282-299) |
+| 128-token decode after 8,192 tokens | median 7.53 (4.91-7.60) | median 7.61 (7.57-7.62) |
+
+The low new-build values come from one run, the first of the sequence, in which every
+decode sample stayed between 4.9 and 6.0 t/s. Its cause was not found: other
+development work shared the machine, and other processes were logged only at the
+start of each run. Without that run the new build's medians are 331, 7.73, 305 and
+7.54 t/s. Prefill is then within 1% on an empty context and 4% faster after 8,192
+tokens. Decode is within 0.3% on an empty context and about 1% slower after 8,192
+tokens (7.48-7.60 against 7.57-7.62 t/s). An earlier two-round comparison also had
+low new-build values in its first run, and in its second round a 13% lower
+empty-context prefill for the new build (300 against 344 t/s) that the four rounds
+above did not reproduce. These are observations on a shared machine, not a
+quiet-machine benchmark. A first attempt, made while another 30B server shared the
+GPU, was discarded.
+
+**Vulkan build.** The slot save and restore cycle passed on `Vulkan0`
+(`tools/slot_cycle.py`, full offload, flash attention, 8,192 context). The first two
+rows restored in the same process after an erase; the last one restored in a fresh
+process after the server was killed, with a prompt longer than Muse's 2,048-token
+sliding window:
+
+| Model | Saved | Reused after restore | Restored answer equals resident |
+| --- | ---: | ---: | --- |
+| Qwen3-4B-Instruct-2507 Q8_0 | 1,804 | 1,804 | Yes |
+| Muse-Glimmer-30B Q8_0 | 1,506 | 1,478 (from a checkpoint) | Yes, including the reasoning text |
+| Muse-Glimmer-30B Q8_0, 2,724-token prompt, fresh process | 2,747 | 2,719 (from a checkpoint) | Yes, including the reasoning text |
+
+For Qwen3-4B, prefill ran at about 2,090 t/s and decode at 45 t/s. For Muse, prefill
+ran at about 350 t/s and decode at 7.8 t/s.
+
+**State formats.** Slot files, sequence blobs, KV and recurrent sections, server token
+lists, mtmd chunks and the `.resume` sidecar did not change. The KV translator's
+readers are affected in three places: nextn layers are no longer in the trunk cache
+of deepseek2 and similar models, qwen4exp's indexer cache is K-only with k-pool rows,
+and bailingmoe3 uses M-RoPE when its GGUF has rope sections. The experiment suites
+still pass with the old binaries. Run against new-pin binaries, they fail only in
+tests that hit these changes or changed fixture defaults.
+[experiments/linear_transfer/STATE_FORMAT_a7b94df.md](../experiments/linear_transfer/STATE_FORMAT_a7b94df.md) lists the changes and what
+`kvstate.py`, `kv_probe.cpp`, `state_driver.cpp` and `kvpark/bridge/resume.py` must
+change.
+
+### Switching the local Qwen3.8 service to the new ROCm build
+
+These are the commands for this machine; run them yourself. The Qwen3.8 backend
+runs under the user unit `kvpark.service` (`kvpark start --hermes --supervise`), and
+its binary path is stored in the Hermes profile's kvpark plugin settings.
+
+```bash
+OLD=/home/uncrayon/Documents/benchmark_models_linux/production/qwen38-dflash2-rocm-resume-20260905
+NEW=/home/uncrayon/Documents/benchmark_models_linux/production/qwen38-dflash2-rocm-a7b94df2c-20261004
+
+# 1. Stop the supervisor, proxy and backend, and the gateway that loads the plugin.
+systemctl --user stop hermes-gateway.service kvpark.service
+
+# 2. Keep a stable copy of the new build (its libraries resolve next to the binary).
+mkdir -p "$NEW"
+cp -a /home/uncrayon/Documents/kvpark/runtime-next/build-rocm/bin "$NEW/"
+"$NEW/bin/llama-server" --version   # version: 0.5.0-dev (build 11398, commit a7b94df2c)
+
+# 3. The old bundle was selected with LD_LIBRARY_PATH. Remove that line, or the new
+#    binary would load the old libraries, which have the same file names.
+grep -n LD_LIBRARY_PATH ~/.hermes/.env
+systemctl --user show-environment | grep LD_LIBRARY_PATH   # if it is not in .env
+
+# 4. Point the kvpark plugin at the new binary; the model and arguments stay the same.
+cp ~/.hermes/config.yaml ~/.hermes/config.yaml.before-a7b94df2c
+sed -i "s#$OLD/bin/llama-server#$NEW/bin/llama-server#g" ~/.hermes/config.yaml
+grep -n "$NEW" ~/.hermes/config.yaml
+
+# 5. Start again and check.
+systemctl --user start kvpark.service hermes-gateway.service
+~/.hermes/hermes-agent/venv/bin/python -m kvpark doctor --hermes
+curl -s http://127.0.0.1:8090/props | python3 -c 'import json, sys; print(json.load(sys.stdin)["build_info"])'
+```
+
+The last command should print `b11398-a7b94df2c`. Conversations parked under the old
+binary are not restored by the new one: the first return to each prefills it again,
+and parking it then produces a compatible snapshot. To roll back, stop both units,
+restore `~/.hermes/config.yaml.before-a7b94df2c` and the `LD_LIBRARY_PATH` line, and
+start them again.
