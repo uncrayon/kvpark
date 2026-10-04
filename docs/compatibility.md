@@ -39,6 +39,16 @@ hybrid and DFlash results came from the originating project with additional loca
 runtime corrections; they are not blanket validation of this package's GPU path.
 See [validation](validation.md) for the release's actual evidence.
 
+A September 27, 2026 development acceptance run also verified native park/resume
+for `Muse-Glimmer-30B-Q8_0.gguf` on the pinned CPU runtime, with F16 K/V caches and
+a 4,096-token context. Its 2,467-token cold prompt exceeded Muse's 2,048-token
+sliding window. A direct continuation after restarting both private processes
+reused 2,462 tokens, processed 38, and exactly matched the resident response's
+full message within an eight-token generation budget. See the
+[Muse acceptance scope and reproduction command](validation.md#muse-cpu-snapshot-acceptance).
+This verifies that particular CPU configuration; the existing Vulkan/DFlash
+deployment was not validated or configured for kvpark by this test.
+
 ## Building
 
 Default: `python scripts/build_runtime.py`. CMake builds only `llama-server` and

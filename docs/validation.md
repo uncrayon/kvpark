@@ -1,9 +1,66 @@
 # Alpha validation
 
-The observations below were recorded under the former **sloth-memory** name.
-They describe their stated release and environment; they are not new real-model
-acceptance results for the kvpark rename. Current test invocation examples use
-the new package and environment-variable names.
+Each result below applies to its stated revision, model, and environment.
+The September 2026 historical release and migration sections were recorded under
+the former **sloth-memory** name; their commands now use kvpark's package and
+environment-variable names. New development results are identified separately.
+
+## Muse CPU snapshot acceptance
+
+On September 27, 2026, the development checkout passed `scripts/acceptance.py`
+with the real `Muse-Glimmer-30B-Q8_0.gguf` weights. It used the pinned llama.cpp
+commit `85d5703a3b1b47243213a39059a6e3076c92733a` with the included slot-resume
+patch, CPU inference, F16 K/V caches, a 4,096-token context, 12 threads, and
+256-token batch/microbatch sizes. Flash attention and weight repacking were
+disabled; weights were memory mapped. Eight context checkpoints used 128-token
+minimum spacing.
+
+The harness launched its own backend and proxy on temporary ports with a private
+archive directory and `--cache-ram 0`. It processed a 2,467-token prompt, exceeding
+Muse's 2,048-token sliding window, then parked 2,474 tokens. After measuring a
+resident continuation, it stopped both private processes and launched fresh ones.
+The first request after restart was the continued transcript, without replaying
+the original request first.
+
+| Stage | Cached tokens | Processed tokens | Whole response |
+| --- | ---: | ---: | ---: |
+| Cold prompt | 0 | 2,467 | 104.900 s |
+| Resident continuation | 2,474 | 26 | 3.487 s |
+| Direct continuation after both restarts | 2,462 | 38 | 4.056 s |
+
+The archive contained a 114,788,284-byte `.bin` and a 164,988,268-byte `.bin.resume`
+companion. Both persisted across the restart, matched the published metadata,
+and the restore event reported the parked token count. The resident and restored
+continuations returned exactly equal complete message objects, including
+`reasoning_content`.
+
+The eight-token output budget ended during reasoning; neither continuation
+produced a final answer. The request used `reasoning_effort="none"`, but this
+model still returned reasoning within that budget. This is evidence of snapshot
+persistence, substantial cache reuse, and deterministic continuation, not task
+answer accuracy. Durations measure complete HTTP responses, excluding process
+startup and model loading; they are not TTFT. The OS page cache was not flushed.
+
+The local evidence file is `evidence/linear-transfer/muse-real-acceptance-v2.json`;
+generated evidence is not included in the package. Reproduce with an installed
+kvpark checkout and the matching patched runtime:
+
+```bash
+python scripts/acceptance.py \
+  --server runtime/build/bin/llama-server \
+  --model /path/to/Muse-Glimmer-30B-Q8_0.gguf \
+  --output evidence/muse-acceptance.json \
+  --ctx-size 4096 --prompt-repetitions 220 --max-tokens 8 --threads 12 \
+  --batch-size 256 --ubatch-size 256 \
+  --cache-type-k f16 --cache-type-v f16 --flash-attn off \
+  --load-mode mmap --no-repack \
+  --min-prompt-tokens 2049 --direct-continuation
+```
+
+This run validates the stated CPU configuration only. It neither validates the
+existing Vulkan/DFlash serving configuration nor configures that deployment for
+kvpark. GPU/speculative deployment and cross-model transfer require separate
+acceptance tests.
 
 ## Coordinated updates — 0.2.0a1
 
@@ -158,4 +215,5 @@ hardware/speculative fixes that are not shipped in this alpha.
 
 That result motivated this project. It is not a benchmark for the standalone
 release and is not evidence of universal hybrid-model, draft, image, or GPU support.
-The public release's tested scope is the standalone CPU flow described above.
+The original public release's tested scope was the standalone Qwen CPU flow;
+newer dated results above retain their own stated scope.
