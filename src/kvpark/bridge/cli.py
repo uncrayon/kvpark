@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import sys
 
-from . import engine_client, messages, registry
+from . import engine_client, messages, registry, surrogates
 
 # kvpark bridge add's RoPE flags: (flag, llama_context_params name, type); llama-server's own
 # flags of the same names (--rope-scale N sets rope_freq_scale = 1 / N, as llama-server does)
@@ -73,8 +73,9 @@ def add_parser(sub):
     engine.add_argument("--hub", help="hub bundle directory (format 1, or 2 from convert_hub.py); required the "
                         "first time")
     engine.add_argument("--device", choices=registry.ENGINE_DEVICES,
-                        help="gpu: torch on a ROCm/CUDA/MPS device; cpu: numpy; auto (default): the GPU when the "
-                        "engine Python's torch has one")
+                        help="gpu: torch on a ROCm/CUDA/MPS device; vulkan: the ggml Vulkan engine "
+                        "(experiments/universal_kv/ggml, no torch); cpu: numpy; auto (default): torch's GPU, else "
+                        "a Vulkan GPU, else the CPU")
     engine.add_argument("--mode", choices=registry.ENGINE_MODES,
                         help="daemon (default): keep the engine resident between switches; oneshot: a fresh "
                         "engine process per switch")
@@ -97,11 +98,62 @@ def add_parser(sub):
                       'will carry them, may be given too)')
     move.add_argument("--tail", type=int)
     move.add_argument("--no-warm", action="store_true", help="skip the warm request that prefills the tail")
+    move.add_argument("--request-out", type=Path, metavar="PATH",
+                      help="write the conversation as the target must receive it: media its server cannot take "
+                      "replaced by their text surrogates, as the switch translated it (send these messages, or the "
+                      "target re-reads the conversation from the first difference)")
+    media = commands.add_parser("media", help="what happens to images, audio and video a target model cannot take "
+                                "(settings not given are kept; with no options, show them)")
+    for key, values in registry.MEDIA_POLICIES.values():
+        what = {"image": "images become descriptions", "audio": "audio becomes transcripts",
+                "video": "videos become descriptions (or keyframes, for a target with vision)"}[key]
+        media.add_argument(f"--{key}", choices=(*values, "default"),
+                           help=f"{values[0]} (default): {what}; skip: switches with them are skipped")
+    media.add_argument("--model", help="set --image/--audio/--video for this model as a target only "
+                       "(default: drop its own setting)")
+    media.add_argument("--describer", action="append", default=[], metavar="MODALITY=MODEL|URL",
+                       help="who makes surrogates when the switch's source cannot (MODALITY: vision, audio or video): "
+                       "a registered model (its slot is saved and restored around the request) or a local "
+                       "llama-server URL; for audio also a local speech-to-text endpoint "
+                       "(http://127.0.0.1:PORT/v1/audio/transcriptions); MODALITY= drops it")
+    media.add_argument("--transcription-model", metavar="NAME",
+                       help="the model a speech-to-text describer is asked for (default whisper-1; '' drops it)")
+    media.add_argument("--cache-mib", type=float, metavar="N", help="size cap of the surrogate cache (default 64)")
+    media.add_argument("--clear-cache", action="store_true", help="delete every cached surrogate")
     undo = commands.add_parser("undo", help="drop a translated cache from a model's server")
     undo.add_argument("model")
     for parser in commands.choices.values():
         parser.add_argument("--config", type=Path, help="bridge configuration (default: kvpark data dir)")
     return bridge
+
+
+def media_summary(config, bridge_dir):
+    """The media settings for `kvpark bridge status` and `kvpark bridge media`: the policy for every
+    target and each model's own, the describers, the surrogate cache and whether ffmpeg is there."""
+    settings = config.get("media") or {}
+    out = {"policy": surrogates.policy(config),
+           "models": {name: surrogates.policy(config, name) for name in (settings.get("models") or {})},
+           "describers": settings.get("describers") or {},
+           "cache": surrogates.cache_for(config, bridge_dir).stats(),
+           "ffmpeg": bool(surrogates.ffmpeg_tools())}
+    if any(registry.is_transcription_url(value) for value in out["describers"].values()):
+        out["transcription_model"] = settings.get("transcription_model") or surrogates.TRANSCRIPTION_MODEL
+    return out
+
+
+def write_private(path, text):
+    """Write a file only the user can read (it holds the conversation): a new private file moved
+    into place, so an existing file's wider permissions are not kept."""
+    path = Path(path)
+    pending = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(text)
+        os.replace(pending, path)
+    except BaseException:
+        pending.unlink(missing_ok=True)
+        raise
 
 
 def daemon_summary(stats):
@@ -133,6 +185,9 @@ def engine_warnings(config, engine, daemon, bridge_dir):
     gpu = (engine or {}).get("gpu")
     if (config.get("engine") or {}).get("device") == "gpu" and gpu is not None and not gpu.get("available"):
         warnings.append(f"engine device gpu, but the engine Python has no GPU: {gpu.get('detail')}")
+    vulkan = (engine or {}).get("vulkan")
+    if (config.get("engine") or {}).get("device") == "vulkan" and vulkan is not None and not vulkan.get("available"):
+        warnings.append(f"engine device vulkan, but the ggml Vulkan engine is not available: {vulkan.get('detail')}")
     if daemon.get("gpu_fault"):
         warnings.append(f"the engine daemon stopped using the GPU after an error: {daemon['gpu_fault']}")
     if (config.get("engine") or {}).get("mode", "daemon") == "daemon" and os.name != "nt":
@@ -165,7 +220,8 @@ def run(args):
         out = {"config": str(path), "hub": config.get("hub"), "hub_models": sorted(models),
                "engine": config.get("engine"), "tail": config.get("tail"),
                "models": {name: {**cfg, "in_hub": cfg["hub_name"] in models}
-                          for name, cfg in config["models"].items()}}
+                          for name, cfg in config["models"].items()},
+               "media": media_summary(config, bridge_dir)}
         if config.get("engine"):
             stats = engine_client.status(bridge_dir)
             out["engine_daemon"] = daemon_summary(stats)
@@ -201,6 +257,7 @@ def run(args):
     elif command == "remove":
         if config["models"].pop(args.name, None) is None:
             raise ValueError(f"unknown bridge model {args.name!r}")
+        registry.forget_model_media(config, args.name)
         registry.save(config, path)
         print(f"removed {args.name}")
     elif command == "engine":
@@ -232,7 +289,29 @@ def run(args):
         report = switch(config, conversation, args.source, args.target, tail=args.tail, warm=not args.no_warm,
                         config_path=path, template_options=template_options(raw),
                         log=lambda event: print(json.dumps(event), flush=True))
+        if args.request_out:
+            # the surrogates the switch made are cached: the same replacements, on the original parts
+            rewritten, _ = surrogates.rewrite_request(config, raw, args.target, bridge_dir=bridge_dir,
+                                                      source=args.source)
+            write_private(args.request_out, json.dumps(rewritten or raw, indent=1) + "\n")
+            report["request_out"] = {"path": str(args.request_out), "rewritten": rewritten is not None}
         print(json.dumps(report, indent=2))
+    elif command == "media":
+        describers = {}
+        for item in args.describer:
+            modality, sep, value = item.partition("=")
+            if not sep:
+                raise ValueError("--describer takes MODALITY=MODEL or MODALITY=URL (MODALITY= drops it)")
+            describers[modality] = value or None
+        registry.set_media(config, policy={"image": args.image, "audio": args.audio, "video": args.video},
+                           target=args.model, describers=describers, cache_mib=args.cache_mib,
+                           transcription_model=args.transcription_model)
+        registry.save(config, path)
+        out = media_summary(config, bridge_dir)
+        if args.clear_cache:
+            out["cache"]["cleared"] = surrogates.cache_for(config, bridge_dir).clear()
+            out["cache"].update(entries=0, bytes=0)
+        print(json.dumps(out, indent=2))
     elif command == "undo":
         from .switch import undo
         undo(config, args.model)

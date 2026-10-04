@@ -15,7 +15,7 @@ from . import capabilities
 
 FORMAT = 1
 HUB_FORMATS = (1, 2)               # hub manifest format_version: 1 (fit_hub.py), 2 (convert_hub.py)
-ENGINE_DEVICES = ("auto", "cpu", "gpu")
+ENGINE_DEVICES = ("auto", "cpu", "gpu", "vulkan")
 ENGINE_MODES = ("daemon", "oneshot")
 # a model server's RoPE settings that change its cache, by llama_context_params name (the
 # engine builds the model's cache layout with them); rope_scaling_type is none | linear | yarn
@@ -29,6 +29,12 @@ RECURRENT_MEAN_FORMAT = 1          # experiments/universal_kv/recurrent_init.py 
 # hybrids with gated DeltaNet layers on a fixed pattern (every full_attention_interval-th layer is
 # attention): their recurrent layout follows from the GGUF header (kvstate.ModelSpec)
 GDN_INTERVAL_ARCHS = ("qwen35", "qwen35moe", "qwen3next")
+# what the bridge does with media a target's server cannot take (surrogates.py), by /props modality:
+# the `kvpark bridge media` option and its values, the first the default
+MEDIA_POLICIES = {"vision": ("image", ("caption", "skip")), "audio": ("audio", ("transcribe", "skip")),
+                  "video": ("video", ("describe", "skip"))}
+# the path that makes an audio describer an OpenAI-compatible speech-to-text endpoint
+TRANSCRIPTION_PATH = "/audio/transcriptions"
 
 
 def default_path():
@@ -65,6 +71,23 @@ def check_url(url):
     if parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost", "::1") or parsed.path not in ("", "/"):
         raise ValueError("model URL must be a local http://127.0.0.1:<port> llama-server address")
     return f"http://{parsed.hostname}:{parsed.port or 80}"
+
+
+def is_transcription_url(url):
+    """Whether a describer is a speech-to-text endpoint (its URL ends in /audio/transcriptions)."""
+    return isinstance(url, str) and urlsplit(url).path.rstrip("/").endswith(TRANSCRIPTION_PATH)
+
+
+def check_describer_url(url, modality):
+    """A describer given by URL: a local llama-server address (check_url) or, for audio, a local
+    OpenAI-compatible speech-to-text endpoint, http://127.0.0.1:<port>/v1/audio/transcriptions."""
+    if modality != "audio" or not is_transcription_url(url):
+        return check_url(url)
+    parsed = urlsplit(url)
+    if parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost", "::1") or parsed.query:
+        raise ValueError("a transcription endpoint must be a local http://127.0.0.1:<port>/v1/audio/transcriptions "
+                         "address")
+    return f"http://{parsed.hostname}:{parsed.port or 80}{parsed.path.rstrip('/')}"
 
 
 def check_runtime(runtime):
@@ -301,6 +324,82 @@ def set_engine(config, *, python=None, script=None, hub=None, device=None, mode=
             engine.pop("threads", None)
     config["engine"] = engine
     return config
+
+
+def set_media(config, *, policy=None, target=None, describers=None, cache_mib=None, transcription_model=None):
+    """Set what the bridge does with media a target's server cannot take (surrogates.py).
+
+    policy: {"image": "caption"|"skip", "audio": "transcribe"|"skip", "video": "describe"|"skip"}
+    (None values are left alone, "default" drops the setting), for every target or, with `target`,
+    for that registered model as a target; describers: {modality ("vision", "audio", "video"): a
+    registered model name or a local llama-server URL (for audio also a local speech-to-text
+    endpoint, .../v1/audio/transcriptions), or None to drop it}; cache_mib: the size cap of the
+    surrogate cache; transcription_model: the "model" a speech-to-text endpoint is asked for
+    ("" drops it: surrogates.TRANSCRIPTION_MODEL). Settings not given keep their values."""
+    media = dict(config.get("media") or {})
+    choices = dict(MEDIA_POLICIES.values())
+    changes = {key: value for key, value in (policy or {}).items() if value is not None}
+    for key, value in changes.items():
+        if key not in choices:
+            raise ValueError(f"unknown media kind {key!r} (image, audio or video)")
+        if value not in (*choices[key], "default"):
+            raise ValueError(f"--{key} must be one of {', '.join(choices[key])} or default")
+    if target is not None:
+        model(config, target)                              # a registered model, or ValueError
+        overrides = dict(media.get("models") or {})
+        entry = dict(overrides.get(target) or {})
+        _apply_policy(entry, changes)
+        if entry:
+            overrides[target] = entry
+        else:
+            overrides.pop(target, None)
+        media["models"] = overrides
+    else:
+        settings = dict(media.get("policy") or {})
+        _apply_policy(settings, changes)
+        media["policy"] = settings
+    if describers:
+        chosen = dict(media.get("describers") or {})
+        for modality, value in describers.items():
+            if modality not in MEDIA_POLICIES:
+                raise ValueError(f"unknown modality {modality!r} (vision, audio or video)")
+            if value is None:
+                chosen.pop(modality, None)
+            else:
+                # a registered model is saved and restored around its side requests; any other
+                # describer is a local server whose resident conversation the request replaces
+                chosen[modality] = value if value in config["models"] else check_describer_url(value, modality)
+        media["describers"] = chosen
+    if cache_mib is not None:
+        if type(cache_mib) not in (int, float) or not math.isfinite(cache_mib) or cache_mib <= 0:
+            raise ValueError("the surrogate cache size must be a positive number of MiB")
+        media["cache_mib"] = cache_mib
+    if transcription_model is not None:
+        if not isinstance(transcription_model, str):
+            raise ValueError("the transcription model is a name")
+        media["transcription_model"] = transcription_model.strip()
+    config["media"] = {key: value for key, value in media.items() if value or key == "cache_mib"}
+    return config
+
+
+def _apply_policy(settings, changes):
+    for key, value in changes.items():
+        if value == "default":
+            settings.pop(key, None)
+        else:
+            settings[key] = value
+
+
+def forget_model_media(config, name):
+    """Drop a removed model's media settings: its overrides as a target, and describers naming it."""
+    media = config.get("media") or {}
+    models = {key: value for key, value in (media.get("models") or {}).items() if key != name}
+    describers = {key: value for key, value in (media.get("describers") or {}).items() if value != name}
+    for key, value in (("models", models), ("describers", describers)):
+        if value:
+            media[key] = value
+        else:
+            media.pop(key, None)
 
 
 def hub_format(directory):

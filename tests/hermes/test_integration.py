@@ -1,6 +1,7 @@
 """Run with Hermes' Python environment and its source importable; all profiles are temporary."""
 
 import asyncio
+import hashlib
 from http.server import ThreadingHTTPServer
 import json
 import os
@@ -538,8 +539,13 @@ class HermesIntegrationTests(unittest.TestCase):
             result = apply_llm_request_middleware(image, session_id="session-b",
                                                   base_url="http://127.0.0.1:18083/v1", api_mode="chat_completions")
         self.assertEqual(result.payload, image)
-        # the image reaches the bridge as a placeholder, without its bytes
-        self.assertEqual(run.call_args[0][1]["messages"][0]["content"][1], {"type": "media", "modality": "vision"})
+        # the image reaches the bridge as a placeholder with its bytes' digest; the part itself stays
+        # beside the messages, in memory, for the surrogate producers
+        from kvpark.bridge.messages import media_digest
+        moved = run.call_args[0][1]
+        self.assertEqual(moved["messages"][0]["content"][1],
+                         {"type": "media", "modality": "vision", "sha256": media_digest(image["messages"][0]["content"][1])})
+        self.assertEqual(list(moved["media_parts"].values()), [image["messages"][0]["content"][1]])
         status = self.command_text("switch status")
         self.assertIn("skipped (target-no-vision)", status)
         self.assertIn("no vision encoder", status)
@@ -550,6 +556,80 @@ class HermesIntegrationTests(unittest.TestCase):
                                                   base_url="http://127.0.0.1:18083/v1", api_mode="chat_completions")
         self.assertEqual(result.payload, conversation)
         self.assertIn("engine exploded", self.command_text("switch status"))
+
+    def test_bridge_media_surrogates_reach_a_model_without_that_encoder(self):
+        from hermes_cli.middleware import apply_llm_request_middleware
+        from http.server import BaseHTTPRequestHandler
+        import base64
+        import struct
+        from kvpark.bridge import registry, surrogates
+
+        class TextOnly(BaseHTTPRequestHandler):
+            # a llama-server without an mmproj, as far as the middleware asks it (/props)
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                data = json.dumps({"modalities": {"vision": False, "audio": False, "video": False}}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+        muse = ThreadingHTTPServer(("127.0.0.1", 0), TextOnly)
+        threading.Thread(target=muse.serve_forever, daemon=True).start()
+        self.addCleanup(muse.server_close)
+        self.addCleanup(muse.shutdown)
+        muse_url = f"http://127.0.0.1:{muse.server_port}"
+        gguf = self.home / "model.gguf"
+        key, arch = b"general.architecture", b"muse-glimmer"
+        gguf.write_bytes(b"GGUF" + struct.pack("<IQQ", 3, 0, 1) + struct.pack("<Q", len(key)) + key
+                         + struct.pack("<IQ", 8, len(arch)) + arch)
+        slots = self.home / "slots"
+        slots.mkdir()
+        config_path = self.home / "bridge" / "bridge.json"
+        config = registry.empty()
+        registry.add_model(config, "muse", url=muse_url, gguf=gguf, slot_dir=slots)
+        registry.save(config, config_path)
+        env = patch.dict(os.environ, {"KVPARK_BRIDGE_CONFIG": str(config_path)})
+        env.start()
+        self.addCleanup(env.stop)
+        chart = b"a bar chart"
+        part = {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(chart).decode()}}
+        request = {"model": "muse", "messages": [{"role": "system", "content": "s"},
+                                                 {"role": "user", "content": [{"type": "text", "text": "what is this"},
+                                                                              part]}]}
+        # nothing has described the image and no describer is set: the request goes out as it is
+        result = apply_llm_request_middleware(request, session_id="session-m", base_url=muse_url + "/v1",
+                                              api_mode="chat_completions")
+        self.assertEqual(result.payload, request)
+        status = self.command_text("switch status")
+        self.assertIn("Last request with media for muse went out unchanged: no image surrogate could be made", status)
+        # the surrogate a switch made (cached by the image's bytes) replaces the image in this request
+        # and every later one, so muse's prompt is the one the switch translated
+        surrogates.Cache(config_path.parent / surrogates.CACHE_DIR).put(
+            hashlib.sha256(chart).hexdigest(), "vision", "qwen38", {"text": "[Image description: five bars]"})
+        result = apply_llm_request_middleware(request, session_id="session-m", base_url=muse_url + "/v1",
+                                              api_mode="chat_completions")
+        self.assertEqual(result.payload["messages"][1]["content"], "what is this\n[Image description: five bars]")
+        self.assertEqual(result.payload["messages"][0], request["messages"][0])
+        self.assertEqual(result.trace, [{"source": "kvpark", "reason": "bridge media surrogates"}])
+        self.assertEqual(request["messages"][1]["content"][1], part)        # Hermes' history keeps the image
+        self.assertIn("Last request with media for muse: media: 1 image as text (1 from the surrogate cache or the "
+                      "conversation).", self.command_text("switch status"))
+        # a server that is not a bridge model, or a request without media, is left alone
+        for base_url, sent in (("http://127.0.0.1:9/v1", request),
+                               (muse_url + "/v1", {"model": "muse", "messages": [{"role": "user", "content": "hi"}]})):
+            result = apply_llm_request_middleware(sent, session_id="session-m", base_url=base_url,
+                                                  api_mode="chat_completions")
+            self.assertEqual(result.payload, sent)
+        # the policy can keep images as they are for this model
+        registry.save(registry.set_media(registry.load(config_path), policy={"image": "skip"}, target="muse"),
+                      config_path)
+        result = apply_llm_request_middleware(request, session_id="session-m", base_url=muse_url + "/v1",
+                                              api_mode="chat_completions")
+        self.assertEqual(result.payload, request)
+        self.assertIn("its vision media policy is skip", self.command_text("switch status"))
 
     def test_unknown_active_context_is_unverified(self):
         from hermes_cli.middleware import apply_llm_request_middleware

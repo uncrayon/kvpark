@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Move the patched runtime to llama.cpp a7b94df2c. The slot-resume patch carries over unchanged, so `.resume` archives keep their format. Upstream now keeps DFlash draft positions at the target's positions, which fixes images after long text with an M-RoPE DFlash draft; the production-only patches the user's builds carried are superseded upstream except a `llama-bench` one, kept in `patches/production/`.
+- Add `kvpark bridge` (experimental): switch a live conversation between local models by translating its cache through a shared latent (`experiments/universal_kv`). The engine runs resident on the GPU (torch) or through Vulkan (ggml, no torch), writes `.resume` sidecars with DFlash and MTP draft state, renders Hermes' request options, starts hybrid models' recurrent state from a per-model mean, and replaces images, audio and video a target cannot read with text descriptions or transcripts. Hermes: `/kvpark switch`.
 - Add `kvpark start --hermes`, which starts the connection configured in the active Hermes profile from a terminal, and `--supervise`, which keeps relaunching stopped services for a systemd or launchd boot service.
 
 ## 0.3.0a3 — safer routing and Hermes compatibility

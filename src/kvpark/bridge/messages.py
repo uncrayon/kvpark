@@ -1,11 +1,14 @@
 """OpenAI-style chat messages -> the bridge engine's conversation form."""
 
+import base64
+import binascii
+import hashlib
 import json
 
 ROLES = {"system", "user", "assistant", "tool"}
 # OpenAI content parts llama-server accepts, by the /props "modalities" key that enables them
-# (tools/server/server-common.cpp:1213-1260)
-MEDIA_PARTS = {"image_url": "vision", "input_audio": "audio", "input_video": "video"}
+# (tools/server/server-common.cpp:1213-1260; upstream also reads "video_url" as "input_video")
+MEDIA_PARTS = {"image_url": "vision", "input_audio": "audio", "input_video": "video", "video_url": "video"}
 # request fields llama-server passes to the chat template (server-common.cpp:1308-1331): e.g.
 # Qwen3.8's template writes the reasoning effort into the prompt, and enable_thinking: false drops it
 TEMPLATE_FIELDS = ("chat_template_kwargs", "reasoning_effort")
@@ -14,11 +17,54 @@ REASONING_VALUES = {"on": True, "enabled": True, "true": True, "1": True,
                     "off": False, "disabled": False, "false": False, "0": False, "auto": None, "-1": None}
 
 
-def _content(content):
-    """A string, or a list of {"type": "text", "text"} and {"type": "media", "modality"} parts.
+def media_reference(part):
+    """Where an OpenAI media part's data is, as llama-server reads it (image_url.url,
+    input_audio/input_video data else url): a data URL, raw base64, an http(s) URL or a file://
+    path; "" when the part names none."""
+    kind = part.get("type")
+    value = part.get(kind)
+    if not isinstance(value, dict):
+        return ""
+    reference = value.get("url") if kind == "image_url" else value.get("data") or value.get("url")
+    return reference if isinstance(reference, str) else ""
 
-    Media parts keep only their modality: the bridge never needs the bytes (the target server
-    reads them from the real request), so no image or audio reaches the engine's job file."""
+
+def media_bytes(reference):
+    """The bytes of inline media (a base64 data URL or raw base64, line breaks allowed), or None
+    for a URL or a file path (the server fetches those itself) and for text that is not base64
+    (a data URL without its comma included)."""
+    if not reference or reference.startswith(("http://", "https://", "file://")):
+        return None
+    if reference.startswith("data:"):
+        _, comma, reference = reference.partition(",")
+        if not comma:
+            return None
+    try:
+        return base64.b64decode("".join(reference.split()), validate=True)
+    except (binascii.Error, ValueError):
+        return None
+
+
+def media_digest(part):
+    """sha256 of an OpenAI media part's bytes; for remote media (a URL or file path, which the
+    bridge never fetches) of "url:" and the reference; for a part that names no media in a form
+    llama-server reads (e.g. image_url given as a string) of "part:" and the part's JSON, so two
+    such parts never share a surrogate."""
+    reference = media_reference(part)
+    if not reference:
+        return hashlib.sha256(b"part:" + json.dumps(part, sort_keys=True).encode()).hexdigest()
+    data = media_bytes(reference)
+    return hashlib.sha256(b"url:" + reference.encode() if data is None else data).hexdigest()
+
+
+def _content(content, kept):
+    """A string, or a list of {"type": "text", "text"} and {"type": "media", "modality", "sha256"}
+    parts.
+
+    Media parts keep their modality and the sha256 of their bytes; the parts themselves (with
+    their data) go to `kept` by digest, for the surrogate producers (surrogates.py). They stay
+    in memory: no image, audio or video reaches the engine's job or the bridge's files (its
+    surrogate cache keeps texts, and a video's keyframes for vision targets)."""
     if content is None:
         return ""
     if isinstance(content, str):
@@ -33,7 +79,9 @@ def _content(content):
                     raise ValueError("a text part must hold a string")
                 parts.append({"type": "text", "text": text or ""})
             elif kind in MEDIA_PARTS:
-                parts.append({"type": "media", "modality": MEDIA_PARTS[kind]})
+                digest = media_digest(part)
+                kept.setdefault(digest, part)
+                parts.append({"type": "media", "modality": MEDIA_PARTS[kind], "sha256": digest})
             else:
                 raise ValueError(f"content part type {kind!r} cannot be bridged")
         return parts
@@ -45,18 +93,20 @@ def conversation_from_openai(messages, tools=None):
 
     Keeps role, content, reasoning_content, tool calls (id, name, arguments) and tool results
     (tool_call_id, name); drops other fields. Content given as parts stays a list of text and
-    media placeholders until ``flatten`` renders it for a target server. Raises ValueError for
-    content the bridge cannot carry (unknown part types, malformed tool calls), so the caller
-    can fall back to a native prefill.
+    media placeholders until ``flatten`` renders it for a target server; a conversation with
+    media also keeps the original media parts ("media_parts": {sha256: part}, in memory only)
+    for the surrogates of a target without that modality. Raises ValueError for content the
+    bridge cannot carry (unknown part types, malformed tool calls), so the caller can fall back
+    to a native prefill.
     """
     if not isinstance(messages, list) or not messages:
         raise ValueError("a conversation needs messages")
-    names, out = {}, []
+    names, out, kept = {}, [], {}
     for index, message in enumerate(messages):
         role = message.get("role") if isinstance(message, dict) else None
         if role not in ROLES:
             raise ValueError(f"message {index} has an unsupported role {role!r}")
-        item = {"role": role, "content": _content(message.get("content"))}
+        item = {"role": role, "content": _content(message.get("content"), kept)}
         if role == "assistant":
             if isinstance(message.get("reasoning_content"), str) and message["reasoning_content"]:
                 item["reasoning_content"] = message["reasoning_content"]
@@ -83,7 +133,10 @@ def conversation_from_openai(messages, tools=None):
             item["tool_call_id"] = call_id
             item["name"] = message.get("name") or names.get(call_id) or "tool"
         out.append(item)
-    return {"messages": out, "tools": tools or None}
+    conversation = {"messages": out, "tools": tools or None}
+    if kept:
+        conversation["media_parts"] = kept
+    return conversation
 
 
 def template_options(request):

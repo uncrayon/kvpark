@@ -58,9 +58,11 @@ Design and evidence: [experiments/universal_kv/ARCHITECTURE.md](../experiments/u
   `runtime/` with small test models and live on the production Qwen3.8 build (ROCm, DFlash2
   draft, mmproj; and the same build with MTP), in and out of it.
   The target's resident conversation is replaced by the switch; park it first if you need it.
-- **Images and audio.** The translated cache stops before the first message that holds an
-  image or audio; the target reads that message and everything after it itself. See
-  [Images and audio](#images-and-audio).
+- **Images, audio and video.** A target that can read the media gets them as they are; the
+  translated cache stops before the first message that holds them, and the target reads that
+  message and everything after it itself. A target that cannot (an image moving to a text-only
+  model) gets a text stand-in instead, such as `[Image description: ...]`, made by the source
+  model or a describer and cached. See [Media across models](#media-across-models).
 
 ## Set up
 
@@ -119,10 +121,13 @@ Design and evidence: [experiments/universal_kv/ARCHITECTURE.md](../experiments/u
 
    The engine Python needs numpy with an optimized BLAS (OpenBLAS or MKL, as pip's numpy
    wheels bundle; a distribution numpy on the reference BLAS makes a switch take minutes) and,
-   for the GPU, torch with ROCm, CUDA or Apple MPS. `--device gpu` uses torch (float16
-   weights with float32 accumulation), `--device cpu` numpy, and `--device auto` (the default)
-   the GPU when the engine Python's torch has one. Without torch (for example
-   `experiments/linear_transfer/.venv`) the engine runs on the CPU. Other options:
+   for the GPU, torch with ROCm, CUDA or Apple MPS, or the ggml Vulkan engine
+   (`experiments/universal_kv/ggml`, no torch needed; build steps in its README). `--device gpu`
+   uses torch (float16 weights with float32 accumulation), `--device vulkan` the ggml engine
+   (the same precision), `--device cpu` numpy, and `--device auto` (the default) torch's GPU,
+   else a Vulkan GPU through ggml, else the CPU. On the Radeon 8060S a warm 13K-token
+   translation took 0.42-0.56 s with torch, 0.62-0.82 s with ggml-Vulkan and 3-4 s on the CPU;
+   in a fresh engine process ggml was the fastest (1.1-1.3 s against torch's 2.3-2.6 s). Other options:
    `--mode daemon|oneshot`, `--idle-unload S`, `--idle-exit S`, `--threads N`; see
    [The engine](#the-engine). Settings not given keep their values, so
    `kvpark bridge engine --device cpu` later changes only the device.
@@ -164,11 +169,14 @@ target reused on the warm request (`reused_tokens`, expected T0), the target's d
 `daemon_error` when the daemon was unavailable; `engine.backend` and `engine.device`), the
 native prompt start (`native_prefix_tokens`), what a hybrid target's recurrent cell started from
 (`recurrent`), how the request's template settings were handled (`template_options`, see
-[Request template settings](#request-template-settings)), the engine's `features` when the
-switch needed to know them (`engine_features`), and the time of each step. Send the
-conversation to the target's server as usual afterwards; it reuses the cache. A switch the
-bridge does not translate reports `"skipped"` with a reason code and a `"note"`; the target
-then simply prefills the conversation.
+[Request template settings](#request-template-settings)), the conversation's media and their
+surrogates (`media`, `surrogates`, see [Media across models](#media-across-models)), the
+engine's `features` when the switch needed to know them (`engine_features`), and the time of
+each step. Send the conversation to the target's server as usual afterwards; it reuses the
+cache. When the conversation holds media the target cannot read, send it as the switch
+rendered it, with their text surrogates: `--request-out PATH` writes it. A switch the bridge
+does not translate reports `"skipped"` with a reason code and a `"note"`; the target then
+simply prefills the conversation.
 
 ## The engine
 
@@ -220,7 +228,7 @@ measured before this change). A DeepSeek V4 target always runs on the CPU.
   `recurrent-mean`); the bridge decides those switches by them (see
   [Skipped switches](#skipped-switches)).
 - **Devices.** `--device` (or the environment variable `KVPARK_ENGINE_DEVICE`) picks
-  `gpu`, `cpu` or `auto`. A GPU error that looks like a broken device moves the daemon to the
+  `gpu`, `vulkan`, `cpu` or `auto`. A GPU error that looks like a broken device moves the daemon to the
   CPU until it exits (`gpu_fault` in its status); the job itself is redone on the CPU.
 - **Threads.** The CPU path uses one BLAS thread per physical core, at most 16
   (`--threads N`, or `OPENBLAS_NUM_THREADS`, `OMP_NUM_THREADS` or `MKL_NUM_THREADS` in the
@@ -300,8 +308,9 @@ the production Qwen3.8 keeps 2,048.
 ## Skipped switches
 
 The bridge skips a switch it cannot translate well or at all, and the target prefills the
-conversation natively, which is always correct. A skipped switch never touches the source's
-cache. Most skips are decided before the target is touched either. Two come later:
+conversation natively, which is always correct. A skipped switch leaves the source's cache as
+it was (when the source described media for the target first, its slot was saved before that
+side request and restored after). Most skips are decided before the target is touched either. Two come later:
 `draft-unsupported`, and `short` because of the DFlash window. Both are decided after the
 bridge has made the target's layout template. On the first switch into a target server, that
 template replaces the target's resident conversation, as the switch itself would have. Three
@@ -324,8 +333,8 @@ An engine from before a feature keeps the skip.
 | `unsupported-arch` | the engine cannot translate this architecture's cache (it translates the architectures listed under [What it can and cannot do](#what-it-can-and-cannot-do)), or the GGUF cannot be read |
 | `no-head-decoders` | the target is DeepSeek V4 and the hub lacks any of its three head decoders (`csa`, `hca`, `lid`; `fit_hub.py --heads`): its pooled caches are synthesized from per-token compressor inputs the hub decodes |
 | `no-indexer-keys` | the target is a DSA model (`deepseek32`, `glm-dsa`, `dots3note`, `hy_v4` with an indexer; `qwen4exp`'s block indexer) whose prompt is longer than its indexer `top_k`, and the hub has no indexer ridge for it (`fit_hub.py --indexer-ridge`): its indexer would rank the translated cells by keys the engine cannot write. Decided from the GGUF header and the prompt length before the source is saved; the engine's own refusal gives the same skip |
-| `target-no-vision`, `target-no-audio`, `target-no-video` | the conversation has that kind of media and the target's server has no encoder for it (no `--mmproj`) |
-| `dsv4-media` | the target is DeepSeek V4 and the conversation has media: media after a translated pooled cache has never been restored, so the target prefills it natively |
+| `target-no-vision`, `target-no-audio`, `target-no-video` | the conversation has that kind of media, the target's server has no encoder for it (no `--mmproj`), and no text surrogate replaces it: the media policy for it is `skip`, or nothing could make one (no cached one, and neither the source nor a describer has that encoder). See [Media across models](#media-across-models) |
+| `dsv4-media` | the target is DeepSeek V4 and would read media itself (text surrogates are fine): media after a translated pooled cache has never been restored, so the target prefills it natively |
 | `media-source` | only with an engine older than the `media-source` feature: the source has already processed the conversation's media (it has the encoder and the media sits in a message before its last answer). A current engine reads the source's cache up to its first medium instead |
 | `text-parts` | a message gives its text as a list of parts and the target's template renders such lists differently from plain text |
 | `draft-unsupported` | the target's server runs a draft model whose state the bridge cannot write (anything but DFlash/DSpark, MTP or none; e.g. a separate full-attention draft model, or an EAGLE3 or plain draft whose state looks like MTP's; for a DeepSeek V4 target any draft, DSpark and MTP included) |
@@ -393,7 +402,280 @@ makes the restore fail; the bridge then drops it, and the next switch makes a ne
 cached template whose `.resume` cannot be read (a save cut short) fails the switch and is
 dropped the same way.
 
-## Images and audio
+## Media across models
+
+**The short answer.** When a conversation holds an image, audio or a video and moves to a
+model that cannot read that kind of media, the bridge puts a text stand-in (a *surrogate*) in
+its place: `[Image description: ...]`, `[Audio transcript: ...]` or `[Video description: ...]`.
+The source model writes it when it can read the media (Qwen3.8 describes its own images), else
+a describer you name does; it is made once and cached. The target model then reads the
+surrogate as ordinary text, the switch goes ahead, and the real request carries the same
+surrogate, so the target's prompt is exactly what the switch translated for. A target that
+*can* read the media gets the media themselves, as before. Before this, every such switch was
+skipped, and the request itself failed on the target.
+
+### What each target gets
+
+| The conversation holds | Text-only target (Muse, Qwen3-4B) | Vision target without video input | Audio target without vision | Target with that input |
+| --- | --- | --- | --- | --- |
+| an image | `[Image description: ...]` | the image | `[Image description: ...]` | the image |
+| audio | `[Audio transcript: ...]` (speech verbatim; "No speech." and a sentence about the sound otherwise) | the same transcript | the audio | the audio |
+| a video | `[Video description: ...]`, and `[Video audio transcript: ...]` when its sound can be transcribed | its keyframes as images (with ffmpeg installed: one per 2 s, at most 8, 512 px wide) after `[Video keyframes at 1 s, 3 s, ...]`, plus the sound's transcript; without ffmpeg the description | the description and the transcript, as for a text-only target | the video |
+
+"Vision target without video input" means a vision server built without `MTMD_VIDEO`. That
+option is on by default wherever llama.cpp can run subprocesses (Linux, macOS, Windows; off on
+iOS, Android and WebAssembly; `tools/mtmd/CMakeLists.txt:5`, pinned and upstream), so every
+vision server on this machine also reports `video`: Qwen3.8 (its production build and
+`runtime/build`) and Gemma 4 26B/31B on a default build read a video themselves, through the
+last column, as frames only (llama.cpp never reads a video's sound track, see below). The
+keyframes column applies to a vision server built without it. An audio-capable target without
+vision (no local model is one) gets a video's sound track as a transcript too, not as audio.
+
+Before this change (the bridge as first committed), every cell left of the last column was a
+skipped switch (`target-no-vision`, `target-no-audio`, `target-no-video`), and llama-server
+itself refused the real request: a server without the encoder answers a request with an image
+with HTTP 500 `image input is not supported - hint: if this is unexpected, you may need to
+provide the mmproj` (the same for audio and video). Unless the client converts the media
+first, that conversation could not continue on the target at all.
+
+A message whose media all became surrogates becomes one string, its text parts and surrogates
+joined by newlines. A message that keeps some media (an image for an image+text target next
+to audio it cannot read) stays a list, with each surrogate as a text part where its medium
+was.
+
+### How llama.cpp takes media
+
+Both the current pin (a7b94df) and the previous one (85d5703a3) read three OpenAI content parts:
+`image_url` (vision), `input_audio` (audio) and `input_video` (video; upstream also accepts
+`video_url` as an alias, `tools/server/server-common.cpp:1182-1196` upstream). Each needs its
+modality in the server's `/props` `modalities` (pinned `server-context.cpp:4693-4698`, upstream
+4837-4842); without it the server throws (pinned `server-common.cpp:1216-1256`, upstream
+1154-1196), which reaches the client as HTTP 500 (`tools/server/server.cpp` `ex_wrapper`); a part
+type it does not know is HTTP 400. Video is not its own encoder: a server has `video` when it
+has vision and was built with `MTMD_VIDEO` (`mtmd-helper.cpp` `mtmd_helper_support_video`; on
+by default, see above; the server then needs ffmpeg in its PATH to decode a video). The
+video helper runs ffmpeg for frames only, 4 per second by default (`--video-fps`), with a
+`[0m5.00s]` time stamp every 5 s (`--video-timestamp-interval`), and never reads the sound track
+(upstream `mtmd-helper.cpp:720-760, 836-872`). Audio needs an audio projector: Whisper-style
+(Ultravox, Qwen2-Audio, Voxtral, Qwen3-ASR), Gemma 4 E2B/E4B, or Qwen2.5/Qwen3 Omni
+(upstream `docs/multimodal.md`).
+
+On this machine: Qwen3.8's projector is vision only (`qwen3vl_merger`; its builds also report
+`video`, as frames), Gemma 4 26B and 31B's projectors are vision only (`gemma4v`, read from
+their GGUF headers on the Windows SSD), and Muse and Qwen3-4B run without one. No local model
+takes audio.
+
+### Where the surrogates come from
+
+For each medium the target cannot read, the first of these that has one wins:
+
+1. **The conversation.** A text part right after the media part that already starts with the
+   marker (`[Image description:` ...): the media part is dropped and that text used. (Hermes'
+   own conversions carry no such marker, but they remove the media part as well, so there is
+   nothing left to replace; see [The real request](#the-real-request).)
+2. **The surrogate cache.** One made before for the same media bytes (their sha256), the same
+   kind and the same prompt version, by any producer. Later switches and later turns get the
+   same text, which keeps the target's prompt equal to its cache. The same medium twice in one
+   conversation is made once (the status calls the second "repeated").
+3. **The source model**, when its server has that input. One side request at temperature 0 with
+   thinking off: the media and a fixed prompt ("describe this image for a reader who cannot
+   see it and will be asked about it later; transcribe all visible text ...",
+   `surrogates.PROMPTS`). The source's slot is saved first (the save the switch translates
+   from) and restored from that file afterwards, so the conversation the source holds is
+   unchanged; the switch reuses that save instead of saving again. Measured on the production
+   Qwen3.8: a save after the restore is byte-identical to the save before the side request,
+   draft state (`.resume`) included. If that save fails, the switch fails with the save's error
+   (the switch needs the same save anyway) rather than handing the media to a describer.
+4. **The describer** set for that kind of media (`kvpark bridge media --describer`): a
+   registered model (its slot is saved and restored the same way), a local llama-server URL
+   (its resident conversation on slot 0 is replaced by the side request, so use a server that
+   does not hold one you need), or, for audio, a local OpenAI-compatible speech-to-text
+   endpoint (`http://127.0.0.1:PORT/v1/audio/transcriptions`, for example Lemonade's Whisper on
+   the NPU or a faster-whisper server). The bridge uploads the audio as a file with
+   the `model` set by `--transcription-model` (default `whisper-1`), `response_format=json` and
+   temperature 0, and takes the answer's `text` (empty: "No speech."). It takes inline audio
+   only. This is tested against a stand-in server, not yet against a real one.
+5. **Nothing**: the switch is skipped with `target-no-vision`, `target-no-audio` or
+   `target-no-video`, and the request goes out unchanged.
+
+A video is described by a producer with video input; failing that, a vision producer reads its
+keyframes in one request (with ffmpeg); its sound track is transcribed by a producer with
+audio input (with ffmpeg). When the video has sound that nothing could transcribe, its
+surrogate says so (`[Video audio transcript: unavailable (the video has a sound track that
+could not be transcribed)]`, `partial` in the report, "the sound of 1 not transcribed" in the
+status), so the target knows it cannot hear it; a later switch or request with a producer for
+audio completes that surrogate in the cache (the target then re-reads the conversation from
+that message once). Without ffmpeg the bridge cannot tell whether a video has sound; like
+llama.cpp's own video input, it then leaves the sound out. Media given by URL (`https://`,
+`file://`) are passed on to the producer, which fetches them itself; the bridge never
+downloads anything, and keys such media by their URL (a changed file behind the same URL
+keeps its old surrogate until `--clear-cache`).
+
+The cache is `surrogates/` next to the bridge configuration (private: the directory 0700, each
+entry 0600), at most 64 MiB (`--cache-mib`), least recently used first out. It holds the
+surrogate texts and, for vision targets, a video's keyframes (JPEG), keyed by the media's
+digests; never the media themselves.
+
+### Where the translated cache stops
+
+The switch translates the conversation as the target will read it, surrogates included.
+
+- **The source read the media itself** (Qwen3.8 → Muse with the image in an earlier message): the
+  source's cache holds the image's own cells, which no other model can use. The translated
+  cache stops before the message that held the image (`max_t0_message`), and the target
+  prefills that message, with the surrogate, and everything after it.
+- **The source read text** (Muse → Qwen3-4B, both text-only, the image described earlier): the
+  source's cache holds the same surrogate text, so it is translated like any other text and
+  nothing stops at it.
+- **The target reads the media** (any source → Qwen3.8 with an image): unchanged from before, see
+  [Images the target reads](#images-the-target-reads).
+- An image only in the newest message costs nothing either way: the newest message is always
+  prefilled natively.
+- A warm request (`kvpark bridge switch` without `--no-warm`) is sent when the target is left
+  with no media of its own.
+
+### The real request
+
+The target must receive the surrogates too, or its prompt differs from the translated cache
+(and an image it cannot read fails the request). In Hermes the middleware does it for every
+request to a registered bridge model whose server lacks a modality the request holds: each such
+part becomes its cached surrogate (or one made now by the staged switch's source or a
+describer). Hermes' own history keeps the media. Outside Hermes, `kvpark bridge switch
+--request-out PATH` writes the conversation as the target must receive it (asking the source
+too, when the switch was skipped before it made the surrogates).
+
+`/kvpark switch status` shows what happened, for example `media: 1 image as text (made by qwen38
+in 23.2 s)` after a switch, and for later requests `Last request with media for muse: media: 1
+image as text (1 from the surrogate cache or the conversation)`, or why a request went out
+unchanged.
+
+How Hermes itself handles media matters here. For a model that is not marked
+`supports_vision`, Hermes replaces images with its own description (`vision_analyze` through its
+auxiliary vision route) before kvpark sees the request
+(`agent/vision_message_prep.py` `_prepare_messages_for_non_vision_model`, applied in
+`agent/chat_completion_helpers.py` before the request middleware runs); `local-muse` is such a
+model in your configuration. Voice notes are transcribed by Whisper on the NPU before the
+agent runs (`gateway/run_inbound.py`), and video and audio files reach the model as file paths
+(the `video_analyze` tool reads videos on an auxiliary model). So in your Hermes setup a request
+to Muse already carries text; the bridge then has nothing to replace, and the engine reads the
+source's cache up to its first image (`source_media`) as described above. The bridge's
+surrogates matter when the request still holds the media: a model marked `supports_vision`
+whose server has no `--mmproj`, audio or video parts from other clients, or the `kvpark bridge
+switch` command. One difference: Hermes describes at temperature 0.1 (`tools/vision_tools.py`
+`_aux_call_kwargs`) and keeps its descriptions in memory only, so a description can change after
+a restart, and the target then re-reads the conversation from that message; the bridge's
+surrogates are made at temperature 0 and kept in its cache.
+
+### Policy
+
+```
+kvpark bridge media                                   # show the settings, the cache and ffmpeg
+kvpark bridge media --image caption|skip|default      # default: caption
+kvpark bridge media --audio transcribe|skip|default   # default: transcribe
+kvpark bridge media --video describe|skip|default     # default: describe
+kvpark bridge media --model muse --image skip         # for one target only (default drops it)
+kvpark bridge media --describer vision=qwen38         # who describes when the source cannot
+kvpark bridge media --describer audio=http://127.0.0.1:8095 --describer video=
+kvpark bridge media --describer audio=http://127.0.0.1:13305/v1/audio/transcriptions \
+                    --transcription-model whisper-v3-turbo-FLM   # a local speech-to-text server
+kvpark bridge media --cache-mib 128 --clear-cache
+```
+
+`skip` keeps a kind of media as it is: the switch is skipped as before, and the request goes out
+with the media. `kvpark bridge status` shows the same settings under `media`.
+
+### Costs and limits
+
+- **Time.** A surrogate costs one side request on the producer, once per medium: on the
+  production Qwen3.8 (DFlash2 draft, ROCm), describing the 480×320 chart (an 855-character
+  description, 198 tokens; the server's own times) took 9.8 and 9.9 s in two runs on an
+  otherwise idle GPU (23 tokens/s) and 21.4 and 21.9 s in two runs while other work shared the
+  GPU (10.6 tokens/s), plus the save and restore of the source's slot around it (0.5-1.3 s each
+  for 13.6K-16.2K-token slots of 1.05-1.22 GB). A Hermes switch
+  runs it while the request waits; later switches and turns read it from the cache. The switch
+  itself then costs what any switch costs (below).
+- **What is lost.** The target reads a description, not the image: it knows what the
+  description says, nothing more, and repeats its mistakes (in the one measured case the count,
+  the colors and the tallest bar were right and one comparison was wrong). Audio becomes its
+  words; tone of voice is lost.
+- **Sound in video.** Transcribed only with ffmpeg and a producer with audio input. No local
+  model has audio input; a speech-to-text describer (above) is the way to get it on this
+  machine. A target that reads the video itself never hears its sound (llama.cpp reads frames
+  only), and the bridge adds no transcript for it.
+- **Determinism.** Surrogates are made at temperature 0 and cached, so the same media give the
+  same text on every later turn. A new prompt version (`surrogates.PROMPT_VERSION`) makes new
+  ones.
+- **Privacy.** The cache holds text derived from your conversations (descriptions,
+  transcripts) and keyframes of videos, privately; `kvpark bridge media --clear-cache` deletes
+  them.
+
+Measured live, Qwen3.8 (production build, vision) → Muse (Vulkan, text only), one model loaded at
+a time (Qwen3.8 primed the conversation and described the image, then stopped; a stub handed its
+saved slot to the switch), on a held-out chat of 8 messages with the generated bar chart (5
+bars, the red one tallest) in message 3 and a question about it at the end (13,611 tokens for
+Qwen3.8 with the image's cells, 12,958 for Muse with the description):
+
+- **Today, without surrogates**, Muse refused the request: HTTP 500 `image input is not
+  supported - hint: if this is unexpected, you may need to provide the mmproj`.
+- **The surrogate.** Qwen3.8 described the chart in 21.4 s (the server's time, with the machine
+  busy: 10.7 tokens/s against 23 on an idle GPU, where the same request takes 9.9 s): the five
+  bars, their colors and the red one as the tallest, right; one comparison wrong (it called the
+  purple bar taller than the orange one). With the save (1.1 s) and restore (1.0 s) around it,
+  23.4 s. A save of Qwen3.8's slot after the
+  restore was byte-identical to the save before the side request (1.05 GB, and its `.resume`).
+  Qwen3.8 itself, seeing the image, answered "5 bars, red".
+- **The switch** (the surrogate from the cache): 1.9 s in all, 1.0 s of it the engine on the
+  GPU daemon, 0.03 s the restore (Qwen3.8's own slot save takes 1.2 s; here a stub handed over
+  the saved file). T0 = 6,900 tokens, stopped before the image's message because Qwen3.8's
+  cache holds the image's cells there.
+- **The real request**, rewritten with the surrogate as the Hermes middleware rewrites it,
+  reused exactly the 6,900 translated tokens and prefilled the other 6,058 in 41.1 s, against
+  76.9 s for Muse's native prefill of the same request. Both answered "the chart has five bars.
+  the tallest bar is red.", Muse's reasoning quoting the description.
+
+Counting the prompt only (the description is needed either way): 23.4 + 1.9 + 41.1 = 66 s before
+Muse's first token after the switch, against 23.4 + 76.9 = 100 s natively, in this one sample
+on a busy machine (the description alone runs twice as fast on an idle GPU). An image later in
+the conversation leaves more to translate.
+
+Evidence: `evidence/universal-kv/live-media-surrogates-20261004/` (`surrogates.jsonl`, server
+logs), `experiments/universal_kv/live_bridge.py surrogates`.
+
+The run above made the surrogate outside the switch and gave the switch a stub of Qwen3.8's
+saved slot. The Hermes path itself was then run live with both servers up (Qwen3.8 production
+build as the source, Qwen3-4B on Vulkan as the text-only target, so one 27-30B model ran) and an
+empty surrogate cache, through `hermes.Adapter.bridge_switch` (a staged switch, as
+`/kvpark switch` stages it) and `bridge_media`, with the image in message 15 of a 26-message
+chat (16,176 tokens on Qwen3.8, 8,688 on Qwen3-4B with the description):
+
+- Qwen3-4B refused the raw request (HTTP 500, as Muse did).
+- **The switch made the surrogate itself**: Qwen3.8's slot saved (1.3 s, the save the engine
+  then translated), the side request, the slot erased and restored (1.3 s); 24.6 s in all, while
+  another job was benchmarking Qwen3.8 on the same GPU (21.9 s for the side request at 10.6
+  tokens/s; on an idle GPU the same request took 9.8 s in an earlier run, at 23.3 tokens/s, with
+  0.5 s each for the save and restore of a 13.6K-token slot). The description was byte for byte
+  the one of the earlier runs.
+- The whole switch took 29.1 s (engine 4.1 s on the GPU daemon). T0 = 6,282 of 8,688, stopped
+  before the image's message.
+- `bridge_media` rewrote the request from the cache (2 ms), and the real request reused exactly
+  T0 (`cache_n` 6,282), prefilling the other 2,406 tokens in 4.7 s against 12.4 s for a native
+  prefill of 8,688. Both answered five bars, the red one tallest.
+- Qwen3.8's slot saved after all this was byte-identical to its save before the switch (1.22 GB,
+  and its `.resume`), and no bridge file was left in its slot directory.
+- `/kvpark switch status` read: `Last switch qwen38 → qwen3-4b: restored 6,282 of 8,688 prompt
+  tokens in 29.112 s (engine: daemon on the GPU, 4.054 s; media: 1 image as text (made by qwen38
+  in 23.2 s)).` and `Last request with media for qwen3-4b: media: 1 image as text (1 from the
+  surrogate cache or the conversation).`
+
+An earlier conversation of that run was rendered by Qwen3-4B's template in 460 tokens (it drops
+the earlier reasoning that makes it 13.6K on Qwen3.8), so its switch was skipped as `short`
+after the surrogate was made (10.8 s, the source again unchanged), and the target prefilled the
+rewritten request natively and answered correctly. Evidence:
+`evidence/universal-kv/live-media-surrogates-hermes-20261004-runs/` (`1-reasoning-short`,
+`2-concat`), `experiments/universal_kv/live_bridge.py surrogates-hermes`. These runs call the
+adapter's methods, not a running Hermes.
+
+### Images the target reads
 
 A conversation with images (`image_url` parts), audio (`input_audio`) or video
 (`input_video`) can be switched to a target that has that modality (`/props` modalities; a
@@ -416,8 +698,8 @@ server started with a matching `--mmproj`):
   than this skips such switches (`media-source`). Verified on tiny fixtures and on real
   llama-server slot saves holding an image (a tiny dense model with NORMAL image positions, and
   a tiny Qwen3.5 hybrid with Qwen3.8's projector and M-RoPE positions): the media slot gives
-  the same translated cache, byte for byte, as a text-only save of its prefix. Not yet live
-  (the only local vision model is Qwen3.8).
+  the same translated cache, byte for byte, as a text-only save of its prefix. Live, Qwen3.8's
+  slot with the chart's cells was read up to them in the Qwen3.8 → Muse switch above.
 - The media's bytes never reach the bridge's files; the target reads them from the real
   request.
 - No warm request is sent (it would read the marker as text); Hermes never sends one anyway.
@@ -434,10 +716,7 @@ such conversations the translated prefix changed the outcome each time (that dou
 reasoning that did not reach its answer within 1,200 tokens, a formatting request no longer
 followed), while the target's own cache restored the same way answered like the native
 prefill: the restore places the image correctly, and what follows a translated prefix depends
-on its quality. The other way, Qwen3.8 to Muse with the image, is skipped (`target-no-vision`).
-
-In the local setup audio is transcribed to text before it reaches llama-server, so it switches
-like any text.
+on its quality.
 
 ## Request template settings
 
@@ -539,10 +818,12 @@ sees the conversation's request go to the target's server, translates the cache,
 there and lets the request through; the target prefills only the native tail. The stage lasts
 15 minutes and is used once. `/kvpark switch status` shows the last result (with how the
 engine ran: daemon or one-shot, GPU or CPU, and its seconds, and whether the request's
-template settings were rendered by the engine), including a skipped switch and its reason (for
-example images going to a model without vision, or a rendering the engine cannot reproduce).
-Any failure (an engine error) falls back to a normal full prefill; the request itself is never
-changed.
+template settings were rendered by the engine, and what became of the conversation's media),
+including a skipped switch and its reason (for example a rendering the engine cannot
+reproduce). Any failure (an engine error) falls back to a normal full prefill. The request
+itself changes in one way only: media the target's server cannot read are replaced by their
+text surrogates, in this and every later request to that model (see
+[The real request](#the-real-request)).
 
 ## Add a model
 
@@ -580,9 +861,11 @@ for what each architecture has been validated on.
   only.
 - **The native tail** dominates a switch (8-16 s on the 27-30B models). A shorter tail needs
   better translation; on hybrids, the recurrent mean allows one for chats.
-- **Images.** The translated part stops before the first image, so an image early in the
-  conversation leaves little to translate, and in 3 of 3 measured conversations the translated
-  text in front of an image changed the answer.
+- **Images.** The translated part stops before the first image the target reads itself or the
+  source's cache holds, so an image early in the conversation leaves little to translate, and
+  in 3 of 3 measured conversations into Qwen3.8 the translated text in front of an image
+  changed the answer. A target without vision reads a description of the image, which carries
+  only what the description says.
 - **Drafts.** MTP drafting accepts less after a switch (48% against 61%) for the rest of the
   conversation. Draft models other than DFlash/DSpark and MTP, and any draft on a DeepSeek V4
   target, are skipped.
@@ -592,5 +875,6 @@ for what each architecture has been validated on.
   slower one-shot engine. The GPU path is tested on ROCm (Radeon 8060S) only; CUDA and Apple MPS
   are untested.
 - **The target's conversation** is replaced by the switch; park it first if you need it.
-- **Hermes.** `/kvpark switch` is covered by integration tests with a stand-in engine; a live
-  Hermes session has not been run yet.
+- **Hermes.** `/kvpark switch` is covered by integration tests with a stand-in engine, and its
+  switch and media path (`Adapter.bridge_switch`, `bridge_media`) ran live on real servers
+  outside Hermes; a live Hermes session has not been run yet.

@@ -4,7 +4,8 @@
 
 0. The switch is skipped (``report["skipped"]`` = a reason code, ``report["note"]``) when the
    translator cannot handle it: an architecture the engine cannot translate (see
-   capabilities.py), media the target cannot take (or, with an engine older than the
+   capabilities.py), media the target cannot take that get no text surrogate (the media
+   policy says skip, or nothing could make one; or, with an engine older than the
    "media-source" feature, media in the source's cache), a prompt too short to be worth
    translating, a DSA target without indexer keys for a prompt this long, or a draft model
    whose state the bridge cannot synthesize; or, at step 4, when the engine daemon's memory
@@ -14,6 +15,11 @@
    to the default rendering, see switch(), and "template-options" means too little of that
    rendering is shared with the request's). The target then simply prefills the conversation
    natively.
+   Media the target's server has no encoder for (an image going to a text-only model) are
+   replaced first by text surrogates (surrogates.py: "[Image description: ...]" from the cache,
+   the conversation, the source model or a describer; report["surrogates"]); a side request to
+   the source saves its slot first (step 3's save) and restores it after. The real request must
+   carry the same surrogates (surrogates.rewrite_request; the Hermes middleware does it).
 1. The target server renders the conversation with its own template (/apply-template, with the
    generation prompt and the request's template options) and tokenizes it (/tokenize with
    pieces): exactly what it will process. Media parts are rendered as the target's media
@@ -23,7 +29,8 @@
    configuration. Its .resume tells whether the server has a draft model and of which kind.
 3. The source server saves its slot (its cache for the conversation) into its slot directory.
 4. The engine translates the source slot into a target slot file holding [0, T0),
-   T0 = min(P - tail, start of the newest message, start of the first message with media);
+   T0 = min(P - tail, start of the newest message, start of the first message with media the
+   target reads or the source's cache holds);
    see experiments/universal_kv/engine.py (it renders the conversation as the server does,
    the request's template options included, and checks that the target's tokens spell it).
    It runs on the resident engine daemon (the job is sent over its socket, so the
@@ -35,8 +42,9 @@
    state of a translated restore).
 5. The target slot is erased and the translated file restored; every bridge file is deleted
    as soon as it has been used.
-6. Optionally (never with media) a warm request (one generated token) prefills the native tail
-   and reports how many prompt tokens the target reused (`cache_n`, expected T0).
+6. Optionally (never with media the target reads itself) a warm request (one generated token)
+   prefills the native tail and reports how many prompt tokens the target reused (`cache_n`,
+   expected T0).
 
 The target's resident conversation is replaced: park it first if it matters. Output stays
 correct whatever the translation quality, because llama-server only reuses cells whose tokens
@@ -44,6 +52,7 @@ match the prompt; translation changes the values of the reused cells, never whic
 target conditions on.
 """
 
+import contextlib
 import hashlib
 import json
 import os
@@ -51,7 +60,7 @@ from pathlib import Path
 import time
 import uuid
 
-from . import capabilities, engine_client, messages, registry, resume
+from . import capabilities, engine_client, messages, registry, resume, surrogates
 from .client import LlamaServer, ServerError
 
 TEMPLATE_TEXT = "Hello"
@@ -254,7 +263,7 @@ def _media_start(server, conversation, index, ids, *, prompt, marker, options=No
     except ServerError:
         cut = -1
     if cut < 0:
-        head, cut = prompt, prompt.find(marker)
+        head, cut = prompt, prompt.find(marker) if marker else -1
     if cut < 0:
         return 0              # no rendering shows where the media starts
     head_ids = [token for token, _ in server.tokenize(head[:cut], add_special=True)]
@@ -305,6 +314,9 @@ def switch(config, conversation, source, target, *, tail=None, fill=None, warm=T
     A, B = LlamaServer(src_cfg["url"]), LlamaServer(tgt_cfg["url"])
     bridge_dir = _bridge_dir(config_path)
     asked = {}
+    source_name = f"kvbridge-{uuid.uuid4().hex}.bin"
+    source_file = Path(src_cfg["slot_dir"]) / source_name
+    created = []
 
     def engine_features():
         """What the engine that will run the job handles beyond older ones (asked once, when needed)."""
@@ -313,33 +325,100 @@ def switch(config, conversation, source, target, *, tail=None, fill=None, warm=T
             report["engine_features"] = sorted(asked["features"])
         return asked["features"]
 
-    media = messages.media(conversation)
-    marker = None
-    if media:
-        target_props = B.props()
-        rule = capabilities.media(media, source=source, target=target,
-                                  source_modalities=A.props().get("modalities") or {},
-                                  target_modalities=target_props.get("modalities") or {},
-                                  source_saw=_source_saw(conversation), target_arch=target_arch)
-        source_media = bool(rule) and rule[0] == "media-source" and "media-source" in engine_features()
-        if source_media:
-            rule = None         # the engine reads the source's cache up to its first medium
-        if rule:
-            return skip(*rule)
-        marker = target_props.get("media_marker")
-        if not marker:
-            return skip("target-no-media-marker", f"{target}'s server does not report its media marker")
-        report["media"] = {"modalities": sorted(media), "first_message": min(media.values())}
-        if source_media:
-            report["media"]["source_media"] = True
-    join = _text_join(B, conversation)
-    if join is None:
-        return skip("text-parts", f"{target}'s chat template renders text parts differently from plain text")
-    n_media = messages.media_count(conversation)
-    conversation = messages.flatten(conversation, marker=marker, text_join=join)
+    def save_source():
+        """Step 3, once: the source's slot (its cache for the conversation) into its slot directory."""
+        if "source_saved" in asked:
+            return
+        if source_file not in created:
+            created.extend([source_file, Path(str(source_file) + ".resume")])
+        reply, seconds = A.slot_action("save", source_name)
+        asked["source_saved"] = True
+        report.update(source_tokens=reply.get("n_saved"), source_bytes=reply.get("n_written"))
+        report["timings"]["source_save_s"] = round(seconds, 3)
+        log({"step": "source-saved", "tokens": reply.get("n_saved")})
 
-    created = []
+    @contextlib.contextmanager
+    def hold_source():
+        """Around side requests to the source (surrogates): its slot is saved first (the save the
+        engine reads at step 4) and restored from that file after, so its cache is unchanged. A
+        failed save fails the switch (step 3 needs it anyway) instead of passing the media on to
+        the next producer."""
+        try:
+            save_source()
+        except ServerError as error:
+            raise RuntimeError(f"{source}'s slot save failed: {error}") from None
+        try:
+            yield
+        finally:
+            t = time.perf_counter()
+            try:
+                A.slot_action("erase")
+                A.slot_action("restore", source_name)
+            except ServerError as error:     # the surrogates stand; the source re-reads its conversation
+                report["source_restore_error"] = str(error)[:300]
+            report["timings"]["source_restore_s"] = round(time.perf_counter() - t, 3)
+
     try:
+        media = messages.media(conversation)
+        marker, cap = None, None
+        if media:
+            target_props = B.props()
+            target_modalities = target_props.get("modalities") or {}
+            source_modalities = A.props().get("modalities") or {}
+            saw = _source_saw(conversation)
+            # media the target has no encoder for become text surrogates, unless the policy says skip
+            replaced = {modality for modality in media if not target_modalities.get(modality)
+                        and surrogates.converts(config, target, modality)}
+            rule = capabilities.media(media, source=source, target=target, source_modalities=source_modalities,
+                                      target_modalities=target_modalities, source_saw=saw, target_arch=target_arch,
+                                      replaced=replaced)
+            source_media = bool(rule) and rule[0] == "media-source" and "media-source" in engine_features()
+            if source_media:
+                rule = None         # the engine reads the source's cache up to its first medium
+            if rule:
+                return skip(*rule)
+            report["media"] = {"modalities": sorted(media)}
+            if replaced:
+                t = time.perf_counter()
+                producers = [surrogates.Producer(source, A, modalities=source_modalities, hold=hold_source),
+                             *surrogates.describers(config, exclude={source, target}, log=log)]
+                resolution = surrogates.resolve(
+                    surrogates.lacking_parts(conversation["messages"], replaced, conversation.get("media_parts")),
+                    frames=bool(target_modalities.get("vision")), producers=producers,
+                    cache=surrogates.cache_for(config, bridge_dir), workdir=bridge_dir, log=log)
+                report["surrogates"] = resolution.report()
+                report["timings"]["surrogates_s"] = round(time.perf_counter() - t, 3)
+                if resolution.missing:
+                    modality = sorted(resolution.missing)[0]
+                    return skip(f"target-no-{modality}", f"the conversation has {modality} input, {target}'s "
+                                f"server has no {modality} encoder (mmproj), and {resolution.missing[modality]}")
+                conversation = surrogates.apply(conversation, resolution, replaced)
+                rule = capabilities.pooled_media(target, target_arch, set(messages.media(conversation)))
+                if rule:            # a video's keyframes, as images
+                    return skip(*rule)
+            # T0 stops at the first message whose media the target reads itself, and at the first
+            # one whose media the source's cache holds (its encoder's cells: the engine reads the
+            # source's text before them; their surrogates are prefilled natively)
+            native = messages.media(conversation)
+            held = [first for modality, first in media.items()
+                    if modality in replaced and source_modalities.get(modality) and first <= saw]
+            cap = min([*native.values(), *held], default=None)
+            if cap is not None:
+                report["media"]["first_message"] = cap
+            if native:
+                report["media"]["native"] = sorted(native)
+                marker = target_props.get("media_marker")
+                if not marker:
+                    return skip("target-no-media-marker", f"{target}'s server does not report its media marker")
+            if source_media:
+                report["media"]["source_media"] = True
+            media = native
+        join = _text_join(B, conversation)
+        if join is None:
+            return skip("text-parts", f"{target}'s chat template renders text parts differently from plain text")
+        n_media = messages.media_count(conversation)
+        conversation = messages.flatten(conversation, marker=marker, text_join=join)
+
         # 1. the target's prompt, as the target will tokenize it
         t = time.perf_counter()
         prompt = B.apply_template(conversation["messages"], conversation.get("tools"))
@@ -372,12 +451,13 @@ def switch(config, conversation, source, target, *, tail=None, fill=None, warm=T
             prompt_, tokens_, options_ = rendering
             effective_tail = base_tail
             handover = len(tokens_) - effective_tail
-            if media:
-                # the translated cache stops before the first message with media: the target
-                # prefills that message (and the media in it) and everything after natively
+            if cap is not None:
+                # the translated cache stops before the first message with media (or a surrogate of
+                # media the source's cache holds): the target prefills that message and everything
+                # after natively
                 key = id(rendering)
                 if key not in media_starts:
-                    media_starts[key] = _media_start(B, conversation, min(media.values()), [i for i, _ in tokens_],
+                    media_starts[key] = _media_start(B, conversation, cap, [i for i, _ in tokens_],
                                                      prompt=prompt_, marker=marker, options=options_)
                 report["media"]["tokens_before"] = media_starts[key]
                 handover = min(handover, media_starts[key])
@@ -460,14 +540,8 @@ def switch(config, conversation, source, target, *, tail=None, fill=None, warm=T
             if why:
                 return skip(*why)
 
-        # 3. the source's cache
-        source_name = f"kvbridge-{uuid.uuid4().hex}.bin"
-        source_file = Path(src_cfg["slot_dir"]) / source_name
-        created += [source_file, Path(str(source_file) + ".resume")]
-        reply, seconds = A.slot_action("save", source_name)
-        report.update(source_tokens=reply.get("n_saved"), source_bytes=reply.get("n_written"))
-        report["timings"]["source_save_s"] = round(seconds, 3)
-        log({"step": "source-saved", "tokens": reply.get("n_saved")})
+        # 3. the source's cache (saved already when the source made a surrogate)
+        save_source()
 
         # 4. translate
         def run_engine(rendering, effective_tail):
@@ -494,9 +568,10 @@ def switch(config, conversation, source, target, *, tail=None, fill=None, warm=T
             target_job = {"name": tgt_cfg["hub_name"], "gguf": tgt_cfg["gguf"], "template_state": str(template),
                           "output": str(output), "tokens": tokens_,
                           "prefix_state": str(prefix_file) if prefix_file else None, "prefix_tokens": prefix_tokens}
-            if media:
-                # T0 stops at the start of this message (the first one holding media)
-                target_job["max_t0_message"] = min(media.values())
+            if cap is not None:
+                # T0 stops at the start of this message (the first one holding media, or the surrogate
+                # of media the source's cache holds)
+                target_job["max_t0_message"] = cap
             if tgt_cfg.get("template_kwargs") is not None:
                 # the target server's own template flags (kvpark bridge add --reasoning-effort, ...)
                 target_job["template_kwargs"] = tgt_cfg["template_kwargs"]

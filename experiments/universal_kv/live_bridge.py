@@ -6,6 +6,8 @@
     python live_bridge.py drafts-control --servers SERVERS.json --source muse --target qwen38 --engine gpu=PY:gpu ...
     python live_bridge.py media-control  --servers SERVERS.json --source muse --target qwen38 --engine gpu=PY:gpu ...
     python live_bridge.py options --servers SERVERS.json --source muse --target qwen38 [--extra-target qwen3-4b] ...
+    python live_bridge.py surrogates --servers SERVERS.json --source qwen38 --target muse --engine gpu=PY:gpu ...
+    python live_bridge.py surrogates-hermes --servers SERVERS.json --source qwen38 --target qwen3-4b --engine gpu=PY:gpu ...
     python live_bridge.py --model NAME=GGUF ... --server BINARY ...     (hops with one upstream build, as before)
 
 Starts throwaway llama-servers (private ports and slot directories; nothing deployed is
@@ -45,6 +47,32 @@ media-control  media case (ii) (the image in an earlier message) on --limit conv
         native, a switch from the source, and the target's own cache of [0, T0) restored with the
         synthesized draft state: what the image and the reply look like after a restore with
         native values in front of the image, against translated ones.
+surrogates  an image moving into a text-only model (the vision source's description in its place):
+        with one 27-30B model loaded at a time. The source (vision) alone: per conversation it
+        processes the conversation with the chart in an earlier user message (a real chat request,
+        so its slot holds the image's cells) and its slot is saved and kept; then the bridge makes
+        the image's surrogate as a switch does (surrogates.resolve with the source as producer: its
+        slot saved, the side request, the slot erased and restored), records the side request's and
+        the save/restore's seconds, and saves the slot again after the restore to compare it with
+        the first save byte for byte (the side request leaves the source's cache as it was); the
+        source's own answer is recorded too. Then the source stops; the target (no vision) runs with
+        a stub in the source's place (its saved slot, its /props modalities): the raw request with
+        the image (what the target says today), a native prefill of the request with the surrogate,
+        the switch (the surrogate comes from the cache) and the real chat request rewritten as the
+        Hermes middleware rewrites it: its cache_n against T0, its time and its answer, checked
+        for the chart's facts (5 bars, the red one tallest).
+surrogates-hermes  the same image case through the Hermes middleware's own path, with both models
+        loaded (the target a small model, so one 27-30B model runs at a time) and an empty surrogate
+        cache: the source primes the conversation (a real chat request with the image) and its
+        slot is saved for comparison; the target's raw request (refused, no vision) and a staged
+        switch (kvpark.bridge.stage, as /kvpark switch stages it) consumed by
+        hermes.Adapter.bridge_switch, where switch() itself asks the source for the description
+        (its slot saved by step 3's save, erased and restored after); then
+        hermes.Adapter.bridge_media rewrites the request (from the cache), the real chat request
+        goes to the target (cache_n against T0, the answer), the source's slot is saved again and
+        compared with the first save byte for byte, /kvpark switch status is recorded, and a
+        native prefill of the rewritten request on the target gives the time and answer to
+        compare with.
 options switches whose real chat request carries template options (TEMPLATE_OPTIONS: none,
         what Hermes sends, enable_thinking off), with one 27-30B model loaded at a time: the
         source primes each conversation alone and its slots are saved and kept, then the
@@ -1001,8 +1029,382 @@ def options(args):
     return results
 
 
+# -- surrogates: an image moving into a text-only model -------------------------------------------
+
+def chart_answer_ok(text):
+    """Whether an answer about chart_png() gives its bar count (5) and the tallest bar's color (red)."""
+    import re
+    text = (text or "").lower()
+    return bool(re.search(r"\b(5|five)\b", text)) and bool(re.search(r"\bred\b", text))
+
+
+def media_stub(port, slot_dir, modalities):
+    """A StubSource whose /props reports these modalities (the real source's), so the switch knows
+    its cache holds the image's own cells."""
+    stub = StubSource(port, slot_dir)
+    base = stub.server.RequestHandlerClass
+
+    class Handler(base):
+        def do_GET(self):
+            if self.path == "/props":
+                return self.reply(200, {"build_info": "stub", "total_slots": 1, "modalities": modalities})
+            return base.do_GET(self)
+    stub.server.RequestHandlerClass = Handler
+    return stub
+
+
+def surrogates_mode(args):
+    import contextlib
+    import hashlib
+    from kvpark.bridge import surrogates
+    specs = server_specs(args)
+    missing = {args.source, args.target} - set(specs)
+    if missing:
+        raise SystemExit(f"no server spec for {sorted(missing)}")
+    slot_root = Path(args.slot_root)
+    held = slot_root / "held"
+    held.mkdir(parents=True, exist_ok=True, mode=0o700)
+    png = chart_png()
+    (args.output / "chart.png").write_bytes(png)
+    (label, python, device), = engines(args)
+    path = Path(f"bridge-{label}") / "bridge.json"           # relative to --bridge-root (cwd)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    cache = surrogates.cache_for({}, path.parent)
+    results = []
+
+    def start(name, number):
+        spec = specs[name]
+        slot_dir = slot_root / name
+        slot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        for stale in slot_dir.iterdir():
+            stale.unlink()
+        waited = wait_for_memory(name, spec["gguf"], args=spec.get("args"))
+        server = Server(name, spec["binary"], spec["gguf"], spec.get("port", args.base_port + number), spec["ctx"],
+                        slot_dir, args.output / f"{name}.log", args=spec.get("args"), env=spec.get("env"))
+        load = server.start()
+        print(json.dumps({"server": name, "port": server.port, "load_s": load, "memory_wait_s": waited,
+                          **machine()}), flush=True)
+        return server
+
+    # 1. the source alone: the conversation with the image, its saved slot, the surrogate
+    source = start(args.source, 0)
+    primed = []
+    try:
+        client = LlamaServer(f"http://127.0.0.1:{source.port}")
+        source_props = client.props()
+        chosen = choose(args, client, corpus(args), limit=args.limit, min_tokens=args.min_tokens,
+                        max_tokens=min(specs[name]["ctx"] for name in (args.source, args.target)) - 2048)
+        for number, (item, base, _) in enumerate(chosen):
+            history = item["messages"]
+            users = [i for i, m in enumerate(history) if m["role"] == "user"]
+            early = users[int(len(users) * 0.6)]
+            messages = ([({**m, "content": [{"type": "text", "text": m["content"]}, image_part(png)]} if i == early else m)
+                         for i, m in enumerate(history)]
+                        + [{"role": "user", "content": QUESTION + " (the chart I sent earlier)"}])
+            record = {"id": item.get("id"), "messages": len(messages), "image_message": early,
+                      "source_modalities": source_props.get("modalities")}
+            try:
+                # the source processes the conversation as it would before answering (one generated
+                # token): a real chat request, so its slot holds the image's cells
+                client.slot_action("erase")
+                extra = {"tools": base["tools"]} if base.get("tools") else {}
+                reply, seconds = client.chat(messages, max_tokens=1, temperature=0, id_slot=0, cache_prompt=True,
+                                             **extra)
+                record["prime"] = {**generation(reply), "wall_s": round(seconds, 2)}
+                name = f"primed-{number}.bin"
+                reply, seconds = client.slot_action("save", name)
+                saved = slot_root / args.source / name
+                tokens = reply.get("n_saved")
+                record["source_save"] = {"tokens": tokens, "bytes": reply.get("n_written"), "seconds": round(seconds, 3),
+                                         "sha256": hashlib.sha256(saved.read_bytes()).hexdigest()}
+                # the surrogate, as a switch makes it: the source's slot saved, the side request, the
+                # slot erased and restored from that save
+                timings = {}
+
+                @contextlib.contextmanager
+                def hold():
+                    t = time.perf_counter()
+                    client.slot_action("save", "hold.bin")
+                    timings["save_s"] = round(time.perf_counter() - t, 3)
+                    try:
+                        yield
+                    finally:
+                        t = time.perf_counter()
+                        client.slot_action("erase")
+                        client.slot_action("restore", "hold.bin")
+                        timings["restore_s"] = round(time.perf_counter() - t, 3)
+                conversation = conversation_from_openai(messages, base.get("tools"))
+                producer = surrogates.Producer(args.source, client, modalities=source_props.get("modalities") or {},
+                                               hold=hold)
+                started = time.perf_counter()
+                resolution = surrogates.resolve(
+                    surrogates.lacking_parts(conversation["messages"], {"vision"}, conversation.get("media_parts")),
+                    frames=False, producers=[producer], cache=cache, workdir=path.parent)
+                entry = next(iter(resolution.entries.values()), {})
+                record["surrogate"] = {**resolution.report(), "wall_s": round(time.perf_counter() - started, 3),
+                                       "hold": timings, "text": entry.get("text")}
+                # the source's cache after the side request: saved again, byte for byte the first save
+                client.slot_action("save", "after.bin")
+                after = slot_root / args.source / "after.bin"
+                record["source_unchanged"] = {
+                    "slot_identical": after.read_bytes() == saved.read_bytes(),
+                    "resume_identical": (Path(str(after) + ".resume").read_bytes() == Path(str(saved) + ".resume")
+                                         .read_bytes()) if Path(str(saved) + ".resume").is_file() else None}
+                # the source's own answer, seeing the image (thinking off, a short answer)
+                reply, seconds = client.chat(messages, max_tokens=args.max_tokens, temperature=0, top_k=1, id_slot=0,
+                                             cache_prompt=True, chat_template_kwargs={"enable_thinking": False},
+                                             **extra)
+                answer = (reply["choices"][0]["message"].get("content") or "")
+                record["source_answer"] = {**generation(reply), "wall_s": round(seconds, 2), "answer": answer[:600],
+                                           "correct": chart_answer_ok(answer)}
+                os.replace(saved, held / name)
+                for leftover in (slot_root / args.source).iterdir():
+                    leftover.unlink()
+                primed.append((record, messages, base, held / name, tokens))
+            except Exception as error:      # noqa: BLE001  (record and continue)
+                record["error"] = f"{type(error).__name__}: {error}"[:400]
+                results.append(record)
+            print(json.dumps({k: record.get(k) for k in ("id", "error", "source_unchanged")}
+                             | {"surrogate_s": (record.get("surrogate") or {}).get("seconds"),
+                                "source_correct": (record.get("source_answer") or {}).get("correct")}), flush=True)
+    finally:
+        source.stop()
+    # 2. the target alone, with a stub in the source's place
+    target_server, stub = None, None
+    try:
+        target_server = start(args.target, 1)
+        stub_dir = slot_root / f"{args.source}-stub"
+        stub_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        stub = media_stub(args.base_port + 9, stub_dir, source_props.get("modalities") or {})
+        config = registry.empty()
+        registry.add_model(config, args.source, url=stub.url, gguf=specs[args.source]["gguf"], slot_dir=stub_dir,
+                           **(specs[args.source].get("register") or {}))
+        registry.add_model(config, args.target, url=f"http://127.0.0.1:{target_server.port}",
+                           gguf=specs[args.target]["gguf"], slot_dir=slot_root / args.target,
+                           **(specs[args.target].get("register") or {}))
+        registry.set_engine(config, python=python, script=Path(__file__).with_name("engine.py"), hub=args.hub,
+                            device=device)
+        config["tail"] = args.tail
+        registry.save(config, path)
+        config = registry.load(path)
+        target = LlamaServer(f"http://127.0.0.1:{target_server.port}")
+        record_props = target.props().get("modalities")
+        for record, messages, base, slot, tokens in primed:
+            record["target_modalities"] = record_props
+            try:
+                tools = base.get("tools")
+                rewritten, summary = surrogates.rewrite_request(config, {"messages": messages}, args.target,
+                                                                bridge_dir=path.parent)
+                record["rewrite"] = summary
+                # what the target does today with the image (no surrogate): llama-server refuses it
+                try:
+                    target.chat(messages, max_tokens=1)
+                    record["raw_request"] = {"refused": False}
+                except Exception as error:      # noqa: BLE001
+                    record["raw_request"] = {"refused": True, "error": str(error)[:300]}
+                # a native prefill of the request with the surrogate, then the switch and the same request
+                target.slot_action("erase")
+                native = chat(target, rewritten["messages"], tools, args.max_tokens)
+                record["native"] = {**native, "correct": chart_answer_ok(native["answer"]), **machine()}
+                stub.select(slot, tokens)
+                warmed = prewarm(config, path, args.source, args.target)
+                before = machine()
+                report = switch(config, conversation_from_openai(messages, tools), args.source, args.target,
+                                config_path=path, warm=False)
+                record["switch"] = switch_record(report, warmed, before)
+                record["switch"]["surrogates"] = report.get("surrogates")
+                if not report.get("skipped"):
+                    bridged = chat(target, rewritten["messages"], tools, args.max_tokens)
+                    record["bridged"] = {**bridged, "correct": chart_answer_ok(bridged["answer"]),
+                                         "reuse_ok": bridged["cache_n"] == record["switch"]["t0"], **machine()}
+            except Exception as error:      # noqa: BLE001
+                record["error"] = f"{type(error).__name__}: {error}"[:400]
+            results.append(record)
+            print(json.dumps({"id": record["id"], "error": record.get("error"),
+                              "refused": (record.get("raw_request") or {}).get("refused"),
+                              "t0": (record.get("switch") or {}).get("t0"),
+                              "skipped": (record.get("switch") or {}).get("skipped"),
+                              "cache_n": (record.get("bridged") or {}).get("cache_n"),
+                              "reuse_ok": (record.get("bridged") or {}).get("reuse_ok"),
+                              "native_correct": (record.get("native") or {}).get("correct"),
+                              "bridged_correct": (record.get("bridged") or {}).get("correct")}), flush=True)
+            with open(args.output / "surrogates.jsonl", "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record) + "\n")
+        (args.output / "surrogates-log.json").write_text(json.dumps(target_server.scan_log(), indent=1) + "\n",
+                                                         encoding="utf-8")
+    finally:
+        try:
+            engine_client.stop(path.parent)
+        finally:
+            if stub is not None:
+                stub.close()
+            if target_server is not None:
+                target_server.stop()
+            for leftover in held.iterdir():
+                leftover.unlink()
+    return results
+
+
+def surrogates_hermes(args):
+    import hashlib
+    from kvpark import hermes
+    from kvpark.bridge import stage
+    specs = server_specs(args)
+    missing = {args.source, args.target} - set(specs)
+    if missing:
+        raise SystemExit(f"no server spec for {sorted(missing)}")
+    slot_root = Path(args.slot_root)
+    png = chart_png()
+    (args.output / "chart.png").write_bytes(png)
+    (label, python, device), = engines(args)
+    path = Path(f"bridge-{label}") / "bridge.json"           # relative to --bridge-root (cwd)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if (path.parent / "surrogates").exists():
+        shutil.rmtree(path.parent / "surrogates")          # an empty cache: the switch makes the surrogate
+    servers, results = {}, []
+    real_switch = bridge_switch.switch
+    try:
+        for number, name in enumerate((args.source, args.target)):
+            spec = specs[name]
+            slot_dir = slot_root / name
+            slot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            for stale in slot_dir.iterdir():
+                stale.unlink()
+            waited = wait_for_memory(name, spec["gguf"], args=spec.get("args"))
+            servers[name] = Server(name, spec["binary"], spec["gguf"], spec.get("port", args.base_port + number),
+                                   spec["ctx"], slot_dir, args.output / f"{name}.log", args=spec.get("args"),
+                                   env=spec.get("env"))
+            load = servers[name].start()
+            print(json.dumps({"server": name, "port": servers[name].port, "load_s": load, "memory_wait_s": waited,
+                              **machine()}), flush=True)
+        config = registry.empty()
+        for name in (args.source, args.target):
+            registry.add_model(config, name, url=f"http://127.0.0.1:{servers[name].port}", gguf=specs[name]["gguf"],
+                               slot_dir=slot_root / name, **(specs[name].get("register") or {}))
+        registry.set_engine(config, python=python, script=Path(__file__).with_name("engine.py"), hub=args.hub,
+                            device=device)
+        config["tail"] = args.tail
+        registry.save(config, path)
+        config = registry.load(path)
+        os.environ["KVPARK_BRIDGE_CONFIG"] = str(path)      # what the Hermes adapter's registry.load() reads
+        source, target = (LlamaServer(f"http://127.0.0.1:{servers[name].port}", timeout=1800)
+                          for name in (args.source, args.target))
+        base_url = f"http://127.0.0.1:{servers[args.target].port}/v1"
+        source_props = source.props()
+        chosen = choose(args, source, corpus(args), limit=args.limit, min_tokens=args.min_tokens,
+                        max_tokens=min(specs[name]["ctx"] for name in (args.source, args.target)) - 2048)
+        adapter = hermes.Adapter.__new__(hermes.Adapter)    # the adapter's bridge methods only (no Hermes)
+        adapter.namespace = "live-surrogates:"
+        for number, (item, base, _) in enumerate(chosen):
+            history = item["messages"]
+            users = [i for i, m in enumerate(history) if m["role"] == "user"]
+            early = users[int(len(users) * 0.6)]
+            messages = ([({**m, "content": [{"type": "text", "text": m["content"]}, image_part(png)]} if i == early else m)
+                         for i, m in enumerate(history)]
+                        + [{"role": "user", "content": QUESTION + " (the chart I sent earlier)"}])
+            tools = base.get("tools")
+            request = {"messages": messages, **({"tools": tools} if tools else {})}
+            record = {"id": item.get("id"), "messages": len(messages), "image_message": early,
+                      "source_modalities": source_props.get("modalities"),
+                      "target_modalities": target.props().get("modalities")}
+            try:
+                # the source processes the conversation with the image (one generated token)
+                source.slot_action("erase")
+                reply, seconds = source.chat(messages, max_tokens=1, temperature=0, id_slot=0, cache_prompt=True,
+                                             **({"tools": tools} if tools else {}))
+                record["prime"] = {**generation(reply), "wall_s": round(seconds, 2)}
+                reply, seconds = source.slot_action("save", f"primed-{number}.bin")
+                primed = slot_root / args.source / f"primed-{number}.bin"
+                record["source_save"] = {"tokens": reply.get("n_saved"), "bytes": reply.get("n_written"),
+                                         "seconds": round(seconds, 3),
+                                         "sha256": hashlib.sha256(primed.read_bytes()).hexdigest()}
+                # what the target does today with the image: llama-server refuses it
+                try:
+                    target.chat(messages, max_tokens=1)
+                    record["raw_request"] = {"refused": False}
+                except Exception as error:      # noqa: BLE001
+                    record["raw_request"] = {"refused": True, "error": str(error)[:300]}
+                # the staged switch, consumed by the middleware's path: the switch makes the surrogate
+                session = f"live-{number}"
+                stage.put(path.parent, adapter.key(session), source=args.source, target=args.target)
+                warmed = prewarm(config, path, args.source, args.target)
+                captured = {}
+
+                def capture(*a, **k):
+                    captured["report"] = real_switch(*a, **k)
+                    return captured["report"]
+                bridge_switch.switch = capture              # hermes imports it at call time
+                before = machine()
+                t = time.perf_counter()
+                named = adapter.bridge_switch(request, session, base_url)
+                switched_s = round(time.perf_counter() - t, 3)
+                bridge_switch.switch = real_switch
+                report = captured.get("report") or {}
+                record["switch"] = {**switch_record(report, warmed, before), "wall_s": switched_s,
+                                    "surrogates": report.get("surrogates"),
+                                    "source_restore_error": report.get("source_restore_error"),
+                                    "adapter": getattr(adapter, "bridge_last", None), "source_named": named}
+                t = time.perf_counter()
+                rewritten = adapter.bridge_media(request, base_url, source=named)
+                record["rewrite"] = {"seconds": round(time.perf_counter() - t, 3), "rewritten": rewritten is not None,
+                                     "adapter": getattr(adapter, "bridge_media_last", None)}
+                record["status"] = adapter.switch_status()
+                from kvpark.bridge import surrogates
+                entry = surrogates.cache_for(config, path.parent).get(bridge_messages.media_digest(image_part(png)),
+                                                                      "vision")
+                record["surrogate_text"] = (entry or {}).get("text")
+                if not report.get("skipped") and rewritten is not None:
+                    bridged = chat(target, rewritten["messages"], tools, args.max_tokens)
+                    record["bridged"] = {**bridged, "correct": chart_answer_ok(bridged["answer"]),
+                                         "reuse_ok": bridged["cache_n"] == record["switch"]["t0"], **machine()}
+                # the source's cache after the switch's side request: saved again, byte for byte the first save
+                source.slot_action("save", f"after-{number}.bin")
+                after = slot_root / args.source / f"after-{number}.bin"
+                record["source_unchanged"] = {
+                    "slot_identical": after.read_bytes() == primed.read_bytes(),
+                    "resume_identical": (Path(str(after) + ".resume").read_bytes() == Path(str(primed) + ".resume")
+                                         .read_bytes()) if Path(str(primed) + ".resume").is_file() else None,
+                    "bridge_files_left": sorted(p.name for p in (slot_root / args.source).iterdir()
+                                                if p.name.startswith("kvbridge"))}
+                if rewritten is not None:
+                    target.slot_action("erase")
+                    native = chat(target, rewritten["messages"], tools, args.max_tokens)
+                    record["native"] = {**native, "correct": chart_answer_ok(native["answer"]), **machine()}
+            except Exception as error:      # noqa: BLE001  (record and continue)
+                record["error"] = f"{type(error).__name__}: {error}"[:400]
+            finally:
+                bridge_switch.switch = real_switch
+                for leftover in (slot_root / args.source).iterdir():
+                    leftover.unlink()
+            results.append(record)
+            print(json.dumps({"id": record["id"], "error": record.get("error"),
+                              "refused": (record.get("raw_request") or {}).get("refused"),
+                              "skipped": (record.get("switch") or {}).get("skipped"),
+                              "t0": (record.get("switch") or {}).get("t0"),
+                              "surrogates_s": ((record.get("switch") or {}).get("timings") or {}).get("surrogates_s"),
+                              "cache_n": (record.get("bridged") or {}).get("cache_n"),
+                              "reuse_ok": (record.get("bridged") or {}).get("reuse_ok"),
+                              "source_unchanged": record.get("source_unchanged"),
+                              "bridged_correct": (record.get("bridged") or {}).get("correct"),
+                              "native_correct": (record.get("native") or {}).get("correct")}), flush=True)
+            with open(args.output / "surrogates-hermes.jsonl", "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record) + "\n")
+        (args.output / "surrogates-hermes-log.json").write_text(
+            json.dumps({name: server.scan_log() for name, server in servers.items()}, indent=1) + "\n",
+            encoding="utf-8")
+    finally:
+        bridge_switch.switch = real_switch
+        try:
+            engine_client.stop(path.parent)
+        finally:
+            for server in servers.values():
+                server.stop()
+    return results
+
+
 MODES = {"hops": hops, "drafts": drafts, "media": media, "drafts-control": drafts_control,
-         "media-control": media_control, "options": options}
+         "media-control": media_control, "options": options, "surrogates": surrogates_mode,
+         "surrogates-hermes": surrogates_hermes}
 
 
 def main(argv=None):

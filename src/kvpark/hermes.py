@@ -74,6 +74,42 @@ def _options_summary(report):
     return f"the request's {names} render differently from token {options.get('shared_tokens')} on"
 
 
+def _media_summary(report):
+    """What happened to the conversation's media in a switch or a request rewrite, for /kvpark switch
+    status: "media: 1 image as text (made by qwen38 in 22.4 s)", or None when it had none."""
+    names = {"vision": "image", "audio": "audio clip", "video": "video"}
+    parts = (report.get("surrogates") or {}).get("parts") or []
+    out = []
+    for modality in ("vision", "audio", "video"):
+        mine = [part for part in parts if part.get("modality") == modality]
+        if not mine:
+            continue
+        made = [part for part in mine if not part.get("cached") and not part.get("duplicate")
+                and part.get("producer") != "conversation"]
+        reused = [part for part in mine if part.get("cached") or part.get("producer") == "conversation"]
+        repeated = [part for part in mine if part.get("duplicate")]
+        how = []
+        if made:
+            producers = sorted({str(name) for part in made for name in (part.get("producer"), part.get("audio_producer"))
+                                if name})
+            how.append(f"made by {', '.join(producers)} in {round(sum(part.get('seconds') or 0 for part in made), 1)} s")
+        if reused:
+            how.append(f"{len(reused)} from the surrogate cache or the conversation")
+        if repeated:
+            how.append(f"{len(repeated)} repeated")
+        silent = sum(1 for part in mine if part.get("sound"))
+        if silent:
+            how.append(f"the sound of {silent} not transcribed")
+        frames = any(part.get("frames") for part in mine)
+        out.append(f"{len(mine)} {names[modality]}{'s' if len(mine) > 1 else ''} as "
+                   f"{'keyframes' if frames else 'text'} ({'; '.join(how)})")
+    source_media = (report.get("engine") or {}).get("source_media")
+    if source_media and not parts:
+        # Hermes replaced the source's media by text itself (e.g. its own image description)
+        out.append("the source's cache held media the request carries as text; translated up to them")
+    return "media: " + ", ".join(out) if out else None
+
+
 def known_route(config):
     try:
         return route_for(config)
@@ -132,23 +168,24 @@ class Adapter:
         return True
 
     def bridge_switch(self, request, session_id, base_url):
-        """Run a staged `/kvpark switch` when this conversation's request reaches the target model.
+        """Run a staged `/kvpark switch` when this conversation's request reaches the target model;
+        returns the source model's name when the stage was used (None otherwise).
 
         Never raises: on any failure the request goes out unchanged and the target prefills
         natively; the outcome is kept for `/kvpark switch status`."""
         if not session_id:
-            return
+            return None
         from .bridge import registry, stage
         bridge_dir = registry.default_path().parent
         key = self.key(session_id)
         staged = stage.get(bridge_dir, key)
         if not staged:
-            return
+            return None
         try:
             config = registry.load()
             model = config["models"].get(staged["target"])
             if model is None or route_key(model["url"] + "/v1") != route_key(base_url):
-                return      # not on the target yet; keep the stage until its lease ends
+                return None     # not on the target yet; keep the stage until its lease ends
             stage.drop(bridge_dir, key)
             from .bridge.messages import conversation_from_openai, template_options
             from .bridge.switch import switch
@@ -162,27 +199,45 @@ class Adapter:
                                 "restored_tokens": report.get("restored_tokens"),
                                 "prompt_tokens": report.get("target_prompt_tokens"),
                                 "seconds": report["timings"].get("total_s"),
-                                "engine": _engine_summary(report), "options": _options_summary(report)}
+                                "engine": _engine_summary(report), "options": _options_summary(report),
+                                "media": _media_summary(report)}
         except Exception as exc:  # the request must go out whatever happens here
             self.bridge_last = {"ok": False, "source": staged.get("source"), "target": staged.get("target"),
                                 "error": f"{type(exc).__name__}: {exc}"[:300]}
+        return staged["source"]
+
+    def bridge_media(self, request, base_url, source=None):
+        """The request with text surrogates for the media its target cannot take, or None to send it
+        unchanged: when it goes to a registered bridge model whose server lacks a modality its
+        messages hold (an image for a text-only model), each such part becomes the surrogate the
+        bridge made for it (cached by a switch, or made now by `source` or a describer), so the
+        target's prompt matches what a switch translated. Never raises."""
+        from .bridge import surrogates
+        if not surrogates.request_media(request.get("messages")):
+            return None
+        target_name = None
+        try:
+            from .bridge import registry
+            config = registry.load()
+            target_name = next((name for name, model in config["models"].items()
+                                if route_key(model["url"] + "/v1") == route_key(base_url)), None)
+            if target_name is None:
+                return None
+            rewritten, summary = surrogates.rewrite_request(config, request, target_name,
+                                                            bridge_dir=registry.default_path().parent, source=source)
+            if summary is not None:
+                self.bridge_media_last = {"ok": True, "target": target_name, "rewritten": rewritten is not None,
+                                          "media": _media_summary({"surrogates": summary}),
+                                          "missing": summary.get("missing"), "skipped": summary.get("skipped")}
+            return rewritten
+        except Exception as exc:  # the request goes out as it is
+            self.bridge_media_last = {"ok": False, "target": target_name, "error": f"{type(exc).__name__}: {exc}"[:300]}
+            return None
 
     def stage_switch(self, rest):
         from .bridge import registry, stage
         if rest == ["status"]:
-            last = getattr(self, "bridge_last", None)
-            if not last:
-                return "No bridge switch has run in this Hermes process yet."
-            if last["ok"] and last.get("skipped"):
-                return (f"Last switch {last['source']} → {last['target']} was skipped ({last['skipped']}): "
-                        f"{last['note']}.")
-            if last["ok"]:
-                details = [f"engine: {last['engine']}"] if last.get("engine") else []
-                details += [last["options"]] if last.get("options") else []
-                details = f" ({'; '.join(details)})" if details else ""
-                return (f"Last switch {last['source']} → {last['target']}: restored {last['restored_tokens']:,} of "
-                        f"{last['prompt_tokens']:,} prompt tokens in {last['seconds']} s{details}.")
-            return f"Last switch {last['source']} → {last['target']} fell back to a full prefill: {last['error']}"
+            return self.switch_status()
         if len(rest) not in (1, 3) or (len(rest) == 3 and rest[1] != "from"):
             raise ValueError("use /kvpark switch MODEL [from CURRENT_MODEL], or /kvpark switch status")
         config = registry.load()
@@ -209,11 +264,46 @@ class Adapter:
                 f"(valid {stage.LEASE_SECONDS // 60} minutes). Switch Hermes to {target_name} with /model, then send "
                 f"your message. /kvpark switch status shows the result.")
 
+    def switch_status(self):
+        last, media = getattr(self, "bridge_last", None), getattr(self, "bridge_media_last", None)
+        lines = []
+        if not last:
+            lines.append("No bridge switch has run in this Hermes process yet.")
+        elif last["ok"] and last.get("skipped"):
+            lines.append(f"Last switch {last['source']} → {last['target']} was skipped ({last['skipped']}): "
+                         f"{last['note']}.")
+        elif last["ok"]:
+            details = [f"engine: {last['engine']}"] if last.get("engine") else []
+            details += [last[key] for key in ("options", "media") if last.get(key)]
+            details = f" ({'; '.join(details)})" if details else ""
+            lines.append(f"Last switch {last['source']} → {last['target']}: restored {last['restored_tokens']:,} of "
+                         f"{last['prompt_tokens']:,} prompt tokens in {last['seconds']} s{details}.")
+        else:
+            lines.append(f"Last switch {last['source']} → {last['target']} fell back to a full prefill: {last['error']}")
+        if media and not media["ok"]:
+            lines.append(f"Last request with media for {media['target']} went out unchanged: {media['error']}")
+        elif media and media["rewritten"]:
+            lines.append(f"Last request with media for {media['target']}: {media['media'] or 'media: none replaced'}.")
+        elif media:
+            why = (f"its {', '.join(media['skipped'])} media policy is skip" if media.get("skipped")
+                   else "; ".join((media.get("missing") or {}).values()))
+            lines.append(f"Last request with media for {media['target']} went out unchanged: {why}.")
+        return "\n".join(lines)
+
     def middleware(self, *, request, session_id="", base_url="", api_mode="", **kwargs):
         config = self.settings()
         if config["uninstalled"] or api_mode != "chat_completions":
             return None
-        self.bridge_switch(request, session_id, base_url)
+        source = self.bridge_switch(request, session_id, base_url)
+        rewritten = self.bridge_media(request, base_url, source=source)
+        routed = self.route(rewritten or request, session_id, base_url, config)
+        if routed is None and rewritten is not None:
+            # a request to a model server kvpark does not proxy still carries the surrogates
+            return {"request": rewritten, "source": "kvpark", "reason": "bridge media surrogates"}
+        return routed
+
+    def route(self, request, session_id, base_url, config):
+        """kvpark's proxy for this request (archive tags, API key), or None to leave its route alone."""
         routes = {route_key(url + "/v1") for url in [config["base_url"], *config["previous_urls"]]}
         upstream = target(config).url + "/v1" if config["connected"] else None
         if upstream:

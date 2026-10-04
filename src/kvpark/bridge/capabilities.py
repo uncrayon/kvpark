@@ -148,25 +148,38 @@ def draft(target, arch, layout):
 
 
 def media(conversation_media, *, source, target, source_modalities, target_modalities, source_saw,
-          target_arch=None):
+          target_arch=None, replaced=()):
     """None when a conversation with media can be translated up to its first media message,
     else (skip code, reason).
 
     `conversation_media` maps each modality to the index of the first message holding it;
     the modalities are /props "modalities" of each server; `source_saw` is the index of the
-    last message the source server has processed (its slot holds media from those)."""
+    last message the source server has processed (its slot holds media from those);
+    `replaced`: the modalities the target lacks whose media the bridge replaces by text
+    surrogates (surrogates.py; the media policy is not "skip"), so the target needs no encoder
+    for them, while the source's cache may still hold them."""
     for modality in sorted(conversation_media):
-        if not target_modalities.get(modality):
-            return f"target-no-{modality}", (f"the conversation has {modality} input and {target}'s server has no "
-                                             f"{modality} encoder (mmproj)")
-    if target_arch in TARGET_ONLY:
-        # media after a synthesized pooled cache (blocks of 128 positions) has never been restored
-        return "dsv4-media", (f"{target} ({target_arch}) pools its cache in blocks; media after a translated "
-                              "pooled cache is untested, so the target prefills this conversation natively")
+        if not target_modalities.get(modality) and modality not in replaced:
+            return f"target-no-{modality}", (f"the conversation has {modality} input, {target}'s server has no "
+                                             f"{modality} encoder (mmproj), and the media policy for it is skip "
+                                             "(kvpark bridge media)")
+    rule = pooled_media(target, target_arch, set(conversation_media) - set(replaced))
+    if rule:
+        return rule
     for modality, first in sorted(conversation_media.items()):
         if first <= source_saw and source_modalities.get(modality):
             return "media-source", (f"{source}'s cache holds the conversation's {modality} input, which the bridge "
                                     "engine cannot read yet")
+    return None
+
+
+def pooled_media(target, target_arch, modalities):
+    """("dsv4-media", reason) when a DeepSeek V4 target would read media (`modalities`, those left
+    for the target itself after any surrogates), else None."""
+    if target_arch in TARGET_ONLY and modalities:
+        # media after a synthesized pooled cache (blocks of 128 positions) has never been restored
+        return "dsv4-media", (f"{target} ({target_arch}) pools its cache in blocks; media after a translated "
+                              "pooled cache is untested, so the target prefills this conversation natively")
     return None
 
 

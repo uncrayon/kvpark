@@ -58,3 +58,7 @@ class LlamaServer:
         body = {"prompt": [int(t) for t in tokens], "n_predict": n_predict, "cache_prompt": True, "id_slot": 0,
                 "temperature": 0.0, "top_k": 1, "return_tokens": True, **extra}
         return self._call("POST", "/completion", body)
+
+    def chat(self, messages, *, timeout=None, **fields):
+        """(reply, seconds) of a /v1/chat/completions request (not streamed) with these fields."""
+        return self._call("POST", "/v1/chat/completions", {**fields, "messages": messages}, timeout=timeout)

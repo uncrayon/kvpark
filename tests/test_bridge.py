@@ -1,4 +1,5 @@
 import ast
+import hashlib
 import json
 import os
 import struct
@@ -15,6 +16,7 @@ from kvpark.bridge import capabilities, engine_client, registry, resume
 from kvpark.bridge import switch as bridge_switch
 from kvpark.bridge import cli as bridge_cli
 from kvpark.bridge.client import LlamaServer, ServerError
+from kvpark.bridge.messages import MEDIA_PARTS, media_digest
 
 KVSTATE = Path(__file__).resolve().parents[1] / "experiments" / "linear_transfer" / "kvstate.py"
 
@@ -100,7 +102,10 @@ class FakeLlama:
     """Just enough of llama-server's slot, template, tokenize and completion API.
 
     patched: like a kvpark-patched server, write <slot>.resume on save and require it on restore;
-    draft: the draft blob a save of n tokens writes (a function of n), or None without a draft."""
+    draft: the draft blob a save of n tokens writes (a function of n), or None without a draft.
+    Chat requests (/v1/chat/completions) are refused with media the server has no modality for,
+    as llama-server refuses them, and otherwise answered by answer(body) (replacing the slot's
+    cache, as a new prompt does on a one-slot server); chat_error makes them fail."""
 
     def __init__(self, slot_dir, name):
         self.slot_dir, self.name = Path(slot_dir), name
@@ -109,6 +114,7 @@ class FakeLlama:
         self.thinking = "start"            # where enable_thinking: false changes the rendering
         self.modalities, self.marker, self.text_join = {"vision": False, "audio": False}, "<__media_x__>", ""
         self.restored_resume = self.restored_payload = None
+        self.chats, self.chat_error = [], None
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -166,10 +172,37 @@ class FakeLlama:
                         fake.restored_payload = json.loads(path.read_text())
                         fake.resident = fake.restored_payload["tokens"]
                         return self.reply(200, {"n_restored": fake.resident})
+                if self.path == "/v1/chat/completions":
+                    fake.chats.append(body)
+                    for message in body["messages"]:
+                        for part in message["content"] if isinstance(message.get("content"), list) else ():
+                            modality = MEDIA_PARTS.get(part.get("type"))
+                            if modality and not fake.modalities.get(modality):
+                                what = {"vision": "image"}.get(modality, modality)
+                                return self.reply(500, {"error": {"code": 500, "type": "server_error", "message":
+                                                                  f"{what} input is not supported - hint: if this is "
+                                                                  "unexpected, you may need to provide the mmproj"}})
+                    if fake.chat_error:
+                        return self.reply(500, {"error": {"code": 500, "message": fake.chat_error}})
+                    fake.resident = 3              # the side request's prompt replaces the slot's cache
+                    return self.reply(200, {"choices": [{"index": 0, "finish_reason": "stop", "message": {
+                        "role": "assistant", "content": fake.answer(body)}}]})
                 if self.path == "/apply-template":
                     def content(value):
+                        if not isinstance(value, list):
+                            return value
+                        if any(p.get("type") in MEDIA_PARTS for p in value):
+                            # like llama-server: a media message is flattened before the template, text
+                            # parts joined by newlines, none next to a media marker
+                            text, marker = "", False
+                            for p in value:
+                                if p.get("type") in MEDIA_PARTS:
+                                    text, marker = text + fake.marker, True
+                                else:
+                                    text, marker = text + ("\n" if text and not marker else "") + p["text"], False
+                            return text
                         # text-only parts reach the template as a list; this one joins them like a typed template
-                        return fake.text_join.join(p["text"] for p in value) if isinstance(value, list) else value
+                        return fake.text_join.join(p["text"] for p in value)
                     # like llama-server (prefill_assistant): a final assistant message is continued, and
                     # one with tool calls is refused
                     last = body["messages"][-1] if body["messages"] else {}
@@ -201,6 +234,12 @@ class FakeLlama:
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def answer(self, body):
+        """The side request's answer: which media this server saw (kind and digest) and how many."""
+        seen = [f"{MEDIA_PARTS[p['type']]} {media_digest(p)[:8]}" for m in body["messages"]
+                for p in (m["content"] if isinstance(m.get("content"), list) else ()) if p.get("type") in MEDIA_PARTS]
+        return f"{self.name} saw {len(seen)}: " + ", ".join(seen)
 
     def close(self):
         self.server.shutdown()
@@ -1080,9 +1119,18 @@ class BridgeTest(unittest.TestCase):
         return conversation_from_openai(messages)
 
     def test_media_needs_the_modality_on_the_target(self):
+        # no server can describe the image (tests/test_bridge_media.py covers surrogates)
         report = self.switch(self.media_conversation())
         self.assertEqual(report["skipped"], "target-no-vision")
         self.assertIn("mmproj", report["note"])
+        self.assertIn("kvpark bridge media --describer", report["note"])
+        # a media policy of skip keeps the image as it is: no surrogate is even tried
+        registry.set_media(self.config, policy={"image": "skip"})
+        self.servers["a"].modalities = {"vision": True}
+        report = self.switch(self.media_conversation())
+        self.assertEqual(report["skipped"], "target-no-vision")
+        self.assertIn("media policy for it is skip", report["note"])
+        self.assertEqual(self.servers["a"].chats, [])
 
     @unittest.skipUnless(os.name == "posix", "POSIX permissions")
     def test_the_configuration_is_private(self):
@@ -1244,8 +1292,12 @@ class MessagesAndStageTest(unittest.TestCase):
             {"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "image_url", "image_url": {"url": "x"}},
                                          {"type": "image_url", "image_url": {"url": "y"}}, {"type": "text", "text": "b"},
                                          {"type": "text", "text": "c"}]}])
-        self.assertEqual(conversation["messages"][0]["content"][0], {"type": "media", "modality": "audio"})
-        self.assertNotIn("AAAA", json.dumps(conversation))          # no media bytes are kept
+        self.assertEqual(conversation["messages"][0]["content"][0],
+                         {"type": "media", "modality": "audio", "sha256": hashlib.sha256(b"\0\0\0").hexdigest()})
+        # the parts with their data stay beside the messages, in memory, for surrogates only
+        self.assertNotIn("AAAA", json.dumps(conversation["messages"]))
+        self.assertEqual(sorted(p["type"] for p in conversation["media_parts"].values()),
+                         ["image_url", "image_url", "input_audio"])
         self.assertEqual(media(conversation), {"audio": 0, "vision": 2})
         flat = flatten(conversation, marker="<M>")
         self.assertEqual(flat["messages"][0]["content"], "<M>transcribe")
