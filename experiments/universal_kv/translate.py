@@ -41,7 +41,24 @@ native tail [t0, P) included) fits in top_k cells: every query of the prompt the
 cell whatever the keys, so zeros are exact for it. A longer prompt is refused
 (IndexerKeysUnavailable): its later queries would rank the translated cells by zero keys below
 the native ones. Tokens generated after the prompt, and later turns, see more cells once the
-conversation passes top_k; from there zero keys (and the ridge's) are approximate.
+conversation passes top_k; from there zero keys (and the ridge's) are approximate. qwen4exp's
+block indexer is filled alike; on a7b94df2c its rows also hold pooled keys, which are written
+zero and re-pooled from the keys on restore (kvstate.ModelSpec.indexer_row_slots). GLM5-Next's
+rows hold a per-token pool gate beside the key ([key | gate | pooled]); its ridge predicts both
+(kvstate.ModelSpec.indexer_key_slots: what pre_rope_keys gives), and zeros are exact below top_k
+as above.
+
+Plain-attention targets of the GQA family (kvstate.GQA_ARCHITECTURES: llama, mistral3, qwen3moe,
+hy_v3, phi3; with a sliding window gemma3, gemma4, gpt-oss, laguna, mimo2) need nothing of their
+own: their layers' head sizes, KV heads and RoPE (per layer kind: gemma4's proportional RoPE on
+its full layers, laguna's plain RoPE on its sliding ones, frequency factors) come from the spec,
+their sliding sections are written like any other, and gemma4's shared KV layers keep no cache.
+
+The specs may describe another llama.cpp revision than the states (kvstate.LLAMA_REVISIONS: the
+production Qwen3.8 server runs 85d5703a3, the repository's runtime a7b94df2c, and their layouts
+differ for deepseek2/mistral4 nextn layers, qwen4exp's indexer and bailingmoe3 with rope sections):
+kvstate reads each state as the revision whose layout it has, and the template's reading is the
+target layout written, the source state's the RoPE undone (state_side).
 
 Sections are written like the template's: full-attention and indexer sections hold [0, t0);
 sliding sections hold the last `swa_cells` positions (default n_swa + 1, which llama-server
@@ -76,7 +93,7 @@ torch float16 on a GPU). `hub` is {kind: HubKind} (hub.load_hub; an optional "in
 """
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import functools
 from pathlib import Path
 import re
@@ -120,6 +137,19 @@ class Side:
     tokens: dict                # token_id, byte_end, special
     gguf: object = None         # the model's GGUF (a split one's first file): an MLA target's latent norm weights
     norms: dict = None          # MLA latent norms {layer: (attn_kv_a_norm weight, rms eps)}; default from gguf
+
+
+def state_side(side, state):
+    """`side` with the spec of a state's reading: kvstate's parsers read a state as the llama.cpp
+    revision whose layout it has (kvstate.ModelSpec.layout_variants), so the template's reading is
+    the layout to write and a source state's the RoPE to undo. The reading must be side.spec's model,
+    on whichever revision; a state without a spec (a capture source) leaves the side as it is."""
+    spec = getattr(getattr(state, "state", None), "spec", None)
+    if spec is None or spec == side.spec:
+        return side
+    if spec.for_revision(side.spec.llama_revision) != side.spec:
+        raise ValueError(f"{side.name}: the state holds another model's layout than its spec describes")
+    return replace(side, spec=spec)
 
 
 def target_kinds(spec):
@@ -405,6 +435,7 @@ def prepare(source_state, source, target, layers, *, t0, template, fill="mean", 
     indexer_ridge: the target's hub.IndexerRidge (DSA targets) or None; recurrent, recurrent_mean,
     recurrent_group: what a hybrid target's recurrent cell at t0 - 1 starts from (translate)."""
     t0 = int(t0)
+    source, target = state_side(source, source_state), state_side(target, template)
     if not 0 < t0 <= len(target.tokens["token_id"]):
         raise ValueError("t0 must lie in [1, target tokens]")
     if fill == "table" and table is None:
@@ -414,6 +445,8 @@ def prepare(source_state, source, target, layers, *, t0, template, fill="mean", 
     if native_prefix:
         if native_state is None or len(native_state.tokens) < native_prefix:
             raise ValueError("a native prefix needs a native target state holding it")
+        if state_side(target, native_state).spec != target.spec and len(target.spec.layout_variants()) > 1:
+            raise ValueError("the native prefix state and the template hold different llama.cpp revisions' layouts")
         if not np.array_equal(np.asarray(native_state.tokens)[:native_prefix],
                               np.asarray(target.tokens["token_id"])[:native_prefix]):
             raise ValueError("the native state's tokens differ from the target prompt")
@@ -497,8 +530,8 @@ def compute(plan, hub, backend, *, table=None, renorm_fill_k=True, chunk_rows=40
 
 def kv_stream(spec, layers, positions, k, v, *, dtype, v_trans, tokens_at=None, seq_id=0, role="attention"):
     """kvstate.build_kv_stream for rows already in the cache dtype (cast and checked by a backend);
-    nextn layers missing from k, and the V rows of an indexer section that stores some (qwen4exp,
-    never written), get the zero rows a native save holds."""
+    nextn layers missing from k, and the V rows of an indexer section that stores some (qwen4exp on
+    85d5703a3, never written), get the zero rows a native save holds."""
     positions = np.asarray(positions)
     if (positions.ndim != 1 or len(positions) == 0 or positions.dtype.kind not in "iu" or (positions < 0).any()
             or (np.diff(positions) <= 0).any() or positions.max() > 2**31 - 1):
@@ -789,7 +822,12 @@ def translate(source_state, source, target, hub, *, t0, template, fill="mean", t
 
     A DeepSeek V4 target goes to dsv4_target.translate (pooled caches from the decoded compressor
     inputs; T0 rounded down to a multiple of 128, report["t0"]); it runs on numpy whatever `backend`
-    is (a numpy backend lends its resident hub sides), takes fill "mean" only and no native prefix."""
+    is (a numpy backend lends its resident hub sides), takes fill "mean" only and no native prefix.
+
+    The source and target specs may describe another llama.cpp revision than the states' (both
+    pins' states parse with either; kvstate.LLAMA_REVISIONS): the template's reading gives the
+    target's layout and the source state's its RoPE (state_side)."""
+    source, target = state_side(source, source_state), state_side(target, template)
     if target.spec.memory == "dsv4":
         import dsv4_target
         if native_prefix or table is not None:

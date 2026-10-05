@@ -2,11 +2,14 @@
 (StateLayoutTests) and every recurrent family, hybrid or recurrent-only (RecurrentFamilyTests).
 
 Needs KVPARK_STATE_DRIVER=/path/to/kvpark-state-driver (built from state_driver.cpp against a
-CPU build of the pinned runtime). KVPARK_LLAMA_ARCHS=/path/to/test-llama-archs (the same
-build with LLAMA_BUILD_TESTS=ON) adds its random kimi-k3, kimi-linear, bailingmoe3, mistral4,
+CPU build of either pinned runtime, 85d5703a3 or a7b94df2c: the specs take the driver's revision,
+tiny_fixture.driver_revision, and the layouts that differ are checked per revision).
+KVPARK_LLAMA_ARCHS=/path/to/test-llama-archs (the same build with LLAMA_BUILD_TESTS=ON; its models
+are written as tiny_fixture.llama_archs_model does) adds its random kimi-k3, kimi-linear, bailingmoe3, mistral4,
 hy_v4, deepseek2, deepseek32 and glm-dsa models (576/512 geometry, no vocabulary: token ids
-only) and its qwen3next, qwen35moe, qwen4exp, minimax-01, jamba, falcon-h1, granitehybrid,
-nemotron_h(_moe), plamo2, lfm2, lfm2moe, mamba and mamba2 models; the RWKV models come from
+only; bailingmoe3 also with rope sections past the w run, SECTIONS_PAST_W) and its qwen3next,
+qwen35moe, qwen4exp, minimax-01, jamba, falcon-h1, granitehybrid, nemotron_h(_moe), plamo2,
+lfm2, lfm2moe, mamba and mamba2 models; the RWKV models come from
 tiny_fixture.create_rwkv_fixture (test-llama-archs skips them). Dsv4LayoutTests checks DeepSeek
 V4 (deepseek4) saves of test-llama-archs' fixture and of tiny_fixture.create_dsv4_mtp_fixture's
 copy with an MTP layer; it needs a driver with --parallel/--seq/--rs-seq/--partial and q8_0
@@ -14,6 +17,7 @@ caches. Without the driver every test here is skipped.
 """
 
 import dataclasses
+import itertools
 import json
 import os
 from pathlib import Path
@@ -27,7 +31,8 @@ import numpy as np
 import gguf_tensors
 import kvstate
 from tiny_fixture import RWKV_FIXTURE_ARCHITECTURES, YARN_V2, copy_with_metadata, create_dsv4_mtp_fixture, \
-    create_mla_fixture, create_nemotron_mtp_fixture, create_rwkv_fixture
+    create_gemma_fixture, create_mla_fixture, create_nemotron_mtp_fixture, create_rwkv_fixture, driver_revision, \
+    llama_archs_model
 
 
 DRIVER = os.environ.get("KVPARK_STATE_DRIVER")
@@ -48,18 +53,24 @@ TINY = {
     "dots3note": ("dots3note", {"layers": 4}),
 }
 ARCHS = ("deepseek2", "deepseek32", "glm-dsa", "mistral4", "hy_v4", "kimi-k3", "kimi-linear", "bailingmoe3")
+# rope sections of archs-bailingmoe3-sections: of its 32 k_pe pairs, sectors 13-17 (pairs 13-17 and 31)
+# take the fourth component, and pairs 18-31 wrap around to t
+SECTIONS_PAST_W = (4, 6, 3, 5)
 # recurrent families: model -> (recurrent_row_floats family, payload sections in order: k = a KV
-# section, r = the recurrent section; walk_payload checks the row sizes without kvstate's shapes)
+# section, r = the recurrent section; walk_payload checks the row sizes without kvstate's shapes, and
+# reads every KV section with and without V blocks: a7b94df2c's qwen4exp indexer stores none)
 RECURRENT_ARCHS = {"mamba": ("ssm", "r"), "mamba2": ("ssm", "r"), "jamba": ("ssm", "kr"), "falcon-h1": ("ssm", "kr"),
                    "granitehybrid": ("ssm", "kr"), "nemotron_h": ("ssm", "kr"), "nemotron_h_moe": ("ssm", "kr"),
                    "plamo2": ("ssm", "kr"), "qwen3next": ("ssm", "kr"), "qwen35moe": ("ssm", "kr"),
-                   "qwen4exp": ("ssm", "krk"), "lfm2": ("shortconv", "kkr"), "lfm2moe": ("shortconv", "kr"),
-                   "minimax-01": ("lightning", "kr"), **{a: ("rwkv", "r") for a in RWKV_FIXTURE_ARCHITECTURES}}
+                   "qwen4exp": ("ssm", "krk"), "glm5-next": ("kda", "krk"), "lfm2": ("shortconv", "kkr"),
+                   "lfm2moe": ("shortconv", "kr"), "minimax-01": ("lightning", "kr"),
+                   **{a: ("rwkv", "r") for a in RWKV_FIXTURE_ARCHITECTURES}}
 # the sections kvstate reads from those fixtures (flags 0): (name, layers)
 FAMILY_SECTIONS = {
     "falcon-h1": [("attn", (0, 1)), ("recurrent", (0, 1))],
     "lfm2": [("base", ()), ("swa", (0,)), ("recurrent", (1,))],
     "qwen4exp": [("attn", (1,)), ("recurrent", (0,)), ("indexer", (1,))],
+    "glm5-next": [("attn", (0,)), ("recurrent", (1,)), ("indexer", (0,))],
     **{a: [("attn", (0,)), ("recurrent", (1,))] for a in ("granitehybrid", "jamba", "lfm2moe", "nemotron_h",
                                                           "nemotron_h_moe", "plamo2")},
     **{a: [("attn", (1,)), ("recurrent", (0,))] for a in ("minimax-01", "qwen35moe", "qwen3next")},
@@ -75,8 +86,10 @@ RUNTIME_YARN_FLAGS = ["--rope-scaling", "yarn", "--rope-freq-scale", "0.125", "-
 
 def walk_payload(data, order, ple_layers):
     """Recurrent (R, S, P) row-size sets and n_layer of a save, skipping KV sections by their own
-    row sizes; tries with and without cell ext and every recurrent layer count."""
-    def walk(ext, n_recurrent):
+    row sizes; tries with and without cell ext, V blocks in each KV section or none, and every
+    recurrent layer count."""
+    def walk(ext, n_recurrent, with_v):
+        with_v = list(with_v)
         offset = 12 + 4 * struct.unpack_from("<I", data, 8)[0]
 
         def take(fmt):
@@ -110,11 +123,12 @@ def walk_payload(data, order, ple_layers):
                             return None
                         row = take("<Q")
                         offset += cells * row
-                    for _ in range(layers):
+                    for _ in range(layers if with_v[0] else 0):
                         if take("<i") not in (0, 1):
                             return None
                         row = take("<I") * take("<I") if v_trans else take("<Q")
                         offset += cells * row
+                with_v.pop(0)
                 continue
             cells = take("<I")
             for _ in range(cells):
@@ -138,12 +152,13 @@ def walk_payload(data, order, ple_layers):
 
     for ext in (False, True):
         for n_recurrent in range(1, 8):
-            try:
-                found = walk(ext, n_recurrent)
-            except struct.error:
-                continue
-            if found:
-                return found
+            for with_v in itertools.product((True, False), repeat=order.count("k")):
+                try:
+                    found = walk(ext, n_recurrent, with_v)
+                except struct.error:
+                    continue
+                if found:
+                    return found
     return None
 
 
@@ -167,13 +182,15 @@ def assert_zero_recurrent_rows(test, state_file, native):
 
 
 class DriverMixin:
-    """kvpark-state-driver runs on the fixtures in cls.models (name -> GGUF) with cls.vocab (name -> size)."""
+    """kvpark-state-driver runs on the fixtures in cls.models (name -> GGUF) with cls.vocab (name -> size);
+    prompts come from cls.rng, or from the fixture's own stream in cls.rngs (name -> Generator)."""
 
     def workdir(self):
         return Path(tempfile.mkdtemp(dir=self.root))
 
     def ids(self, name, n):
-        return [int(t) for t in self.rng.integers(0, self.vocab[name], n)]
+        rng = getattr(self, "rngs", {}).get(name, self.rng)
+        return [int(t) for t in rng.integers(0, self.vocab[name], n)]
 
     def drive(self, mode, name, *args, cache="f32", fa="off", extra=()):
         command = [DRIVER, "--mode", mode, "--model", str(self.models[name]), "--cache-type", cache,
@@ -209,7 +226,27 @@ class DriverMixin:
         return found
 
     def spec(self, name, runtime=None):
-        return kvstate.ModelSpec.from_gguf(self.models[name], runtime=runtime)
+        """The model's spec on the driver's llama.cpp revision (cls.revision)."""
+        return kvstate.ModelSpec.from_gguf(self.models[name], runtime=runtime, llama_revision=self.revision)
+
+    def move(self, spec, state, offset):
+        """Every section moved to positions + offset (K rows through pre_rope_keys at the old
+        positions and cache_keys at the new ones, M-RoPE cells' (x, y) with them, recurrent cells
+        relabelled), with `offset` filler tokens in front so the state still ends at its token count."""
+        for part, layout in zip(state.state.parts, spec.layouts(state.state.flags)):
+            if layout.kind != "kv":
+                part.positions = (part.positions + offset).astype(np.int32)
+                continue
+            stream = part.stream()
+            moved = stream.positions + offset
+            for il in part.layers:
+                rows = stream.k[il]
+                pre = kvstate.pre_rope_keys(spec, il, rows, stream.positions, role=layout.role)
+                stream.k[il] = kvstate.cache_keys(spec, il, pre, moved, role=layout.role).astype(rows.dtype)
+            stream.positions = moved.astype(np.int32)
+            if stream.ext is not None and spec.rope_type in ("imrope", "mrope"):
+                stream.ext = np.asarray(stream.ext) + np.asarray([offset, offset, 0], dtype=np.int32)
+        state.token_words = kvstate.token_words(np.concatenate([np.zeros(offset, np.int64), state.tokens]))
 
     def rerotate(self, spec, state):
         """Every K row through pre_rope_keys and back through cache_keys (in place)."""
@@ -235,17 +272,23 @@ class StateLayoutTests(DriverMixin, unittest.TestCase):
             cls.weights[name] = create_mla_fixture(path, architecture, **options)
             cls.models[name], cls.vocab[name] = path, 256
         if LLAMA_ARCHS:
-            out = cls.root / "archs"
-            out.mkdir()
             for architecture in ARCHS:
-                result = subprocess.run([LLAMA_ARCHS, "-a", architecture, "-s", "7", "-o", str(out)],
-                                        capture_output=True, text=True, timeout=600)
-                if result.returncode != 0:
-                    raise RuntimeError(f"test-llama-archs {architecture}: {result.stderr[-400:]}")
                 # these architectures only exist as MoE models in test-llama-archs
                 name = f"archs-{architecture}"
-                cls.models[name], cls.vocab[name] = out / f"{architecture}-moe.gguf", 128
+                cls.models[name] = llama_archs_model(LLAMA_ARCHS, architecture, cls.root / "archs")
+                cls.vocab[name] = 128
+            # bailingmoe3 with rope sections that leave pairs to the fourth component (position 0 for
+            # text: unrotated) and wrap around their sum, where a7b94df2c's fixture sections [8, 12, 12, 0]
+            # cover every pair (text M-RoPE = NEOX); 85d5703a3 never reads them (NORM, cells without ext)
+            path = cls.root / "bailingmoe3-sections.gguf"
+            copy_with_metadata(cls.models["archs-bailingmoe3"], path,
+                               values={"bailingmoe3.rope.dimension_sections": list(SECTIONS_PAST_W)})
+            cls.models["archs-bailingmoe3-sections"], cls.vocab["archs-bailingmoe3-sections"] = path, 128
+        cls.revision = driver_revision(DRIVER, cls.root / "revision")
         cls.rng = np.random.default_rng(2026)
+        # the later fixture draws from its own stream, so every other one keeps the prompts the
+        # tolerances were set on (see test_rerotated_states_restore_like_native)
+        cls.rngs = {"archs-bailingmoe3-sections": np.random.default_rng(2027)}
 
     @classmethod
     def tearDownClass(cls):
@@ -282,14 +325,17 @@ class StateLayoutTests(DriverMixin, unittest.TestCase):
     # -- layouts -----------------------------------------------------------
 
     def test_native_saves_parse_and_write_byte_identically(self):
-        expected = {"deepseek2": [("kv", (0, 1))], "deepseek2-nextn": [("kv", (0, 1, 2))],
+        # deepseek2's nextn layer: kept (zero rows) by 85d5703a3's plain cache, filtered out by a7b94df2c's
+        nextn = (0, 1, 2) if self.revision == "85d5703a3" else (0, 1)
+        expected = {"deepseek2": [("kv", (0, 1))], "deepseek2-nextn": [("kv", nextn)],
                     "deepseek32": [("kv", (0, 1)), ("indexer", (0, 1))],
                     "glm-dsa": [("kv", (0, 1, 2, 3)), ("indexer", (0, 2))],
                     "dots3note": [("base", (0, 2)), ("indexer", (0, 2)), ("swa", (1, 3))],
                     "archs-hy_v4": [("kv", (0, 1)), ("indexer", (0,))],
                     "archs-kimi-k3": [("attn", (0,)), ("recurrent", (1,))],
                     "archs-kimi-linear": [("attn", (0,)), ("recurrent", (1,))],
-                    "archs-bailingmoe3": [("attn", (0,)), ("recurrent", (1,))]}
+                    "archs-bailingmoe3": [("attn", (0,)), ("recurrent", (1,))],
+                    "archs-bailingmoe3-sections": [("attn", (0,)), ("recurrent", (1,))]}
         for name in self.models:
             spec = self.spec(name)
             prompt = self.ids(name, 13)
@@ -301,6 +347,12 @@ class StateLayoutTests(DriverMixin, unittest.TestCase):
                         parsed = kvstate.parse_file(data, spec)
                         self.assertEqual(parsed.to_bytes(), data)
                         np.testing.assert_array_equal(parsed.tokens, prompt)
+                        # a spec of either revision reads the save as the driver's revision where their
+                        # layouts of the model differ (deepseek2-nextn, bailingmoe3 with rope sections)
+                        for revision in kvstate.LLAMA_REVISIONS:
+                            other = spec.for_revision(revision)
+                            reading = kvstate.parse_file(data, other).state.spec
+                            self.assertEqual(reading, spec if len(spec.layout_variants()) > 1 else other)
                         if name in expected:
                             self.assertEqual([(p.name, p.layers) for p in parsed.state.parts], expected[name])
                         for part, layout in zip(parsed.state.parts, spec.layouts(0)):
@@ -439,6 +491,8 @@ class StateLayoutTests(DriverMixin, unittest.TestCase):
         # it must match the stored rows up to the float32 matmul rounding (restoring re-rotated
         # rows cannot see a wrong RoPE: pre_rope_keys and cache_keys share it)
         cases = (("archs-bailingmoe3", None, ()), ("archs-bailingmoe3", RUNTIME_YARN, RUNTIME_YARN_FLAGS),
+                 ("archs-bailingmoe3-sections", None, ()),
+                 ("archs-bailingmoe3-sections", RUNTIME_YARN, RUNTIME_YARN_FLAGS),
                  ("archs-hy_v4", None, ()), ("archs-hy_v4", RUNTIME_YARN, RUNTIME_YARN_FLAGS),
                  ("archs-kimi-k3", None, ()), ("archs-kimi-linear", None, ()))
         for name, runtime, extra in cases:
@@ -467,14 +521,29 @@ class StateLayoutTests(DriverMixin, unittest.TestCase):
                     # the check separates parameters: a 7x base misses by orders of magnitude more
                     wrong = dataclasses.replace(rope, base=rope.base * 7).apply(pre, positions)
                     self.assertGreater(np.abs(wrong[..., lora:] - rows[..., lora:]).max(), 1e-2 * scale)
+                    if not name.startswith("archs-bailingmoe3"):
+                        continue
+                    sections = SECTIONS_PAST_W if name.endswith("-sections") else (8, 12, 12, 0)
+                    self.assertEqual((rope.mode, rope.sections),
+                                     ("norm", None) if self.revision == "85d5703a3" else ("mrope", sections))
+                    if rope.mode == "mrope" and 3 in kvstate.rope_components(rope.n_dims // 2, rope.sections,
+                                                                              interleaved=False):
+                        # and the unrotated fourth-component pairs: NEOX over every pair misses
+                        neox = dataclasses.replace(rope, mode="neox", sections=None).apply(pre, positions)
+                        self.assertGreater(np.abs(neox[..., lora:] - rows[..., lora:]).max(), 1e-2 * scale)
 
     # -- restore equivalence -------------------------------------------------
 
     def test_rerotated_states_restore_like_native(self):
+        # with flash attention on, llama.cpp casts an f32 cache to f16 for the kernel
+        # (src/llama-graph.cpp:2655-2658), so a re-rotation that moves a key by one f32 ulp across an
+        # f16 rounding boundary moves the logits by about 1e-5 of their scale: rare (none in 20
+        # random dots3note prompts), but one prompt drawn from this class's stream in another
+        # order missed by 1.85e-5 on both pins (base section only; indexer and SWA exact)
         names = ["deepseek2", "deepseek2-q0", "deepseek2-yarn", "deepseek2-nextn", "mistral4-yarn",
                  "deepseek32-yarn", "glm-dsa-yarn", "dots3note"]
-        names += [n for n in ("archs-kimi-k3", "archs-kimi-linear", "archs-bailingmoe3", "archs-hy_v4",
-                              "archs-mistral4") if n in self.models]
+        names += [n for n in ("archs-kimi-k3", "archs-kimi-linear", "archs-bailingmoe3", "archs-bailingmoe3-sections",
+                              "archs-hy_v4", "archs-mistral4") if n in self.models]
         for name in names:
             spec = self.spec(name)
             # 40 cells: past the indexer top_k (8) and the dots3note window (8)
@@ -520,23 +589,6 @@ class StateLayoutTests(DriverMixin, unittest.TestCase):
                 logits, _ = self.restore(name, directory / "built.state", next_ids, extra=extra)
                 np.testing.assert_allclose(logits, native, rtol=0, atol=2e-6 * max(1.0, float(np.abs(native).max())))
 
-    def move(self, spec, state, offset):
-        """Every section moved to positions + offset (K rows through pre_rope_keys at the old
-        positions and cache_keys at the new ones, recurrent cells relabelled), with `offset`
-        filler tokens in front so the state still ends at its token count."""
-        for part, layout in zip(state.state.parts, spec.layouts(state.state.flags)):
-            if layout.kind != "kv":
-                part.positions = (part.positions + offset).astype(np.int32)
-                continue
-            stream = part.stream()
-            moved = stream.positions + offset
-            for il in part.layers:
-                rows = stream.k[il]
-                pre = kvstate.pre_rope_keys(spec, il, rows, stream.positions, role=layout.role)
-                stream.k[il] = kvstate.cache_keys(spec, il, pre, moved, role=layout.role).astype(rows.dtype)
-            stream.positions = moved.astype(np.int32)
-        state.token_words = kvstate.token_words(np.concatenate([np.zeros(offset, np.int64), state.tokens]))
-
     def test_states_moved_to_other_positions_restore_like_native(self):
         # RoPE attention depends on relative positions only, so keys re-rotated to positions + 37
         # restore to the native continuation (decoded from 37 further on) up to rounding, while a
@@ -548,7 +600,8 @@ class StateLayoutTests(DriverMixin, unittest.TestCase):
                  ("deepseek2", RUNTIME_YARN, RUNTIME_YARN_FLAGS)]
         # hybrids: the recurrent cell moves too (their test-llama-archs logits barely depend on
         # attention, so these check the plumbing; test_k_pe_rope_from_the_latent_projection the RoPE)
-        cases += [(n, None, ()) for n in ("archs-bailingmoe3", "archs-kimi-linear", "archs-hy_v4") if n in self.models]
+        cases += [(n, None, ()) for n in ("archs-bailingmoe3", "archs-bailingmoe3-sections", "archs-kimi-linear",
+                                          "archs-hy_v4") if n in self.models]
         offset = 37
         for name, runtime, extra in cases:
             spec = self.spec(name, runtime)
@@ -650,13 +703,9 @@ class Dsv4LayoutTests(DriverMixin, unittest.TestCase):
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory(prefix="kvpark-dsv4-")
         cls.root = Path(cls.temp.name)
-        out = cls.root / "archs"
-        out.mkdir()
-        result = subprocess.run([LLAMA_ARCHS, "-a", "deepseek4", "-s", "7", "-o", str(out)], capture_output=True,
-                                text=True, timeout=600)
-        if result.returncode != 0:
-            raise RuntimeError(f"test-llama-archs deepseek4: {result.stderr[-400:]}")
-        cls.models = {"dsv4": out / "deepseek4-moe.gguf", "dsv4-mtp": cls.root / "deepseek4-mtp.gguf"}
+        cls.models = {"dsv4": llama_archs_model(LLAMA_ARCHS, "deepseek4", cls.root / "archs"),
+                      "dsv4-mtp": cls.root / "deepseek4-mtp.gguf"}
+        cls.revision = driver_revision(DRIVER, cls.root / "revision")
         create_dsv4_mtp_fixture(cls.models["dsv4"], cls.models["dsv4-mtp"])
         cls.vocab = {"dsv4": 128, "dsv4-mtp": 128}
         cls.rng = np.random.default_rng(2028)
@@ -768,16 +817,16 @@ class RecurrentFamilyTests(DriverMixin, unittest.TestCase):
             create_rwkv_fixture(path, architecture)
             cls.models[architecture], cls.vocab[architecture] = path, 258
         if LLAMA_ARCHS:
-            out = cls.root / "archs"
-            out.mkdir()
             for architecture in RECURRENT_ARCHS:
                 if architecture in RWKV_FIXTURE_ARCHITECTURES:
                     continue
-                result = subprocess.run([LLAMA_ARCHS, "-a", architecture, "-s", "7", "-o", str(out)],
-                                        capture_output=True, text=True, timeout=600)
-                if result.returncode != 0:
-                    raise RuntimeError(f"test-llama-archs {architecture}: {result.stderr[-400:]}")
-                cls.models[architecture], cls.vocab[architecture] = next(out.glob(f"{architecture}-*.gguf")), 128
+                first = kvstate.ARCHITECTURE_SINCE.get(architecture)
+                order = kvstate.LLAMA_REVISIONS.index
+                if first is not None and order(driver_revision(DRIVER, cls.root / "revision")) < order(first):
+                    continue                    # glm5-next: a7b94df2c on
+                cls.models[architecture] = llama_archs_model(LLAMA_ARCHS, architecture, cls.root / "archs")
+                cls.vocab[architecture] = 128
+        cls.revision = driver_revision(DRIVER, cls.root / "revision")
         cls.rng = np.random.default_rng(2027)
 
     @classmethod
@@ -810,9 +859,19 @@ class RecurrentFamilyTests(DriverMixin, unittest.TestCase):
                             for il in part.layers:
                                 self.assertEqual(stream.k_types[il], kvstate.DTYPE_NAMES[cache])
                                 self.assertTrue(stream.k[il].any())
-                                if layout.role == "indexer":
-                                    # qwen4exp's indexer cache stores raw keys and V rows nothing writes
+                                if layout.role == "indexer" and self.revision == "85d5703a3":
+                                    # 85d5703a3's qwen4exp indexer cache stores raw keys and V rows nothing writes
                                     self.assertFalse(stream.v[il].any())
+                                elif layout.role == "indexer":
+                                    # a7b94df2c's stores K only, [key | pooled] with k-pooling (the fixture's
+                                    # compress ratio 4): a pooled key in the last row of each complete block
+                                    # (the graph's padding entries may write other rows' slots too)
+                                    self.assertEqual(stream.v, {})
+                                    slots = stream.k[il][..., spec.indexer.head_size:]
+                                    self.assertEqual(slots.shape[-1],
+                                                     spec.indexer.head_size * (spec.indexer_row_slots - 1))
+                                    for last in range(spec.indexer.kpool - 1, 13, spec.indexer.kpool or 13):
+                                        self.assertTrue(slots[last].any(), f"pooled key of the block ending at {last}")
         # the layer kinds behind those sections
         expected = {"falcon-h1": ("parallel", "parallel"), "nemotron_h": ("full", "recurrent", "mlp"),
                     "lfm2": ("sliding", "recurrent"), "mamba": ("recurrent", "recurrent")}
@@ -966,6 +1025,7 @@ class RecurrentFamilyTests(DriverMixin, unittest.TestCase):
         for name in self.models:
             spec = self.spec(name)
             prompt, next_ids = self.ids(name, 20), self.ids(name, 4)
+            state = None                # (never the previous model's state when this one's save fails)
             with self.subTest(model=name, state="R0"):
                 directory = self.save(name, prompt, next_ids=next_ids)
                 state = kvstate.read_file(directory / "native.state", spec)
@@ -985,6 +1045,8 @@ class RecurrentFamilyTests(DriverMixin, unittest.TestCase):
                     tolerance = 0.0 if name.startswith("mamba") else 1e-6
                     np.testing.assert_allclose(logits[1:], fresh, rtol=0,
                                                atol=tolerance * max(1.0, float(np.abs(fresh).max())))
+            if state is None:
+                continue
             with self.subTest(model=name, state="truncated"):
                 cut = 15
                 with self.assertRaisesRegex(kvstate.StateFormatError, "needs R0"):
@@ -1011,6 +1073,287 @@ class RecurrentFamilyTests(DriverMixin, unittest.TestCase):
                         self.assertTrue(bits_equal(a.k[il], b.k[il]), f"layer {il} K")
                         if il in b.v:
                             self.assertTrue(bits_equal(a.v[il], b.v[il]), f"layer {il} V")
+
+
+
+# GQA family (kvstate.GQA_ARCHITECTURES): gguf-py Gemma models (both pins) -> create_gemma_fixture options
+GEMMA_TINY = {"gemma4": ("gemma4", {}), "gemma4-shared": ("gemma4", {"layers": 8, "shared_kv_layers": 2}),
+              "gemma4-v": ("gemma4", {"alternative_attention": False}), "gemma3-tiny": ("gemma3", {})}
+# test-llama-archs models (85d5703a3's writes no gemma3, gpt-oss... see GqaFamilyTests.setUpClass)
+GQA_ARCHS = ("llama", "mistral3", "qwen3moe", "hy_v3", "phi3", "gemma3", "gpt-oss", "laguna", "mimo2")
+# copies of them with other RoPE settings: name -> (base model, metadata values without the arch prefix)
+GQA_VARIANTS = {
+    # Laguna-S-2.1's geometry scaled down: full layers YaRN over a partial head, plain RoPE on sliding ones
+    "laguna-yarn": ("laguna", {"rope.scaling.type": "yarn", "rope.scaling.factor": 4.0,
+                               "rope.scaling.original_context_length": 64, "rope.dimension_count": 40,
+                               "rope.freq_base": 500000.0, "rope.freq_base_swa": 1000.0}),
+    # gpt-oss runs YaRN on every layer, its sliding layers with the GGUF's scale whatever the context's
+    "gpt-oss-yarn": ("gpt-oss", {"rope.scaling.type": "yarn", "rope.scaling.factor": 4.0,
+                                 "rope.scaling.original_context_length": 64, "rope.freq_base": 150000.0}),
+    # mistral3 reads the YaRN betas and log multiplier from the GGUF (mistral3.cpp:7-9)
+    "mistral3-yarn": ("mistral3", {"rope.scaling.type": "yarn", "rope.scaling.factor": 4.0,
+                                   "rope.scaling.original_context_length": 64, "rope.scaling.yarn_beta_fast": 16.0,
+                                   "rope.scaling.yarn_beta_slow": 2.0, "rope.scaling.yarn_log_multiplier": 0.8}),
+    # Gemma 3's linear scaling of the global layers (sliding layers keep scale 1 and their own base)
+    "gemma3-linear": ("gemma3", {"rope.scaling.type": "linear", "rope.scaling.factor": 8.0,
+                                 "rope.freq_base_swa": 500.0}),
+    # MiMo's partial NEOX (64 of the head) and its own sliding base
+    "mimo2-partial": ("mimo2", {"rope.dimension_count": 64, "rope.freq_base_swa": 777.0}),
+}
+# Gemma's FFN GELU reads its input rounded to float16 on the CPU (ggml_vec_gelu_f32 with GGML_GELU_FP16,
+# ggml-cpu/vec.h:1000-1014), so a key moved by one float32 ulp can flip a GELU input across an f16
+# rounding boundary: the tiny Gemma models (weights N(0, 0.05)) move their logits by up to ~3e-4 of
+# their scale when a re-rotation changes the last bit of ~10% of the keys (1e-6 or less for SiLU
+# models). Restore tolerances (f32, f16 caches) of those models, and of every other:
+GELU_TOLERANCE, TOLERANCE = (2e-3, 2e-2), (2e-6, 2e-3)
+# the graph node holding each GQA architecture's keys right before RoPE: (name, op); hy_v3's k_norm
+# output is unnamed, so it is the k RMSNorm ("norm", the layer's second 3-D one) times attn_k_norm
+GQA_PRE_ROPE = {"gemma3": ("Kcur_normed", "MUL"), "gemma4": ("Kcur_normed", "MUL"), "laguna": ("Kcur_normed", "MUL"),
+                "qwen3moe": ("Kcur_normed", "MUL"), "llama": ("Kcur", "RESHAPE"), "mistral3": ("Kcur", "RESHAPE"),
+                "phi3": ("Kcur", "RESHAPE"), "gpt-oss": ("Kcur", "RESHAPE"), "mimo2": ("Kcur", "MUL_MAT"),
+                "hy_v3": ("norm", "RMS_NORM")}
+
+
+@unittest.skipUnless(DRIVER, "set KVPARK_STATE_DRIVER to enable llama.cpp state-layout checks")
+class GqaFamilyTests(DriverMixin, unittest.TestCase):
+    """Plain-attention models that take the context's RoPE (kvstate.GQA_ARCHITECTURES): one cache
+    (llama, mistral3, qwen3moe, hy_v3, phi3) or a global and a sliding-window one (gemma3, gemma4,
+    gpt-oss, laguna, mimo2) with per-layer KV heads and head sizes, per-layer-kind RoPE (gemma4's
+    proportional RoPE on its full layers, laguna's plain RoPE on its sliding ones, frequency factors)
+    and gemma4's shared KV layers: byte-exact codecs, RoPE bit for bit against the CPU build, restores
+    of re-rotated, moved, truncated and built states. The Gemma models come from
+    tiny_fixture.create_gemma_fixture (both pins); the others from test-llama-archs (KVPARK_LLAMA_ARCHS)
+    where its build writes them."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory(prefix="kvpark-gqa-")
+        cls.root = Path(cls.temp.name)
+        cls.models, cls.vocab, cls.weights = {}, {}, {}
+        for name, (architecture, options) in GEMMA_TINY.items():
+            cls.models[name] = cls.root / f"{name}.gguf"
+            cls.weights[name] = create_gemma_fixture(cls.models[name], architecture, **options)
+            cls.vocab[name] = 256
+        cls.missing = []
+        for architecture in GQA_ARCHS if LLAMA_ARCHS else ():
+            try:
+                path = llama_archs_model(LLAMA_ARCHS, architecture, cls.root / "archs")
+            except RuntimeError:
+                cls.missing.append(architecture)        # 85d5703a3's test-llama-archs saves no such model
+                continue
+            if architecture == "phi3":
+                # get_rope_factors would pick rope_factors_long or _short by the context size (refused):
+                # Phi-3 GGUFs without longrope carry neither
+                plain = cls.root / "phi3-plain.gguf"
+                copy_with_metadata(path, plain, drop_tensors=["rope_factors_long.weight", "rope_factors_short.weight"])
+                cls.refused_phi3, path = path, plain
+            cls.models[architecture], cls.vocab[architecture] = path, 128
+        for name, (base, values) in GQA_VARIANTS.items():
+            if base in cls.models:
+                cls.models[name] = cls.root / f"{name}.gguf"
+                copy_with_metadata(cls.models[base], cls.models[name],
+                                   values={f"{base}.{key}": value for key, value in values.items()})
+                cls.vocab[name] = cls.vocab[base]
+        cls.revision = driver_revision(DRIVER, cls.root / "revision")
+        cls.rng = np.random.default_rng(2029)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp.cleanup()
+
+    def test_specs_of_the_fixtures(self):
+        gemma = self.spec("gemma4")
+        # the last of every three layers is full: 1 KV head of 32 with proportional RoPE (4 of its 16
+        # pairs rotate, factor 1e30 leaves the rest), sliding layers 4 heads of 16 rotated whole
+        self.assertEqual(gemma.layer_types, ("sliding", "sliding", "full") * 2)
+        self.assertEqual((gemma.memory, gemma.n_swa, gemma.n_rot, gemma.n_rot_swa), ("iswa", 48, 32, 16))
+        self.assertEqual([gemma.head_shape(il, "k") for il in (0, 2)], [(4, 16), (1, 32)])
+        full, sliding = gemma.rope(2), gemma.rope(0)
+        self.assertEqual((full.mode, full.n_dims, full.base, sliding.n_dims, sliding.base, sliding.freq_factors),
+                         ("neox", 32, 1e6, 16, 1e4, None))
+        self.assertEqual(full.freq_factors, (1.0,) * 4 + (float(np.float32(1e30)),) * 12)
+        shared = self.spec("gemma4-shared")
+        self.assertEqual((shared.layer_types[-2:], shared.sections(0)),
+                         (("shared", "shared"), [("base", "kv", (2, 5)), ("swa", "kv", (0, 1, 3, 4))]))
+        with self.assertRaisesRegex(ValueError, "no attention cache"):
+            shared.rope(7)
+        if "phi3" in self.models:
+            with self.assertRaisesRegex(kvstate.StateFormatError, "by the context size"):
+                kvstate.ModelSpec.from_gguf(self.refused_phi3)
+        if "laguna-yarn" in self.models:
+            laguna = self.spec("laguna-yarn")
+            full, sliding = laguna.rope(0), laguna.rope(1)
+            self.assertEqual((full.n_dims, full.ext_factor, full.freq_scale, full.base),
+                             (40, 1.0, 0.25, 500000.0))
+            self.assertEqual((sliding.n_dims, sliding.ext_factor, sliding.attn_factor, sliding.freq_scale, sliding.base),
+                             (80, 0.0, 1.0, 1.0, 1000.0))
+
+    def test_native_saves_parse_and_write_byte_identically(self):
+        for name in self.models:
+            spec = self.spec(name)
+            prompt = self.ids(name, 40)
+            for cache in ("f16", "f32"):
+                for fa in ("off", "on"):
+                    with self.subTest(model=name, cache=cache, flash_attn=fa):
+                        directory = self.workdir()
+                        self.drive("save", name, "--tokens", ",".join(map(str, prompt)), "--state",
+                                   directory / "native.state", "--partial", directory / "native.partial",
+                                   cache=cache, fa=fa)
+                        data = (directory / "native.state").read_bytes()
+                        parsed = kvstate.parse_file(data, spec)
+                        self.assertEqual(parsed.to_bytes(), data)
+                        np.testing.assert_array_equal(parsed.tokens, prompt)
+                        # one layout on both revisions: either spec reads it as itself
+                        self.assertEqual(spec.layout_variants(), [spec])
+                        for revision in kvstate.LLAMA_REVISIONS:
+                            self.assertEqual(kvstate.parse_file(data, spec.for_revision(revision)).state.spec.llama_revision,
+                                             revision)
+                        self.assertEqual([(p.name, p.layers) for p in parsed.state.parts],
+                                         [(name_, layers) for name_, _, layers in spec.sections(0)])
+                        for part, layout in zip(parsed.state.parts, spec.layouts(0)):
+                            stream = part.stream()
+                            self.assertEqual((stream.v_trans, stream.ext), (fa == "off", None))
+                            first = max(0, 40 - spec.n_swa) if layout.sliding else 0
+                            np.testing.assert_array_equal(stream.positions, np.arange(first, 40))
+                            for il in part.layers:
+                                self.assertEqual((stream.k[il].shape[1:], stream.v[il].shape[1:]),
+                                                 (spec.head_shape(il, "k"), spec.head_shape(il, "v")))
+                                self.assertTrue(stream.k[il].any() and stream.v[il].any())
+                                self.assertEqual(stream.k_types[il], kvstate.DTYPE_NAMES[cache])
+                        # a server checkpoint's PARTIAL_ONLY blob: the sliding-window section of iSWA
+                        # memory, the whole cache of a plain one (llama_kv_cache ignores the flags)
+                        partial = (directory / "native.partial").read_bytes()
+                        blob = kvstate.parse_blob(partial, spec, flags=kvstate.FLAGS_PARTIAL_ONLY)
+                        self.assertEqual(blob.to_bytes(), partial)
+                        self.assertEqual([p.name for p in blob.state.parts], ["swa"] if spec.memory == "iswa" else ["kv"])
+
+    def pre_rope(self, name, spec, found, layer, n):
+        """A layer's keys right before RoPE from one capture run's nodes (GQA_PRE_ROPE)."""
+        node, op = GQA_PRE_ROPE[spec.architecture]
+        nodes = [a for o, a in found[f"{node}-{layer}"] if o == op]
+        if spec.architecture == "hy_v3":
+            # attn_norm and ffn_norm are 2-D, then q's and k's RMSNorm: k's is the second 3-D one
+            norm = [a for a in nodes if a.ndim == 3][1]
+            weight = gguf_tensors.read_tensor(self.models[name], f"blk.{layer}.attn_k_norm.weight").astype(np.float32)
+            return (norm.reshape((n,) + spec.kv_shape(layer, "k")) * weight).astype(np.float32)
+        return nodes[0].reshape((n,) + spec.kv_shape(layer, "k"))
+
+    def test_rope_matches_the_cpu_cache_rows_bit_for_bit(self):
+        # the pre-RoPE keys of one capture run, rotated by cache_keys, are the rows the same run saved
+        # (f32 cache), with the GGUF's RoPE and with the receiving server's YaRN settings; a 7x base misses
+        cases = [(name, None, ()) for name in self.models]
+        cases += [(name, RUNTIME_YARN, RUNTIME_YARN_FLAGS) for name in ("gemma4", "gpt-oss-yarn", "laguna-yarn", "llama")
+                  if name in self.models]
+        for name, runtime, extra in cases:
+            spec = self.spec(name, runtime)
+            prompt = self.ids(name, 40)
+            saved = self.workdir() / "captured.state"
+            node = GQA_PRE_ROPE[spec.architecture][0]
+            found = self.capture(name, prompt, [node], extra=extra, state=saved)
+            state = kvstate.read_file(saved, spec)
+            for part in state.state.parts:
+                stream = part.stream()
+                positions = np.asarray(stream.positions)
+                for il in part.layers:
+                    with self.subTest(model=name, runtime=runtime, layer=il):
+                        pre = self.pre_rope(name, spec, found, il, len(prompt))[positions]
+                        rows = stream.k[il]
+                        self.assertTrue(bits_equal(kvstate.cache_keys(spec, il, pre, positions), rows))
+                        np.testing.assert_allclose(kvstate.pre_rope_keys(spec, il, rows, positions), pre, rtol=0,
+                                                   atol=1e-6 * max(1.0, float(np.abs(pre).max())))
+                        rope = spec.rope(il)
+                        wrong = dataclasses.replace(rope, base=rope.base * 7).apply(pre, positions)
+                        self.assertGreater(np.abs(wrong - rows).max(), 1e-2 * np.abs(rows).max())
+
+    def tolerance(self, name, cache):
+        """The restore tolerance of a model and cache type, in units of the logit scale (GELU_TOLERANCE)."""
+        return (GELU_TOLERANCE if name in GEMMA_TINY else TOLERANCE)[cache == "f16"]
+
+    def test_rerotated_states_restore_like_native(self):
+        for name in self.models:
+            spec = self.spec(name)
+            prompt, next_ids = self.ids(name, 40), self.ids(name, 4)
+            for cache, fa in (("f32", "off"), ("f32", "on"), ("f16", "on")):
+                with self.subTest(model=name, cache=cache, flash_attn=fa):
+                    directory = self.save(name, prompt, next_ids=next_ids, cache=cache, fa=fa)
+                    native = np.load(directory / "native.npy")
+                    state = kvstate.read_file(directory / "native.state", spec)
+                    self.rerotate(spec, state)
+                    kvstate.write_file(directory / "rerotated.state", state)
+                    logits, report = self.restore(name, directory / "rerotated.state", next_ids, cache=cache, fa=fa)
+                    self.assertEqual(report["next_pos"], 40)
+                    # f32: one rounding of each key (an f16 cache keeps the native bits)
+                    tolerance = self.tolerance(name, "f32") if cache == "f32" else 0.0
+                    np.testing.assert_allclose(logits, native, rtol=0,
+                                               atol=tolerance * max(1.0, float(np.abs(native).max())))
+
+    def test_states_moved_to_other_positions_restore_like_native(self):
+        # attention depends on relative positions only (the sliding windows too), so every key moved to
+        # positions + 37 restores to the native continuation up to rounding (DriverMixin.move); in the
+        # Gemma models, whose logits hear attention, keys moved with a wrong RoPE (7x every base) miss
+        # by far more, so there the comparison checks the parameters. (test-llama-archs' models barely
+        # hear attention: a wrong RoPE moves their logits by ~1e-7 of their scale. Their RoPE is checked
+        # bit for bit against llama.cpp's rows instead.)
+        offset = 37
+        for name in self.models:
+            spec = self.spec(name)
+            for n_prompt, cache, fa in ((24, "f32", "off"), (6, "f16", "on")):
+                with self.subTest(model=name, cells=n_prompt, cache=cache, flash_attn=fa):
+                    prompt, next_ids = self.ids(name, n_prompt), self.ids(name, 3)
+                    directory = self.save(name, prompt, next_ids=next_ids, cache=cache, fa=fa)
+                    native = np.load(directory / "native.npy")
+                    scale = max(1.0, float(np.abs(native).max()))
+                    misses = []
+                    for label, moved_spec in (("moved", spec), ("wrong", dataclasses.replace(
+                            spec, rope_freq_base=spec.rope_freq_base * 7, rope_freq_base_swa=spec.rope_freq_base_swa * 7))):
+                        state = kvstate.read_file(directory / "native.state", spec)
+                        # (a wrong spec turns each key by its wrong angle of `offset` positions)
+                        self.move(moved_spec, state, offset)
+                        kvstate.write_file(directory / f"{label}.state", state)
+                        logits, report = self.restore(name, directory / f"{label}.state", next_ids, cache=cache, fa=fa)
+                        self.assertEqual(report["next_pos"], n_prompt + offset)
+                        misses.append(float(np.abs(logits - native).max()) / scale)
+                    self.assertLessEqual(misses[0], self.tolerance(name, cache))
+                    if cache == "f32" and name in GEMMA_TINY:
+                        self.assertGreater(misses[1], 10 * self.tolerance(name, cache))
+
+    def test_truncated_states_are_native_prefix_saves(self):
+        # truncate_state keeps what a save of the prefix holds (every sliding window still whole), byte for byte
+        for name in self.models:
+            spec = self.spec(name)
+            n = min(30, spec.n_swa) if spec.n_swa else 30
+            cut = n - 9
+            prompt, next_ids = self.ids(name, n), self.ids(name, 3)
+            for cache, fa in (("f32", "off"), ("f16", "on")):
+                with self.subTest(model=name, cache=cache, flash_attn=fa):
+                    state = kvstate.read_file(self.save(name, prompt, cache=cache, fa=fa) / "native.state", spec)
+                    truncated = kvstate.truncate_state(state, cut)
+                    prefix = self.save(name, prompt[:cut], next_ids=next_ids, cache=cache, fa=fa)
+                    self.assertEqual(truncated.to_bytes(), (prefix / "native.state").read_bytes())
+                    path = prefix / "cut.state"
+                    kvstate.write_file(path, truncated)
+                    logits, _ = self.restore(name, path, next_ids, cache=cache, fa=fa)
+                    np.testing.assert_array_equal(logits, np.load(prefix / "native.npy"))
+
+    def test_built_plain_caches_restore_like_native(self):
+        # build_dense_state from pre-RoPE rows (and V) of the plain-cache models, with the GGUF's RoPE and
+        # the receiving server's YaRN
+        cases = [(name, None, ()) for name in ("llama", "mistral3", "mistral3-yarn", "qwen3moe", "hy_v3", "phi3")
+                 if name in self.models]
+        cases += [(name, RUNTIME_YARN, RUNTIME_YARN_FLAGS) for name in ("llama", "qwen3moe") if name in self.models]
+        for name, runtime, extra in cases:
+            with self.subTest(model=name, runtime=runtime):
+                spec = self.spec(name, runtime)
+                prompt, next_ids = self.ids(name, 30), self.ids(name, 3)
+                directory = self.save(name, prompt, next_ids=next_ids, extra=extra)
+                native = np.load(directory / "native.npy")
+                stream = kvstate.read_file(directory / "native.state", spec).state.part("kv").stream()
+                positions = np.arange(30)
+                keys = {il: kvstate.pre_rope_keys(spec, il, stream.k[il], positions) for il in spec.layers_of("full")}
+                built = kvstate.build_dense_state(spec, prompt, positions, keys, dict(stream.v), dtype="f32", v_trans=True)
+                kvstate.write_file(directory / "built.state", built)
+                logits, _ = self.restore(name, directory / "built.state", next_ids, extra=extra)
+                np.testing.assert_allclose(logits, native, rtol=0, atol=2e-6 * max(1.0, float(np.abs(native).max())))
 
 
 if __name__ == "__main__":

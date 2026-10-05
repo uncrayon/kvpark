@@ -6,7 +6,7 @@ everything kvpark and the universal KV translator read or write: slot files, seq
 memory sections, the `.resume` sidecar, server token lists, mtmd chunks, speculative state, per-
 architecture cache layouts and RoPE. It ends with the exact changes `kvstate.py`, `kv_probe.cpp`,
 `state_driver.cpp` and `src/kvpark/bridge/resume.py` need. Nothing under `experiments/` was changed
-in this stage.
+in that stage; [Status](#status-october-4-2026) at the end says what the next stage changed.
 
 Line numbers below refer to `runtime-next/src` (the new pin plus `patches/llama-slot-resume.patch`).
 
@@ -215,7 +215,9 @@ changes. These need re-baselining, not format work.
   instead of `MUL_MAT` outputs; the op filters only need extending if such GGUFs are used.
 * `experiments/linear_transfer/build_collector.py` defaults `--runtime-revision` to
   `85d5703a3…` and `--llama-source/--llama-build` to `runtime/source`/`runtime/build`; update
-  both when `runtime/` is rebuilt at the new pin.
+  both when `runtime/` is rebuilt at the new pin. (Done: the revision comes from the build info,
+  and since October 5, 2026 `runtime/` is a `scripts/build_runtime.py` build of a7b94df2c; the
+  85d5703a3 runtime is kept at `runtime-85d5703a3/`.)
 
 ### `experiments/linear_transfer/state_driver.cpp`
 
@@ -249,3 +251,92 @@ changes. These need re-baselining, not format work.
   from `runtime/source`; both work with the new tree (`runtime-next/src`) as well.
 * Re-baseline the DSV4 oracle tolerances and the attention-insensitivity set in
   `test_families.py` after rebuilding fixtures with the new `test-llama-archs` (§9).
+
+## Status (October 4, 2026)
+
+The changes above, as made (both pins' states read and written; old-pin states parse and
+re-serialize byte for byte; README.md, [Tests on both pinned runtimes](README.md#tests-on-both-pinned-runtimes)):
+
+- `kvstate.py`: `LLAMA_REVISIONS`, `ModelSpec.llama_revision` (default a7b94df2c; `from_metadata` /
+  `from_gguf(..., llama_revision=)` also take a commit or llama-server's `build_info`,
+  `llama_revision_of`), `for_revision`, `layout_variants`. The parsers read a state with the spec's
+  revision, else with the other one where the model's layouts differ, and the parsed state's spec is
+  the reading that fits (`strict=True`: the spec's reading only). §1: `ModelSpec.nextn_cached` (deepseek2/mistral4's plain cache keeps the
+  nextn layers on 85d5703a3 only; the KDA hybrids and DeepSeek V4's raw cache on both). §2:
+  `IndexerSpec.kpool`/`kpool_row` (from qwen4exp's `attention.compress_ratios`),
+  `ModelSpec.indexer_row_slots`; the a7b94df2c indexer section is K-only with `[key | pooled]` rows,
+  `cache_keys` writes zero pooled slots (a restore re-pools every block) and `pre_rope_keys` drops
+  them. §3: `model_rope_type` (bailingmoe3: `mrope` on a7b94df2c with rope sections), `Rope` mode
+  `mrope` (NEOX pairs, sections in runs, `rope_components`), M-RoPE cell extensions. §4: no code
+  recomputes GatedDeltaNet. §5: documented. Docstring line references are a7b94df2c's.
+- `translate.py`: the template's reading gives the target layout and the source state's the RoPE
+  (`state_side`); torch and ggml backends rotate `mrope`.
+- `kv_probe.cpp`: the GPU report's `graph_splits` also reads a7b94df2c's graph summary line
+  (`graph: nodes = ..., splits = N`; 85d5703a3 printed `graph splits = N`); otherwise comments only.
+  `state_driver.cpp`: comments only. Both build against both pins; the a7b94df2c builds (CPU probe,
+  driver and value collector, Vulkan probe) are in `runtime-kvtools/`. `build_collector.py` takes
+  the revision from the build info when it names a known pin, refuses a `--runtime-revision`
+  naming the other one, and requires `--runtime-revision` when the build info names none (a
+  runtime built before `scripts/build_runtime.py` set `LLAMA_BUILD_COMMIT`, such as the 85d5703a3
+  one at `runtime-85d5703a3/`); the manifest records `runtime_build_info`.
+- Tests: fixtures from `tiny_fixture.llama_archs_model` (N(0, 0.01) weights and indexer top_k 8 on
+  both pins), the driver's revision from `tiny_fixture.driver_revision` (the layout of a save,
+  checked against a manifest), per-revision expectations for the nextn layer, qwen4exp's indexer
+  rows and the attention-insensitive hybrids. A bailingmoe3 copy with rope sections `[4, 6, 3, 5]`
+  checks a7b94df2c's M-RoPE past the w run (unrotated fourth-component pairs, sections wrapping
+  around their sum) against llama.cpp's k_pe rows, and gives an 85d5703a3 save of a model with
+  rope sections (NORM, read as 85d5703a3 with a spec of either revision). With those
+  fixtures the DeepSeek V4 oracle tolerances and the bit-exact Mamba R0 restore hold unchanged on
+  a7b94df2c (the misses of the compat run above came with N(0, 0.1) weights and top_k 131072).
+- `src/kvpark/bridge/resume.py`: docstring (line references, the draft-position remark, the qwen4exp
+  MTP draft) and an unreadable draft refused with ValueError in `translated_draft`.
+
+Not done in that stage: qwen4exp MTP drafts (`classify_draft` calls them "other"; inferred, no
+model), `_fits` with an image's position gap (templates are text-only), fused-QKV op filters in
+the probe, the `llama_batch_ext` API in the C++ tools (the old API keeps them building against
+85d5703a3).
+
+### New cache architectures (stream 1b)
+
+No new difference between the pins: the architectures below write the same sections and rows on
+both (where 85d5703a3 has them), so `layout_variants` gives one reading (one exception refused,
+below).
+
+- The GQA family (`kvstate.GQA_ARCHITECTURES`, README "GQA family, Gemma 4 and GLM5-Next"):
+  `llama`, `mistral3`, `qwen3moe`, `hy_v3`, `phi3` (plain cache) and `gemma3`, `gemma4`,
+  `gpt-oss`, `laguna`, `mimo2` (iSWA with a window). Per-layer KV heads and head sizes,
+  per-layer-kind RoPE (`GQA_CONVENTIONS`, `ModelSpec.n_rot_swa`), frequency factors
+  (`ROPE_FREQ_FACTOR_ARCHITECTURES`: gemma4's proportional RoPE on its full layers; read by
+  `gguf_rope_freq_factors`, which a spec built from metadata alone needs, phi3's included, since
+  `ROPE_FACTOR_TENSOR_ARCHITECTURES` refuse `rope()` with unknown factors), gemma4's shared KV
+  layers in no section. Pin differences that leave states alone: a7b94df2c reads gemma4's
+  and mimo2's `sliding_window_pattern` as flags only (85d5703a3 also took one value for every
+  layer); its plain/iSWA trunk filter would drop nextn layers that 85d5703a3 keeps (refused for
+  these models except mimo2 and hy_v3, which both pins filter). One that would not: a7b94df2c
+  reads gemma3's, gpt-oss's and laguna's pattern as flags or a period, 85d5703a3 as a period only
+  (flags leave its default period). Their converters write no pattern, so `from_metadata` with
+  85d5703a3 refuses flags that disagree with the default period instead of modelling the
+  difference (`for_revision` keeps the layer kinds of the spec it is given).
+- `glm5-next` (a7b94df2c only, `ARCHITECTURE_SINCE`): `hybrid_idx` memory, NoPE MLA latent rows
+  without k_pe, KDA rows, K-only `[key | gate | pooled]` indexer rows (`indexer_key_slots`: key and
+  gate are per-token data, the pooled slot is re-pooled on restore).
+- Gemma 4's MTP head (`gemma4-assistant`): its draft cache views the target's last sliding and full
+  layers and writes nothing (`src/llama-kv-cache.cpp:2066-2069`), so a `.resume` draft blob is 8
+  bytes; `kvpark.bridge.resume` classifies it `shared` (measured on the real Gemma-4 26B-A4B and
+  31B servers).
+- `kv_probe.cpp`: rows for these architectures (gemma4's V is `Vcur_normed`, a bare RMS norm),
+  per-layer head sizes on sliding layers, the `shared` layer kind, and a `collect` option to save
+  the capture run's own state (`"save_at": [token count]`). With a fused `attn_qkv` (Phi-3 and
+  MiMo-V2.5 GGUFs), build_qkv's K and V are views the existing op filters take (llama and phi3
+  fused copies checked on both pins), and mimo2's Q, K and V, unnamed views, are read as columns
+  of the projection `wqkv` (`arch_def::fused_keys`; several keys share one node). The tools now
+  know the pin they are built against (`KVPARK_LLAMA_REVISION`, passed by `build_collector.py`):
+  an 85d5703a3 probe refuses gemma3/gpt-oss/laguna pattern flags that disagree with the default
+  period, as kvstate does.
+- `kvpark.bridge.capabilities`: the GQA family is translatable but for `ROPE_FACTOR_GQA` (llama,
+  mistral3, gemma4, phi3): `experiments/universal_kv/engine.py` builds its specs from metadata and
+  does not read their factor tensors yet, so their jobs would fail in the engine after the source
+  slot is saved; they join once the engine passes `kvstate.gguf_rope_freq_factors`.
+
+Still not done: `minimax-m3` (its MSA memory, `llama_kv_cache_msa`: a GQA cache plus an indexer
+cache with V rows), qwen4exp MTP drafts.

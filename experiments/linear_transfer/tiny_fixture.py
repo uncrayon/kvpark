@@ -2,10 +2,12 @@
 
 These files exercise the real Muse/Qwen3.5/Qwen3 graph implementations and, through
 create_mla_fixture, the MLA (deepseek2, mistral4), DSA (deepseek32, glm-dsa) and
-DSA-iSWA (dots3note) ones, and through create_rwkv_fixture the recurrent-only RWKV ones
-(rwkv6, rwkv6qwen2, rwkv7, arwkv7), which test-llama-archs skips. Their random weights and
-byte tokenizer cannot measure language quality or transfer quality. No model download or
-running inference server is involved.
+DSA-iSWA (dots3note) ones, through create_rwkv_fixture the recurrent-only RWKV ones
+(rwkv6, rwkv6qwen2, rwkv7, arwkv7), which test-llama-archs skips, and through
+create_gemma_fixture Gemma 3 and Gemma 4 (iSWA; Gemma 4 with per-layer head sizes, proportional
+RoPE and shared KV layers), which it skips too (gemma4) or only writes on a7b94df2c (gemma3).
+Their random weights and byte tokenizer cannot measure language quality or transfer quality. No
+model download or running inference server is involved.
 """
 
 import argparse
@@ -18,14 +20,18 @@ import numpy as np
 FIXTURE_ARCHITECTURES = ("muse-glimmer", "qwen35", "qwen3")
 MLA_FIXTURE_ARCHITECTURES = ("deepseek2", "mistral4", "deepseek32", "glm-dsa", "dots3note")
 RWKV_FIXTURE_ARCHITECTURES = ("rwkv6", "rwkv6qwen2", "rwkv7", "arwkv7")
+GEMMA_FIXTURE_ARCHITECTURES = ("gemma3", "gemma4")
 # YaRN of the DeepSeek-V2 kind on a 64-token original context (factor 4, mscale_all_dim 0.707):
 # rope.scaling.yarn_log_multiplier is stored as 0.1 * mscale_all_dim (conversion/deepseek.py)
 YARN_V2 = {"factor": 4.0, "original_context_length": 64, "log_multiplier": 0.1 * 0.707}
 
 
 def _gguf_module():
-    gguf_path = Path(__file__).resolve().parents[2] / "runtime/source/gguf-py"
-    if not gguf_path.is_dir():
+    # the repository's runtime (scripts/build_runtime.py), else the pin upgrade's worktree
+    root = Path(__file__).resolve().parents[2]
+    gguf_path = next((path for path in (root / "runtime/source/gguf-py", root / "runtime-next/src/gguf-py")
+                      if path.is_dir()), None)
+    if gguf_path is None:
         raise RuntimeError("build the pinned runtime first to provide gguf-py")
     if str(gguf_path) not in sys.path:
         sys.path.insert(0, str(gguf_path))
@@ -57,8 +63,8 @@ def create_mla_fixture(path, architecture, seed=7, *, layers=2, q_lora=24, yarn=
     Geometry: hidden 64, 2 query heads, kv_lora 32, k_pe 16 (rope.dimension_count), qk_nope 16,
     v_head 16, so the cache row is [c_kv (32) | k_pe (16)] = 48 elements (src/models/deepseek2.cpp:
     84-160 lists the tensors). deepseek2/mistral4 (mistral4 reuses deepseek2's loader and graph):
-    q_lora 0 selects attn_q (the "lite" layout), nextn adds nextn blocks the plain cache keeps
-    as zero rows. deepseek32/glm-dsa/dots3note add a lightning indexer (2 heads of 64, top_k 8;
+    q_lora 0 selects attn_q (the "lite" layout), nextn adds nextn blocks (85d5703a3's plain cache
+    keeps them as zero rows, a7b94df2c's leaves them out). deepseek32/glm-dsa/dots3note add a lightning indexer (2 heads of 64, top_k 8;
     tensors as src/models/deepseek32.cpp:92-114) on the `indexer_types` layers (default: all for
     deepseek32/glm-dsa, the full-attention ones for dots3note); deepseek32 and dots3note need
     q_lora > 0. dots3note alternates full (even) and sliding (odd) layers with `sliding_window`,
@@ -312,11 +318,117 @@ def create_rwkv_fixture(path, architecture, seed=11, *, layers=2):
     return tensors
 
 
+def create_gemma_fixture(path, architecture, seed=23, *, layers=6, period=3, sliding_window=48, shared_kv_layers=0,
+                         alternative_attention=True, context_length=512, rope_freq_base=1e6, rope_freq_base_swa=1e4,
+                         rotated_fraction=0.25, output_scale=0.75, stdev=0.05):
+    """Write a tiny random Gemma 3 or Gemma 4 model (test-llama-archs writes none of gemma4, and
+    85d5703a3's none of gemma3); return its tensors (numpy order).
+
+    The last of every `period` layers is full attention, the others slide over `sliding_window`
+    (gemma4: attention.sliding_window_pattern flags, as its loader requires, gemma4.cpp:5; gemma3:
+    the period, set_swa_pattern). Hidden 64, 4 query heads, a byte vocabulary, dense FFNs.
+    gemma4 is the real 26B/31B scaled down (src/models/gemma4.cpp:39-127): sliding layers 4 KV heads
+    of 16 (attention.key_length_swa) rotated whole with rope.freq_base_swa; full layers 1 KV head of
+    32 (so the layers' V widths differ, 64 and 32: a transposed V cache pads them) with gemma4's
+    proportional RoPE (NEOX over the whole head, rope_freqs.weight: factor 1 for
+    the first `rotated_fraction` of the pairs, 1e30, i.e. unrotated, for the rest), without attn_v
+    when `alternative_attention` (V is then the RMS-normed K projection, as in the real full
+    layers), and layer_output_scale `output_scale`; the last `shared_kv_layers` layers keep no
+    cache (they attend to the last sliding or full layer's, Gemma 4 E2B/E4B). gemma3: every layer 2
+    KV heads of 16, RoPE over the whole head (freq_base_swa on sliding layers)."""
+    if architecture not in GEMMA_FIXTURE_ARCHITECTURES:
+        raise ValueError(f"Gemma fixture architecture must be one of {GEMMA_FIXTURE_ARCHITECTURES}")
+    if layers < 2 or period < 2 or not 0 <= shared_kv_layers <= layers - 2 or sliding_window < 1:
+        raise ValueError("layers and period of at least 2, a positive window, at least two layers with a cache")
+    if shared_kv_layers and architecture != "gemma4":
+        raise ValueError("shared KV layers are a gemma4 feature")
+    path = Path(path)
+    if path.exists():
+        raise FileExistsError(path)
+    gguf = _gguf_module()
+    gemma4 = architecture == "gemma4"
+    hidden, n_head, ffn, vocab = 64, 4, 128, 258
+    sliding = [il % period < period - 1 for il in range(layers)]
+    head_full, head_swa = (32, 16) if gemma4 else (16, 16)
+    kv_full, kv_swa = (1, 4) if gemma4 else (2, 2)
+    rng = np.random.default_rng(seed)
+    writer = gguf.GGUFWriter(path, architecture)
+    writer.add_name(f"UNTRAINED Gemma test fixture: {architecture}")
+    writer.add_file_type(0)  # ALL_F32
+    writer.add_context_length(context_length)
+    writer.add_embedding_length(hidden)
+    writer.add_block_count(layers)
+    writer.add_feed_forward_length(ffn)
+    writer.add_head_count(n_head)
+    writer.add_head_count_kv([kv_swa if s else kv_full for s in sliding] if gemma4 else kv_full)
+    writer.add_key_length(head_full)
+    writer.add_value_length(head_full)
+    writer.add_layer_norm_rms_eps(1e-6)
+    writer.add_rope_freq_base(float(rope_freq_base))
+    writer.add_rope_freq_base_swa(float(rope_freq_base_swa))
+    writer.add_sliding_window(sliding_window)
+    writer.add_final_logit_softcapping(30.0)
+    if gemma4:
+        writer.add_sliding_window_pattern(sliding)
+        writer.add_key_length_swa(head_swa)
+        writer.add_value_length_swa(head_swa)
+        writer.add_rope_dimension_count(head_full)
+        writer.add_rope_dimension_count_swa(head_swa)
+        writer.add_shared_kv_layers(shared_kv_layers)
+        writer.add_embedding_length_per_layer_input(0)
+    else:
+        writer.add_sliding_window_pattern(period)
+    _byte_vocabulary(writer, gguf)
+
+    tensors = {}
+
+    def tensor(name, shape, fill=None):
+        # NumPy dimensions are reversed relative to GGML's ne array.
+        value = (rng.normal(0, stdev, shape).astype(np.float32) if fill is None
+                 else np.full(shape, fill, dtype=np.float32))
+        tensors[name] = value
+
+    tensor("token_embd.weight", (vocab, hidden))
+    tensor("output_norm.weight", (hidden,), 1)
+    if gemma4:
+        rotated = max(1, int(head_full // 2 * rotated_fraction))
+        tensors["rope_freqs.weight"] = np.asarray([1.0] * rotated + [1e30] * (head_full // 2 - rotated), np.float32)
+    for il in range(layers):
+        prefix = f"blk.{il}"
+        head = head_swa if sliding[il] else head_full
+        kv = kv_swa if sliding[il] else kv_full
+        tensor(f"{prefix}.attn_norm.weight", (hidden,), 1)
+        tensor(f"{prefix}.attn_q.weight", (n_head * head, hidden))
+        tensor(f"{prefix}.attn_output.weight", (hidden, n_head * head))
+        tensor(f"{prefix}.attn_q_norm.weight", (head,), 1)
+        if not gemma4 or il < layers - shared_kv_layers:
+            tensor(f"{prefix}.attn_k.weight", (kv * head, hidden))
+            tensors[f"{prefix}.attn_k_norm.weight"] = (1 + 0.2 * rng.normal(size=head)).astype(np.float32)
+            if not (gemma4 and alternative_attention and not sliding[il]):
+                tensor(f"{prefix}.attn_v.weight", (kv * head, hidden))
+        tensor(f"{prefix}.post_attention_norm.weight", (hidden,), 1)
+        tensor(f"{prefix}.ffn_norm.weight", (hidden,), 1)
+        tensor(f"{prefix}.ffn_gate.weight", (ffn, hidden))
+        tensor(f"{prefix}.ffn_up.weight", (ffn, hidden))
+        tensor(f"{prefix}.ffn_down.weight", (hidden, ffn))
+        tensor(f"{prefix}.post_ffw_norm.weight", (hidden,), 1)
+        if gemma4:
+            tensor(f"{prefix}.layer_output_scale.weight", (1,), output_scale)
+    for name, value in tensors.items():
+        writer.add_tensor(name, value)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    return tensors
+
+
 def copy_with_metadata(source, path, *, values=None, remove=(), drop_tensors=(), add_tensors=None):
     """Copy a GGUF with edited metadata and unchanged tensors (as gguf-py's
     gguf_new_metadata.py, without its tqdm dependency): keys in `remove` are dropped and
     `values` sets keys; an existing key keeps its GGUF type, a new one is STRING, FLOAT32 or
-    UINT32 by its Python type. Empty arrays (test-llama-archs writes an empty merges list and
+    UINT32 by its Python type (a list: an ARRAY of INT32 or FLOAT32, as gguf-py's add_array
+    writes Python ints and floats). Empty arrays (test-llama-archs writes an empty merges list and
     classifier labels) are dropped: gguf-py cannot write them. Used to reproduce what a
     converter writes, e.g. the base head_dim in attention.value_length of kimi-linear and
     bailingmoe3 GGUFs. Tensors named in `drop_tensors` are left out and `add_tensors`
@@ -337,6 +449,10 @@ def copy_with_metadata(source, path, *, values=None, remove=(), drop_tensors=(),
         sub_type = field.types[-1] if value_type == gguf.GGUFValueType.ARRAY else None
         writer.add_key_value(field.name, values.pop(field.name, field.contents()), value_type, sub_type=sub_type)
     for key, value in values.items():
+        if isinstance(value, (list, tuple)):
+            sub_type = gguf.GGUFValueType.FLOAT32 if isinstance(value[0], float) else gguf.GGUFValueType.INT32
+            writer.add_key_value(key, list(value), gguf.GGUFValueType.ARRAY, sub_type=sub_type)
+            continue
         value_type = (gguf.GGUFValueType.STRING if isinstance(value, str)
                       else gguf.GGUFValueType.FLOAT32 if isinstance(value, float) else gguf.GGUFValueType.UINT32)
         writer.add_key_value(key, value, value_type)
@@ -356,6 +472,31 @@ def copy_with_metadata(source, path, *, values=None, remove=(), drop_tensors=(),
     for value in added.values():
         writer.write_tensor_data(value)
     writer.close()
+
+
+def fuse_qkv(source, path):
+    """Copy a GGUF with every layer's attn_q, attn_k and attn_v weights fused into one attn_qkv weight
+    (rows [Q | K | V], as llama.cpp's converters write a checkpoint's qkv_proj, e.g. MiMo-V2.5's:
+    conversion/mimo.py) and their biases and scales left out; float32 projections only. Return the
+    fused layers."""
+    gguf = _gguf_module()
+    reader = gguf.GGUFReader(source)
+    tensors = {tensor.name: tensor for tensor in reader.tensors}
+    fused, dropped = {}, []
+    layers = sorted(int(name.split(".")[1]) for name in tensors
+                    if name.startswith("blk.") and name.endswith(".attn_q.weight"))
+    for layer in layers:
+        prefix = f"blk.{layer}"
+        parts = [tensors[f"{prefix}.attn_{part}.weight"] for part in "qkv"]
+        if any(part.tensor_type != gguf.GGMLQuantizationType.F32 for part in parts):
+            raise ValueError(f"{source}: layer {layer} projections are not float32")
+        fused[f"{prefix}.attn_qkv.weight"] = np.concatenate([np.asarray(part.data) for part in parts], axis=0)
+        dropped += [name for name in (f"{prefix}.attn_{part}.{kind}" for part in "qkv"
+                                      for kind in ("weight", "bias", "scale", "input_scale")) if name in tensors]
+    if not layers:
+        raise ValueError(f"{source} has no attn_q projections")
+    copy_with_metadata(source, path, drop_tensors=dropped, add_tensors=fused)
+    return layers
 
 
 def create_nemotron_mtp_fixture(source, path, seed=13, *, n_expert=2, n_ff_exp=64, n_ff_shexp=32):
@@ -421,6 +562,74 @@ def create_nemotron_mtp_fixture(source, path, seed=13, *, n_expert=2, n_ff_exp=6
         if p + key in meta and isinstance(meta[p + key], list) and len(meta[p + key]) == n_layer:
             values[p + key] = extend(key, type(meta[p + key][0])(0))
     copy_with_metadata(source, path, values=values, drop_tensors=dense, add_tensors=added)
+
+
+# What test-llama-archs writes differently on the two pins (STATE_FORMAT_a7b94df.md, test fixtures): from
+# a7b94df2c on it draws the weights from N(0, 0.1) unless -d/--stdev says otherwise (85d5703a3: 0.01, which
+# the tests were tuned on), and gives every indexer a budget (attention.indexer.top_k) of 131072, where
+# every cell is selected (85d5703a3: 8, so prompts of tens of tokens reach past it). llama_archs_model
+# writes both pins' fixtures with 0.01 and 8; the other a7b94df2c changes stay (the qwen4exp k-pool
+# blocks, bailingmoe3's rope sections, the negative Mamba A).
+LLAMA_ARCHS_STDEV = 0.01
+LLAMA_ARCHS_TOP_K = 8
+
+
+def llama_archs_model(binary, architecture, out, *, seed=7, timeout=600):
+    """The path of test-llama-archs' model of `architecture` (<arch>-moe.gguf or <arch>-dense.gguf,
+    whichever it writes) in the directory `out`, written on first use with the settings both pins'
+    binaries share (LLAMA_ARCHS_STDEV, LLAMA_ARCHS_TOP_K; a model already in `out` gets the top_k
+    too). -a takes a regex from a7b94df2c on, so ^arch$ keeps it to this architecture's model (a
+    name it does not know would be a substring regex there; a regex matching nothing exits 0);
+    85d5703a3 takes exact names only, exits 1 on ^arch$ (its "unkown LLM architecture" goes through
+    the asynchronous log and can be lost at exit, so the exit status decides) and ignores -d (its
+    weights are N(0, 0.01) anyway)."""
+    import subprocess
+    out = Path(out)
+    found = sorted(out.glob(f"{architecture}-*.gguf"))
+    if not found:
+        out.mkdir(parents=True, exist_ok=True)
+
+        def write(name):
+            command = [str(binary), "-a", name, "-s", str(seed), "-o", str(out), "-d", str(LLAMA_ARCHS_STDEV)]
+            return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+        result = write(f"^{architecture}$")
+        if result.returncode != 0:
+            result = write(architecture)
+        found = sorted(out.glob(f"{architecture}-*.gguf"))
+        if result.returncode != 0 or not found:
+            raise RuntimeError(f"test-llama-archs {architecture}: {result.stderr[-400:]}")
+    key = f"{architecture}.attention.indexer.top_k"
+    gguf = _gguf_module()
+    top_k = gguf.GGUFReader(found[0]).get_field(key)
+    if top_k is not None and int(top_k.contents()) != LLAMA_ARCHS_TOP_K:
+        written = found[0].with_name(found[0].name + ".top-k")
+        copy_with_metadata(found[0], written, values={key: LLAMA_ARCHS_TOP_K})
+        written.replace(found[0])
+    return found[0]
+
+
+def driver_revision(driver, workdir):
+    """The llama.cpp revision (kvstate.LLAMA_REVISIONS) a kvpark-state-driver runs on: what kvstate
+    reads from its own save of a deepseek2 fixture with a nextn block (only 85d5703a3 keeps that
+    layer in the cache). A build_collector.py manifest naming another revision is refused (a build
+    of an unverifiable runtime records the revision it was given)."""
+    import subprocess
+    import kvstate
+    named = kvstate.llama_revision_of(Path(driver))
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    model, state = workdir / "revision-probe.gguf", workdir / "revision-probe.state"
+    if not model.exists():
+        create_mla_fixture(model, "deepseek2", nextn=1)
+    if not state.exists():
+        result = subprocess.run([str(driver), "--mode", "save", "--model", str(model), "--tokens", "1,2,3", "--state",
+                                 str(state)], capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            raise RuntimeError(f"state driver save: {result.stderr[-1500:]}")
+    revision = kvstate.read_file(state, kvstate.ModelSpec.from_gguf(model)).state.spec.llama_revision
+    if named is not None and named != revision:
+        raise RuntimeError(f"{driver}: its manifest names llama.cpp {named}, but its saves have {revision}'s layout")
+    return revision
 
 
 def create_dsv4_mtp_fixture(source, path, seed=17):
@@ -509,10 +718,7 @@ def create_fixture(path, architecture, seed=31, *, fused_qkv=False, context_leng
     path = Path(path)
     if path.exists():
         raise FileExistsError(path)
-    gguf_path = Path(__file__).resolve().parents[2] / "runtime/source/gguf-py"
-    if not gguf_path.is_dir():
-        raise RuntimeError("build the pinned runtime first to provide gguf-py")
-    sys.path.insert(0, str(gguf_path))
+    _gguf_module()
     from gguf import GGUFWriter, TokenType
     from gguf.vocab import bytes_to_unicode
 

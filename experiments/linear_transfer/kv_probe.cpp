@@ -29,6 +29,18 @@
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
+// The llama.cpp revision the probe is built against (build_collector.py passes it to CMake; unset: the
+// current pin's rules). 85d5703a3 reads gemma3's, gpt-oss's and laguna's attention.sliding_window_pattern as
+// a period only: llama_model_loader::get_key_or_arr into a scalar skips an array, so the default period
+// applies whatever flags say (kvstate.py refuses such flags when they disagree with it; so does the probe).
+#ifndef KVPARK_LLAMA_REVISION
+#define KVPARK_LLAMA_REVISION ""
+#endif
+static bool period_only_pattern(const std::string & architecture) {
+    static const bool pin_85d5703a3 = std::string(KVPARK_LLAMA_REVISION).rfind("85d5703a3", 0) == 0;
+    return pin_85d5703a3 && (architecture == "gemma3" || architecture == "gpt-oss" || architecture == "laguna");
+}
+
 enum class run_mode { tokenize, collect, patch_score, save_state, seed_score };
 
 struct options {
@@ -45,7 +57,8 @@ struct options {
 static const char * usage =
     "--mode {tokenize,collect,patch-score,save-state,seed-score} --model GGUF --input DOCS.jsonl --output NEW_DIR\n"
     "  [--ctx 5120] [--batch 512] [--threads 16]\n"
-    "  [--capture-spec SPEC.json]   (collect; default {\"k\":\"all\",\"v\":\"all\"})\n"
+    "  [--capture-spec SPEC.json]   (collect; default {\"k\":\"all\",\"v\":\"all\"}; a document with\n"
+    "                               \"save_at\": [its token count] also gets the state of the capture run)\n"
     "  [--max-scored 256]           (patch-score, seed-score)\n"
     "  [--full-decode]              (patch-score, seed-score: decode whole documents, not only up to the last needed ubatch)\n"
     "  [--cache-type f32|f16] [--flash-attn off|on] [--swa-full on|off]\n"
@@ -359,16 +372,24 @@ static int64_t integer(const gguf_context * meta, const std::string & key, int64
 // as float32 [tokens, heads, dim] (or [tokens, heads * dim]). The K row of an MLA cache with
 // RoPE is no single node before RoPE: it is captured from two, the normed latent "kv_cmpr"
 // (build_norm's MUL, [kv_lora, tokens]) and the pre-RoPE "k_pe" ([n_rot, 1, tokens]), each
-// written into its columns of one row [c_kv | k_pe] (src/models/deepseek2.cpp:526-590).
+// written into its columns of one row [c_kv | k_pe] (src/models/deepseek2.cpp:517-581).
+// Line numbers in this file are llama.cpp a7b94df2c's (the current pin); every graph name here is
+// the same on 85d5703a3, and so is every layer rule but the sliding patterns of gemma3, gpt-oss and
+// laguna (period_only_pattern), so the probe builds and captures alike on both pins.
 
 // norm_output: whatever build_norm returns, its bias ADD, else its weight MUL, else the NORM itself
-// (llm_graph_context::build_norm names only that last node after the caller)
-enum class key_op { mul, mul_mat, reshape_or_view, view, concat, norm_output, sigmoid, any };
+// (llm_graph_context::build_norm names only that last node after the caller); rms_norm: a bare
+// ggml_rms_norm (gemma4's V)
+enum class key_op { mul, mul_mat, reshape_or_view, view, concat, norm_output, rms_norm, sigmoid, any };
+
+// the columns of a fused QKV projection's row [Q | K | V] that a 2-D node_def reads (mimo2.cpp:129-142)
+enum class qkv_slice { none, q, k, v };
 
 struct node_def {
     const char * tensor;
     key_op op;
     bool two_d;             // [heads * dim, tokens] instead of [dim, heads, tokens]
+    qkv_slice slice = qkv_slice::none;
 };
 
 // One capture key of an architecture: its node, and for a composite row (the MLA K row, a DeepSeek
@@ -399,7 +420,7 @@ static const key_def q_qkv{"q", {"Qcur", key_op::reshape_or_view, false}};
 // bias are optional, glm-dsa.cpp:144-145, so the output is an ADD, a MUL or the NORM)
 static const key_def k_mla{"k", {"kv_cmpr", key_op::mul, true}, {"k_pe", key_op::view, false}};
 static const key_def ik_dsa{"ik", {"indexer_k", key_op::norm_output, true}};
-// DeepSeek V4 (src/models/deepseek4.cpp:928-1040): K is the raw latent before RoPE (kv_norm, the
+// DeepSeek V4 (src/models/deepseek4.cpp:927-1039): K is the raw latent before RoPE (kv_norm, the
 // reshape [head, 1, tokens]; the cache reads it as both K and V, so there is no V key), and per
 // compressed layer the compressor inputs of its pools as one row [a | s] from two 2-D MUL_MATs
 // ({csa,hca,lid}_state_kv and _state_score: the score before APE): CSA and LID on ratio-4 layers,
@@ -413,7 +434,8 @@ static const key_def lid_dsv4{"lid", {"lid_state_kv", key_op::mul_mat, true}, {"
 enum class layer_rule {
     hybrid_recurrent,  // qwen35/qwen3next/qwen35moe/minimax-01: attention.recurrent_layers flags, else every
                        // full_attention_interval-th layer (default arch_def::interval) is full attention
-    sliding_pattern,   // muse-glimmer, dots3note: attention.sliding_window_pattern flags or period; the rest is full
+    sliding_pattern,   // muse-glimmer, dots3note and the GQA models with a sliding window: attention.sliding_window_pattern
+                       // flags, or a period (arch_def::swa_period, swa_dense_first); the rest is full
     dense,             // every trunk layer is full attention (one plain llama_kv_cache)
     kv_heads,          // recurrent iff attention.head_count_kv is 0 for the layer (KDA, Mamba, short-conv
                        // hybrids); lfm2's attention layers all slide when attention.sliding_window > 0
@@ -423,7 +445,9 @@ enum class layer_rule {
 };
 
 // One row per architecture whose graph names (src/models/<arch>.cpp), tensor shapes and
-// memory layout were checked against the pinned runtime. To add an architecture, check that
+// memory layout were checked against both pinned runtimes (85d5703a3 and a7b94df2c: kvstate.py
+// reads either's states, whose layouts differ for deepseek2/mistral4 nextn layers, qwen4exp's
+// indexer and bailingmoe3 with rope sections). To add an architecture, check that
 // its graph names the pre-RoPE key/query and V as one of the key definitions above uses them
 // (or give it its own), then add a row; kvstate.py needs the matching ModelSpec. A row
 // without keys still serves tokenize, save-state and seed-score.
@@ -434,8 +458,16 @@ struct arch_def {
     std::vector<key_def> keys;              // capture keys of this architecture
     bool mla = false;                       // K-only latent rows: one KV head, K = key_length, V = kv_lora_rank
     int interval = 4;                       // hybrid_recurrent: default full_attention_interval
-    const key_def * find(const std::string & key) const {
-        for (const auto & def : keys) {
+    // sliding_pattern: the default period (0: the GGUF must hold flags), whether the full layer leads each
+    // period (llama_hparams::set_swa_pattern), and whether a model without attention.sliding_window is a
+    // plain cache of full layers (gemma3, laguna) rather than an error
+    int swa_period = 4;
+    bool swa_dense_first = false, swa_optional = false;
+    // capture keys of the layers whose projection is one attn_qkv tensor (layer_info::fused_qkv), where the
+    // graph names no node of the split ones (mimo2); empty: the same keys for both
+    std::vector<key_def> fused_keys = {};
+    const key_def * find(const std::string & key, bool fused = false) const {
+        for (const auto & def : fused && !fused_keys.empty() ? fused_keys : keys) {
             if (key == def.key) { return &def; }
         }
         return nullptr;
@@ -450,14 +482,15 @@ static const std::vector<arch_def> arch_table = {
       {"attn_out", {"attn_out", key_op::any, true}}}},
     // src/models/qwen3.cpp: Kcur_normed / Qcur_normed (q/k RMSNorm before NEOX RoPE), Vcur from build_qkv
     {"qwen3", layer_rule::dense, false, {k_normed, v_cur, q_normed}},
-    // GatedDeltaNet hybrids named like qwen35 (qwen3next.cpp:263-290, qwen35moe.cpp:302-337,
-    // qwen4exp.cpp:777-822), and plamo2's Mamba hybrid (plamo2.cpp:225-243: V a view of the fused QKV)
+    // GatedDeltaNet hybrids named like qwen35 (qwen3next.cpp:247-290, qwen35moe.cpp:290-337,
+    // qwen4exp.cpp:958-1003; its block indexer has no capture key), and plamo2's Mamba hybrid
+    // (plamo2.cpp:225-243: V a view of the fused QKV)
     {"qwen3next", layer_rule::hybrid_recurrent, true, {k_normed, v_cur, q_normed}},
     {"qwen35moe", layer_rule::hybrid_recurrent, true, {k_normed, v_cur, q_normed}},
     {"qwen4exp", layer_rule::hybrid_recurrent, true, {k_normed, v_cur, q_normed}},
     {"plamo2", layer_rule::kv_heads, false, {k_normed, v_cur, q_normed}},
-    // build_qkv attention next to recurrent layers: K/Q before RoPE (minimax-01.cpp:254-271, jamba.cpp:132,
-    // granite-hybrid.cpp:208-221, nemotron-h.cpp:261); NoPE in jamba and nemotron-h
+    // build_qkv attention next to recurrent layers: K/Q before RoPE (minimax-01.cpp:255-272, jamba.cpp:132,
+    // granite-hybrid.cpp:208-221, nemotron-h.cpp:271); NoPE in jamba and nemotron-h
     {"minimax-01", layer_rule::hybrid_recurrent, true, {k_qkv, v_cur, q_qkv}, false, 8},
     {"jamba", layer_rule::kv_heads, false, {k_qkv, v_cur, q_qkv}},
     {"granitehybrid", layer_rule::kv_heads, false, {k_qkv, v_cur, q_qkv}},
@@ -473,8 +506,9 @@ static const std::vector<arch_def> arch_table = {
     {"lfm2moe", layer_rule::kv_heads, false,
      {{"k", {"model.layers.{}.self_attn.k_layernorm", key_op::mul, false}}, v_cur,
       {"q", {"model.layers.{}.self_attn.q_layernorm", key_op::mul, false}}}},
-    // MLA (deepseek2.cpp:526-590; mistral4 runs deepseek2's graph; deepseek32.cpp, glm-dsa.cpp: indexer
-    // keys, glm-dsa.cpp:276-293); the deepseek2/mistral4 cache keeps nextn layers, which are not captured
+    // MLA (deepseek2.cpp:517-581; mistral4 runs deepseek2's graph; deepseek32.cpp, glm-dsa.cpp: indexer
+    // keys, glm-dsa.cpp:276-293); nextn layers are not captured (85d5703a3's deepseek2/mistral4 cache
+    // keeps them as zero rows, a7b94df2c's leaves them out)
     {"deepseek2", layer_rule::dense, true, {k_mla, v_cur}, true},
     {"mistral4", layer_rule::dense, true, {k_mla, v_cur}, true},
     {"deepseek32", layer_rule::dense, false, {k_mla, v_cur, ik_dsa}, true},
@@ -482,15 +516,42 @@ static const std::vector<arch_def> arch_table = {
     // dots3note.cpp:316-344: k_pe gets an RMSNorm (MUL, named k_pe) before RoPE
     {"dots3note", layer_rule::sliding_pattern, false,
      {{"k", {"kv_cmpr", key_op::mul, true}, {"k_pe", key_op::mul, false}}, v_cur, ik_dsa}, true},
-    // NoPE MLA + KDA (kimi-linear.cpp:394-437): the concatenated cache row is the pre-RoPE row
+    // NoPE MLA + KDA (kimi-linear.cpp:406-449): the concatenated cache row is the pre-RoPE row
     {"kimi-linear", layer_rule::kv_heads, true, {{"k", {"Kcur", key_op::concat, false}}, v_cur}, true},
-    // kimi-k3.cpp:481-556, bailingmoe3.cpp:303-351 and hy-v4.cpp:296-321 name neither the latent row
-    // nor k_pe before RoPE: no capture keys (tokenize, save-state and seed-score only)
+    // kimi-k3.cpp:485-560, bailingmoe3.cpp:308-363 (NORM RoPE, or M-RoPE on a7b94df2c when the GGUF has
+    // rope sections) and hy-v4.cpp:296-321 name neither the latent row nor k_pe before RoPE: no capture
+    // keys (tokenize, save-state and seed-score only)
     {"kimi-k3", layer_rule::kv_heads, true, {}, true},
     {"bailingmoe3", layer_rule::kv_heads, true, {}, true},
     {"hy_v4", layer_rule::dense, false, {}, true},
     // DeepSeek V4, V4-Pro, V4-Flash (deepseek4.cpp; kvstate's dsv4 memory); its nextn (MTP) blocks are not trunk layers
     {"deepseek4", layer_rule::all_sliding, true, {k_dsv4, csa_dsv4, hca_dsv4, lid_dsv4}},
+    // NoPE MLA + KDA + a k-pool indexer (glm5-next.cpp, a7b94df2c only): no capture keys
+    {"glm5-next", layer_rule::kv_heads, true, {}, true},
+    // GQA models (kvstate.GQA_ARCHITECTURES). One cache: llama.cpp:143-160 and mistral3.cpp:134-151 rotate
+    // build_qkv's K, phi3.cpp:105-121 too; qwen3moe.cpp:94-117 its k_norm output (Kcur_normed); hy-v3.cpp:
+    // 131-141 names its k_norm output not at all (no capture keys; its nextn blocks are filtered out)
+    {"llama", layer_rule::dense, false, {k_qkv, v_cur, q_qkv}},
+    {"mistral3", layer_rule::dense, false, {k_qkv, v_cur, q_qkv}},
+    {"phi3", layer_rule::dense, false, {k_qkv, v_cur, q_qkv}},
+    {"qwen3moe", layer_rule::dense, false, {k_normed, v_cur, q_normed}},
+    {"hy_v3", layer_rule::dense, true, {}},
+    // sliding windows: gemma3.cpp:126-147 (period 6, optional window), laguna.cpp:203-224 (period 4, the
+    // full layer first, optional window), openai-moe.cpp:89-106 (gpt-oss: period 2), mimo2.cpp:143-153
+    // (flags; the K/V projections, named before their reshape: 2-D; with a fused attn_qkv, as the MiMo-V2.5
+    // conversions write it, Q, K and V are unnamed views of the projection "wqkv" [Q | K | V],
+    // mimo2.cpp:129-142, read as its columns), gemma4.cpp:154-219 (flags; V is the RMS-normed projection,
+    // Vcur_normed)
+    {"gemma3", layer_rule::sliding_pattern, false, {k_normed, v_cur, q_normed}, false, 4, 6, false, true},
+    {"laguna", layer_rule::sliding_pattern, false, {k_normed, v_cur, q_normed}, false, 4, 4, true, true},
+    {"gpt-oss", layer_rule::sliding_pattern, false, {k_qkv, v_cur, q_qkv}, false, 4, 2},
+    {"mimo2", layer_rule::sliding_pattern, true,
+     {{"k", {"Kcur", key_op::mul_mat, true}}, {"v", {"Vcur", key_op::mul_mat, true}}, {"q", {"Qcur", key_op::mul_mat, true}}},
+     false, 4, 0, false, false,
+     {{"k", {"wqkv", key_op::mul_mat, true, qkv_slice::k}}, {"v", {"wqkv", key_op::mul_mat, true, qkv_slice::v}},
+      {"q", {"wqkv", key_op::mul_mat, true, qkv_slice::q}}}},
+    {"gemma4", layer_rule::sliding_pattern, false, {k_normed, {"v", {"Vcur_normed", key_op::rms_norm, false}}, q_normed},
+     false, 4, 0},
 };
 
 static const arch_def * find_arch(const std::string & name) {
@@ -513,12 +574,13 @@ static std::string arch_list(const std::function<bool(const arch_def &)> & keep)
 }
 
 struct layer_info {
-    std::string attention;                  // full | sliding | recurrent | parallel | mlp
+    std::string attention;                  // full | sliding | recurrent | parallel | mlp | shared
     int64_t n_head = 0, n_head_kv = 0, dim_k = 0, dim_v = 0;
     int64_t kv_lora = 0;                    // MLA: latent width (the first kv_lora elements of the K row)
     int64_t indexer = 0;                    // DSA: indexer key length when this layer stores indexer keys
     int64_t compress = 0;                   // DeepSeek V4: compress ratio (0 window only, 4 CSA + LID, 128 HCA)
     int64_t lid_dim = 0;                    // DeepSeek V4: lightning-indexer key length on ratio-4 layers
+    bool fused_qkv = false;                 // the attention projection is one attn_qkv tensor (arch_def::fused_keys)
 };
 
 struct model_info {
@@ -527,7 +589,8 @@ struct model_info {
     int64_t n_layer = 0;
     std::vector<layer_info> layers;
     bool is_attention(int64_t il) const {
-        return il >= 0 && il < n_layer && layers[il].attention != "recurrent" && layers[il].attention != "mlp";
+        return il >= 0 && il < n_layer && layers[il].attention != "recurrent" && layers[il].attention != "mlp"
+               && layers[il].attention != "shared";
     }
 };
 
@@ -580,13 +643,26 @@ static model_info inspect_model(const fs::path & path) {
         } else if (info.arch->rule == layer_rule::sliding_pattern) {
             const std::string pattern = prefix + "attention.sliding_window_pattern";
             const auto id = gguf_find_key(m, pattern.c_str());
+            const bool flags = id >= 0 && gguf_get_kv_type(m, id) == GGUF_TYPE_ARRAY;
             bool sliding;
-            if (id >= 0 && gguf_get_kv_type(m, id) == GGUF_TYPE_ARRAY) {
-                sliding = integer(m, pattern, -1, il) != 0;
+            if (info.arch->swa_optional && integer(m, prefix + "attention.sliding_window", 0) <= 0) {
+                sliding = false;                // no window: a plain cache (gemma3, laguna)
             } else {
-                const auto period = integer(m, pattern, 4);
-                if (period <= 0) { throw std::runtime_error("invalid sliding-window period"); }
-                sliding = il % period < period - 1;
+                // flags past the array's end stay full (get_arr into is_swa_impl)
+                const bool flagged = flags && uint64_t(il) < gguf_get_arr_n(m, id) && integer(m, pattern, -1, il) != 0;
+                if (flags && !period_only_pattern(info.architecture)) {
+                    sliding = flagged;
+                } else {
+                    if (info.arch->swa_period == 0) { throw std::runtime_error(info.architecture + " needs sliding_window_pattern flags"); }
+                    const auto period = flags ? info.arch->swa_period : integer(m, pattern, info.arch->swa_period);
+                    if (period < 0) { throw std::runtime_error("invalid sliding-window period"); }
+                    // llama_hparams::set_swa_pattern (src/llama-hparams.cpp:7-22): period 0, every layer slides
+                    sliding = period == 0 || (info.arch->swa_dense_first ? il % period != 0 : il % period < period - 1);
+                    if (flags && sliding != flagged) {
+                        throw std::runtime_error(std::string("llama.cpp ") + KVPARK_LLAMA_REVISION + " ignores " + info.architecture
+                                                 + "'s sliding_window_pattern flags (their layers differ by pin; not modelled)");
+                    }
+                }
             }
             layer.attention = sliding ? "sliding" : "full";
         } else if (info.arch->rule == layer_rule::kv_heads) {
@@ -610,20 +686,35 @@ static model_info inspect_model(const fs::path & path) {
         } else {
             layer.attention = "full";
         }
-        if (layer.attention != "recurrent" && layer.attention != "mlp") {
+        if (info.architecture == "gemma4" && il >= blocks - integer(m, prefix + "attention.shared_kv_layers", 0)) {
+            // gemma4's shared KV layers attend to an earlier layer's cache and keep none (llama_hparams::has_kv)
+            layer.attention = "shared";
+        }
+        if (layer.attention != "recurrent" && layer.attention != "mlp" && layer.attention != "shared") {
+            layer.fused_qkv = gguf_find_tensor(m, ("blk." + std::to_string(il) + ".attn_qkv.weight").c_str()) >= 0;
             layer.n_head = per_layer(prefix + "attention.head_count", -1, il);
             if (layer.n_head <= 0) { throw std::runtime_error("invalid attention head count"); }
             layer.n_head_kv = per_layer(prefix + "attention.head_count_kv", layer.n_head, il);
-            const bool sliding = layer.attention == "sliding" && info.arch->mla;
-            layer.dim_k = integer(m, prefix + (sliding ? "attention.key_length_swa" : "attention.key_length"),
-                                  embd / layer.n_head, il);
-            layer.dim_v = integer(m, prefix + "attention.value_length", embd / layer.n_head, il);
+            // head sizes as llama_hparams::n_embd_head_k/v(il): the _swa ones on sliding layers, defaulting to
+            // the full ones, which default to n_embd / n_head of layer 0
+            // (a hybrid whose layer 0 has no heads: this layer's; plamo2 writes the head sizes anyway)
+            const bool sliding = layer.attention == "sliding";
+            const int64_t n_head0 = per_layer(prefix + "attention.head_count", -1, 0);
+            const int64_t fallback = embd / (n_head0 > 0 ? n_head0 : layer.n_head);
+            layer.dim_k = integer(m, prefix + "attention.key_length", fallback, il);
+            layer.dim_v = integer(m, prefix + "attention.value_length", fallback, il);
+            if (sliding) {
+                layer.dim_k = integer(m, prefix + "attention.key_length_swa", layer.dim_k, il);
+                layer.dim_v = integer(m, prefix + "attention.value_length_swa", layer.dim_v, il);
+            }
             if (info.arch->mla) {
                 // one latent "head" per cell; attention reads V as its first kv_lora elements, whatever
                 // attention.value_length says (src/llama-kv-cache.cpp:229-233)
                 layer.kv_lora = integer(m, prefix + (sliding ? "attention.kv_lora_rank_swa" : "attention.kv_lora_rank"));
                 layer.dim_v = layer.kv_lora;
-                if (layer.n_head_kv != 1 || layer.dim_k <= layer.kv_lora) {
+                // glm5-next's NoPE latent rows hold no k_pe at all
+                const int64_t k_pe_min = info.architecture == "glm5-next" ? 0 : 1;
+                if (layer.n_head_kv != 1 || layer.dim_k - layer.kv_lora < k_pe_min) {
                     throw std::runtime_error("layer " + std::to_string(il) + " is not an MLA row [c_kv | k_pe] of one KV head");
                 }
             }
@@ -655,6 +746,7 @@ struct target {
     int layer = 0;
     int64_t heads = 0, dim = 0;
     int64_t row_dim = 0, column = 0;  // a composite row (MLA K): the row's width and this node's first column
+    int64_t node_width = 0, node_column = 0;  // a 2-D node: its row width, and where this target's columns start
     key_op op = key_op::any;
     bool two_d = false;
     bool observe_only = false;  // patch-score on a GPU: split the graph here without touching the values
@@ -676,8 +768,7 @@ static std::vector<std::unique_ptr<target>> make_targets(const model_info & info
             == capture_keys.end()) {
         throw std::runtime_error("unknown capture key: " + key);
     }
-    const key_def * def = info.arch->find(key);
-    if (!def) {
+    if (!info.arch->find(key)) {
         throw std::runtime_error("capture key " + key + " is only defined for "
                                  + arch_list([&key](const arch_def & arch) { return arch.has_key(key); }));
     }
@@ -685,6 +776,10 @@ static std::vector<std::unique_ptr<target>> make_targets(const model_info & info
         throw std::runtime_error("layer " + std::to_string(layer) + " is not an attention layer of this model");
     }
     const auto & l = info.layers[size_t(layer)];
+    const key_def * def = info.arch->find(key, l.fused_qkv);
+    if (!def) {
+        throw std::runtime_error("capture key " + key + " is not defined for a layer with a fused attn_qkv");
+    }
     if (key == "ik" && l.indexer == 0) {
         throw std::runtime_error("layer " + std::to_string(layer) + " stores no indexer keys");
     }
@@ -718,6 +813,13 @@ static std::vector<std::unique_ptr<target>> make_targets(const model_info & info
         t->row_dim = dim;
         t->dim = def->tail.tensor ? (node == &def->node ? split : dim - split) : dim;
         t->column = node == &def->node ? 0 : split;
+        t->node_width = heads * t->dim;
+        if (node->slice != qkv_slice::none) {
+            // [Q (n_head * dim_k) | K (n_head_kv * dim_k) | V (n_head_kv * dim_v)]
+            const int64_t q = l.n_head * l.dim_k, k = l.n_head_kv * l.dim_k;
+            t->node_width = q + k + l.n_head_kv * l.dim_v;
+            t->node_column = node->slice == qkv_slice::q ? 0 : node->slice == qkv_slice::k ? q : q + k;
+        }
         out.push_back(std::move(t));
     }
     return out;
@@ -741,6 +843,7 @@ static bool op_allowed(const target & t, const ggml_tensor * tensor) {
         case key_op::concat: return tensor->op == GGML_OP_CONCAT;
         case key_op::norm_output:
             return tensor->op == GGML_OP_ADD || tensor->op == GGML_OP_MUL || tensor->op == GGML_OP_NORM;
+        case key_op::rms_norm: return tensor->op == GGML_OP_RMS_NORM;
         case key_op::sigmoid: return tensor->op == GGML_OP_UNARY && ggml_get_unary_op(tensor) == GGML_UNARY_OP_SIGMOID;
         case key_op::any: return true;
     }
@@ -749,19 +852,19 @@ static bool op_allowed(const target & t, const ggml_tensor * tensor) {
 
 static bool shape_matches(const target & t, const ggml_tensor * tensor, int64_t n_tokens) {
     if (t.two_d) {
-        return tensor->ne[0] == t.heads * t.dim && tensor->ne[1] == n_tokens && tensor->ne[2] == 1 && tensor->ne[3] == 1;
+        return tensor->ne[0] == t.node_width && tensor->ne[1] == n_tokens && tensor->ne[2] == 1 && tensor->ne[3] == 1;
     }
     return tensor->ne[0] == t.dim && tensor->ne[1] == t.heads && tensor->ne[2] == n_tokens && tensor->ne[3] == 1;
 }
 
 static size_t element_offset(const target & t, const ggml_tensor * tensor, int64_t token, int64_t head, int64_t dim) {
-    if (t.two_d) { return size_t(token * tensor->nb[1] + (head * t.dim + dim) * tensor->nb[0]); }
+    if (t.two_d) { return size_t(token * tensor->nb[1] + (t.node_column + head * t.dim + dim) * tensor->nb[0]); }
     return size_t(token * tensor->nb[2] + head * tensor->nb[1] + dim * tensor->nb[0]);
 }
 
 struct probe_state {
     std::vector<std::unique_ptr<target>> targets;
-    std::unordered_map<std::string, target *> by_name;
+    std::unordered_map<std::string, std::vector<target *>> by_name;   // a fused QKV node serves several keys
     bool active = false, patching = false;
     int64_t n_tokens = 0, pos_start = 0;
     uint64_t row_base = 0;
@@ -773,7 +876,11 @@ struct probe_state {
     void index() {
         by_name.clear();
         for (auto & t : targets) {
-            if (!by_name.emplace(t->name, t.get()).second) { throw std::runtime_error("duplicate capture " + t->name); }
+            auto & same = by_name[t->name];
+            for (const target * other : same) {
+                if (other->key == t->key) { throw std::runtime_error("duplicate capture " + t->name); }
+            }
+            same.push_back(t.get());
         }
     }
 };
@@ -880,20 +987,26 @@ static bool probe_callback(ggml_tensor * tensor, bool ask, void * opaque) {
     if (!st.active) { return !ask; }
     const auto found = st.by_name.find(tensor->name);
     if (found == st.by_name.end()) { return !ask; }
-    target & t = *found->second;
-    const bool selected = tensor->type == GGML_TYPE_F32 && op_allowed(t, tensor) && shape_matches(t, tensor, st.n_tokens);
-    if (ask) {
-        if (!selected) {
-            t.mismatch = std::string("op ") + ggml_op_desc(tensor) + " type " + ggml_type_name(tensor->type) + " ne ["
+    auto fits = [&](const target & t) {
+        return tensor->type == GGML_TYPE_F32 && op_allowed(t, tensor) && shape_matches(t, tensor, st.n_tokens);
+    };
+    bool selected = false;
+    for (target * t : found->second) {
+        if (fits(*t)) {
+            selected = true;
+        } else if (ask) {
+            t->mismatch = std::string("op ") + ggml_op_desc(tensor) + " type " + ggml_type_name(tensor->type) + " ne ["
                 + std::to_string(tensor->ne[0]) + "," + std::to_string(tensor->ne[1]) + ","
                 + std::to_string(tensor->ne[2]) + "," + std::to_string(tensor->ne[3]) + "]";
         }
-        return selected;
     }
-    if (!selected) { return true; }
+    if (ask || !selected) { return ask ? selected : true; }
     try {
-        if (t.seen++ != 0) { throw std::runtime_error("tensor " + t.name + " matched more than once in one ubatch"); }
-        if (st.patching) { patch_rows(st, t, tensor); } else { collect_rows(st, t, tensor); }
+        for (target * t : found->second) {
+            if (!fits(*t)) { continue; }
+            if (t->seen++ != 0) { throw std::runtime_error("tensor " + t->name + " matched more than once in one ubatch"); }
+            if (st.patching) { patch_rows(st, *t, tensor); } else { collect_rows(st, *t, tensor); }
+        }
         return true;
     } catch (const std::exception & exc) {
         if (st.error.empty()) { st.error = exc.what(); }
@@ -950,7 +1063,26 @@ static std::vector<document> read_documents(const fs::path & path) {
     return documents;
 }
 
-static void tokenize(const llama_vocab * vocab, document & doc, int ctx) {
+// A SentencePiece vocabulary (LLAMA_VOCAB_TYPE_SPM) with add_space_prefix (the GGUF's
+// tokenizer.ggml.add_space_prefix, true unless it says false, as llama_vocab::impl::load reads it)
+// tokenizes the text that starts the input, and each text after a special token, with a space in
+// front (is_prev_special, src/llama-vocab.cpp:3487 at a7b94df2c, 3411 at 85d5703a3), which that
+// text's first piece prints and the text does not hold (Jamba).
+static bool spm_space_prefix(const llama_model * model) {
+    if (llama_vocab_type(llama_model_get_vocab(model)) != LLAMA_VOCAB_TYPE_SPM) { return false; }
+    char value[16] = {0};
+    return llama_model_meta_val_str(model, "tokenizer.ggml.add_space_prefix", value, sizeof(value)) < 0
+           || std::string(value) != "false";
+}
+
+// The pieces drop that space where the tokenizer added it, as experiments/universal_kv/engine.py
+// spelled_pieces does: from the first normal token's piece at the start and after each special
+// token (attribute CONTROL, USER_DEFINED or UNKNOWN: the fragments the tokenizer splits off), so
+// they join to the text. A lone U+2581 token there spells nothing: its piece is empty, and so is
+// any piece llama_token_to_piece prints as nothing (byte_end then repeats the previous end).
+static void tokenize(const llama_model * model, document & doc, int ctx) {
+    const auto * vocab = llama_model_get_vocab(model);
+    const bool space_prefix = spm_space_prefix(model);
     const int32_t special_mask = LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED | LLAMA_TOKEN_ATTR_UNKNOWN;
     std::vector<llama_token> tokens(doc.text.size() + 1);
     int count = llama_tokenize(vocab, doc.text.data(), int(doc.text.size()), tokens.data(), int(tokens.size()), false, true);
@@ -967,16 +1099,21 @@ static void tokenize(const llama_vocab * vocab, document & doc, int ctx) {
     }
     std::string reconstructed;
     std::vector<char> piece(256);
+    bool after_special = true;
     for (const auto token : tokens) {
         int length = llama_token_to_piece(vocab, token, piece.data(), int(piece.size()), 0, true);
         if (length < 0) {
             piece.resize(size_t(-int64_t(length)));
             length = llama_token_to_piece(vocab, token, piece.data(), int(piece.size()), 0, true);
         }
-        if (length <= 0) { throw std::runtime_error("empty or invalid token piece in document " + doc.id); }
-        reconstructed.append(piece.data(), size_t(length));
+        if (length < 0) { throw std::runtime_error("invalid token piece in document " + doc.id); }
+        const auto attr = llama_vocab_get_attr(vocab, token);
+        const size_t skip = space_prefix && after_special && (attr & LLAMA_TOKEN_ATTR_NORMAL) != 0 && length > 0
+                            && piece[0] == ' ' ? 1 : 0;
+        reconstructed.append(piece.data() + skip, size_t(length) - skip);
         doc.byte_end.push_back(int64_t(reconstructed.size()));
-        doc.special.push_back((llama_vocab_get_attr(vocab, token) & special_mask) != 0 ? 1 : 0);
+        doc.special.push_back((attr & special_mask) != 0 ? 1 : 0);
+        after_special = (attr & special_mask) != 0;
     }
     if (reconstructed != doc.text) {
         throw std::runtime_error("token pieces do not reproduce the exact UTF-8 input of document " + doc.id);
@@ -1008,9 +1145,15 @@ static void log_callback(ggml_log_level, const char * text, void * opaque) {
     const std::string line(text);
     std::smatch match;
     static const std::regex offloaded("offloaded ([0-9]+/[0-9]+) layers to GPU");
+    // llama_context::graph_reserve's summary: "graph splits = N" (85d5703a3) or, from a7b94df2c on,
+    // "graph: nodes = ..., splits = N, ..." (src/llama-context.cpp:754-759; "pp / tg" values when
+    // the two reservations differ)
     static const std::regex splits("graph splits = ([^\n]*)");
+    static const std::regex splits_summary("graph[^:\n]*: nodes = [^,\n]*, splits = ([^,\n]*)");
     if (std::regex_search(line, match, offloaded)) { log.offloaded = match[1].str(); }
-    if (std::regex_search(line, match, splits)) { log.graph_splits = match[1].str(); }
+    if (std::regex_search(line, match, splits) || std::regex_search(line, match, splits_summary)) {
+        log.graph_splits = match[1].str();
+    }
 }
 
 static ggml_backend_dev_t vulkan_device() {
@@ -1300,7 +1443,7 @@ static int run_tokenize(const options & args, const model_info & info, std::vect
     load_runtime(rt, args, info, nullptr);
     uint64_t rows = 0;
     for (auto & doc : documents) {
-        tokenize(llama_model_get_vocab(rt.model.get()), doc, args.ctx);
+        tokenize(rt.model.get(), doc, args.ctx);
         doc.first_row = rows;
         rows += doc.tokens.size();
     }
@@ -1315,6 +1458,8 @@ static int run_tokenize(const options & args, const model_info & info, std::vect
     return 0;
 }
 
+static std::vector<size_t> plan_snapshots(const document & doc);
+
 static int run_collect(const options & args, const model_info & info, std::vector<document> & documents) {
     probe_state st;
     st.targets = parse_capture_spec(args, info);
@@ -1324,7 +1469,7 @@ static int run_collect(const options & args, const model_info & info, std::vecto
     load_runtime(rt, args, info, &st);
     uint64_t rows = 0;
     for (auto & doc : documents) {
-        tokenize(llama_model_get_vocab(rt.model.get()), doc, args.ctx);
+        tokenize(rt.model.get(), doc, args.ctx);
         doc.first_row = rows;
         rows += doc.tokens.size();
     }
@@ -1354,9 +1499,33 @@ static int run_collect(const options & args, const model_info & info, std::vecto
         captures.push_back({{"key", t->key}, {"layer", t->layer}, {"tensor", t->name}, {"heads", t->heads},
                             {"dim", t->row_dim}, {"file", t->filename}, {"dtype", "<f4"}});
     }
-    const std::vector<uint8_t> no_logits;
-    for (const auto & doc : documents) {
+    // a document with "save_at": [its token count] also gets the sequence state of this very run (the cache
+    // rows of the captured graph: on a GPU, a second run can differ by more than rounding, e.g. by a MoE
+    // routing flip, so a state of a save-state run is no reference for these captures)
+    json docs = documents_json(documents);
+    for (size_t di = 0; di < documents.size(); ++di) {
+        const auto & doc = documents[di];
+        const bool save = doc.record.contains("save_at");
+        if (save && plan_snapshots(doc) != std::vector<size_t>{doc.tokens.size()}) {
+            throw std::runtime_error("document " + doc.id + ": collect saves a state at the document's end only");
+        }
+        const std::vector<uint8_t> no_logits;
         decode_document(rt, st, args, doc, no_logits, [](int, int64_t) {}, doc.tokens.size());
+        if (save) {
+            llama_synchronize(rt.ctx.get());
+            fs::create_directories(stage.temp / "states" / doc.id);
+            const std::string relative = "states/" + doc.id + "/" + std::to_string(doc.tokens.size()) + ".state";
+            const auto path = stage.temp / relative;
+            const size_t written = llama_state_seq_save_file(rt.ctx.get(), path.string().c_str(), 0, doc.tokens.data(),
+                                                             doc.tokens.size());
+            if (written == 0 || written != fs::file_size(path)) {
+                throw std::runtime_error("llama_state_seq_save_file failed for document " + doc.id);
+            }
+            auto * memory = llama_get_memory(rt.ctx.get());
+            docs[di]["states"] = json::array({{{"n_tokens", doc.tokens.size()}, {"file", relative}, {"bytes", written},
+                                               {"pos_min", llama_memory_seq_pos_min(memory, 0)},
+                                               {"pos_max", llama_memory_seq_pos_max(memory, 0)}}});
+        }
         std::cerr << "captured document " << doc.id.substr(0, 12) << ": " << doc.tokens.size() << " tokens\n";
     }
     for (auto & t : st.targets) {
@@ -1365,7 +1534,7 @@ static int run_collect(const options & args, const model_info & info, std::vecto
     json report = {{"format_version", 2}, {"mode", "collect"}, {"architecture", info.architecture},
                    {"file_type", info.file_type}, {"n_layer", info.n_layer}, {"layers", layers_json(info)},
                    {"settings", runtime_settings(args)}, {"captures", captures},
-                   {"documents", documents_json(documents)}, {"rows", rows}};
+                   {"documents", docs}, {"rows", rows}};
     add_device_report(report, rt);
     write_json(stage.temp / "report.json", report);
     stage.publish();
@@ -1611,7 +1780,7 @@ static int run_patch_score(const options & args, const model_info & info, std::v
     const int64_t n_vocab = llama_vocab_n_tokens(vocab);
     std::vector<score_plan> plans;
     for (auto & doc : documents) {
-        tokenize(vocab, doc, args.ctx);
+        tokenize(rt.model.get(), doc, args.ctx);
         plans.push_back(plan_document(info, doc, args));
     }
     fs::create_directory(stage.temp / "scores");
@@ -1806,7 +1975,7 @@ static int run_save_state(const options & args, const model_info & info, std::ve
     uint64_t rows = 0;
     std::vector<std::vector<size_t>> snapshots;
     for (auto & doc : documents) {
-        tokenize(llama_model_get_vocab(rt.model.get()), doc, args.ctx);
+        tokenize(rt.model.get(), doc, args.ctx);
         doc.first_row = rows;
         rows += doc.tokens.size();
         snapshots.push_back(plan_snapshots(doc));
@@ -1919,7 +2088,7 @@ static int run_seed_score(const options & args, const model_info & info, std::ve
     std::vector<score_plan> plans;
     std::vector<std::vector<seed_condition>> seeds;
     for (auto & doc : documents) {
-        tokenize(vocab, doc, args.ctx);
+        tokenize(rt.model.get(), doc, args.ctx);
         plans.push_back(plan_scored_positions(doc, args));
         seeds.push_back(plan_seed_conditions(doc, plans.back()));
     }

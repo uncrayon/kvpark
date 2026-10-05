@@ -245,7 +245,14 @@ def state_bytes(spec, cells):
 def state_bytes_per_cell(spec):
     """Bytes of one f16 cell over every attention layer's stored rows (an upper bound for the
     output): K, V where the layer stores one (an MLA layer stores K only, a DeepSeek V4 layer its
-    latent), and the indexer keys of a DSA or qwen4exp model."""
+    latent), and the indexer keys of a DSA or qwen4exp model. The output takes the layout of the
+    target's template, which either pinned runtime may have written, so the largest of the spec's
+    layout variants counts (kvstate.ModelSpec.layout_variants: 85d5703a3 keeps V rows beside a
+    qwen4exp indexer's keys, a7b94df2c the pooled keys)."""
+    return max(_cell_bytes(variant) for variant in spec.layout_variants())
+
+
+def _cell_bytes(spec):
     total = 0
     for layer in spec.attention_layers:
         for key in ("k", "v"):
@@ -746,7 +753,8 @@ class Daemon:
         """Bytes of (source state + translated state) a job moves: what its peak scales with."""
         source = Path(job["source"]["state"]).stat().st_size
         try:
-            spec = engine.spec_of(job["target"]["gguf"], job["target"].get("runtime"))
+            spec = engine.spec_of(job["target"]["gguf"], job["target"].get("runtime"),
+                                  llama_revision=engine.job_revision(job["target"]))
             output = state_bytes(spec, len(job["target"]["tokens"]))
         except Exception:                       # noqa: BLE001  (the estimate must never fail a job)
             output = source

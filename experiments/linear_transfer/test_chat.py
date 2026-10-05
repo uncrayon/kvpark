@@ -13,7 +13,7 @@ import unittest
 
 from chat import (Rendered, compile_template, document_id, gguf_tokenizer_info, main,
                   make_environment, render, rendered_record, segment_texts, server_context, server_contexts,
-                  template_sha256, template_uses_bos, validate_conversation)
+                  template_sha256, template_uses_bos, tojson, validate_conversation)
 
 
 GGUF_PY = Path(__file__).resolve().parents[2] / "runtime/source/gguf-py"
@@ -36,6 +36,8 @@ CORPUS_V2 = Path(__file__).resolve().parents[2] / "evidence/linear-transfer/corp
 # kvpark-chat-apply (llama.cpp's common_chat_templates_apply) and kvpark-kv-probe binaries
 CHAT_APPLY = os.environ.get("KVPARK_CHAT_APPLY")
 PROBE = os.environ.get("KVPARK_KV_PROBE")
+# llama-server (CPU is enough): template_check's /apply-template comparison on tokenizer twins
+SERVER = os.environ.get("KVPARK_LLAMA_SERVER")
 
 # Miniature templates reproducing the behaviours of the real ones that matter here.
 QWEN_LIKE = """\
@@ -182,6 +184,46 @@ class SyntheticTemplateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "stripped"):
             render(conv, QWEN_LIKE)
 
+    def test_live_spans_hold_the_text_inside_edge_whitespace(self):
+        # a running chat keeps its whitespace: a template that trims it (QWEN_LIKE: ASCII only, as
+        # llama.cpp trims) and one that writes it raw (MUSE_LIKE) both span the same core bytes,
+        # and a whitespace-only segment has no span
+        conv = conversation("train")
+        conv["messages"][1]["content"] = "\n  Weather in Zürich?\u00a0 \n"
+        conv["messages"][3]["content"] = "\n"
+        conv["messages"][4]["content"] = "Bring a jacket.\n\n"
+        with self.assertRaisesRegex(ValueError, "stripped"):
+            render(conv, QWEN_LIKE)                         # corpus records stay stripped
+        qwen, muse = render(conv, QWEN_LIKE, live=True), render(conv, MUSE_LIKE, bos_token=MUSE_BOS, live=True)
+        self.assertIn("<|im_start|>user\nWeather in Zürich?\u00a0<|im_end|>", qwen.text)
+        self.assertIn("<|start|>user<|message|>\n  Weather in Zürich?\u00a0 \n<|eot|>", muse.text)
+        self.assertIn("<tool_response>\n\n</tool_response>", qwen.text)
+        for rendered in (qwen, muse):
+            found = {rendered.segment_keys[i]: rendered.text.encode()[a:b].decode() for i, a, b in rendered.segments}
+            self.assertEqual(found["1:content"], "Weather in Zürich?\u00a0")
+            self.assertEqual(found["4:content"], "Bring a jacket.")
+            self.assertNotIn("3:content", found)
+            self.assertEqual(rendered.escaped, ())
+
+    def test_live_arguments_written_json_escaped_have_no_span(self):
+        template = MUSE_LIKE.replace("{{- value -}}{%- endif -%}</p>", "{{- value | tojson -}}{%- endif -%}</p>")
+        conv = conversation()
+        rendered = render(conv, template, live=True)        # tojson writes a plain string as it is, quoted
+        self.assertIn('<p name="city">"Zürich, CH"</p>', rendered.text)
+        self.assertIn("2:arg:0:city", [rendered.segment_keys[i] for i, _, _ in rendered.segments])
+        conv["messages"][2]["tool_calls"][0]["function"]["arguments"]["city"] = 'Zürich "Altstadt"\nCH'
+        with self.assertRaisesRegex(ValueError, "transforms content"):
+            render(conv, template)                          # corpus records need every segment verbatim
+        rendered = render(conv, template, live=True)
+        self.assertIn('<p name="city">"Zürich \\"Altstadt\\"\\nCH"</p>', rendered.text)
+        self.assertEqual([rendered.segment_keys[i] for i in rendered.escaped], ["2:arg:0:city"])
+        self.assertNotIn("2:arg:0:city", [rendered.segment_keys[i] for i, _, _ in rendered.segments])
+        self.check_spans(conv, rendered)
+        # a template that transforms content otherwise is refused live too
+        with self.assertRaisesRegex(ValueError, "transforms content"):
+            render(conv, template.replace("{{- message.content -}}<|eot|>{%- endif -%}",
+                                          "{{- message.content | upper -}}<|eot|>{%- endif -%}"), live=True)
+
     def test_conversation_validation(self):
         mutations = [
             lambda c: c["messages"].pop(0),
@@ -259,6 +301,87 @@ class SyntheticTemplateTests(unittest.TestCase):
             environment.from_string("{{ raise_exception('boom') }}").render()
         with self.assertRaises(Exception):
             environment.from_string("{{ x.append(1) }}").render(x=[])
+
+    def test_tojson_and_printed_floats_follow_llama_cpp(self):
+        # common/jinja/value.cpp: tojson writes floats as C++ streams do (%g), {{ x }} as
+        # std::to_string without its trailing zeros; keys keep their order; C++ string escapes
+        environment = make_environment()
+        value = {"z": 1.0, "a": [0.25, 1e-07, 1234567.0, 3, True, None], "s": "tab\t\x1b \"q\" \\ é", "e": {}}
+        self.assertEqual(tojson(value), '{"z": 1, "a": [0.25, 1e-07, 1.23457e+06, 3, true, null], '
+                                        '"s": "tab\\t\\u001b \\"q\\" \\\\ é", "e": {}}')
+        nested = {"a": [1, {"b": 1.5}], "c": []}
+        self.assertEqual(environment.from_string("{{ x | tojson(indent=2) }}").render(x=nested),
+                         json.dumps(nested, indent=2))
+        self.assertEqual(tojson([1, {"a": 2}], separators=(",", ":")), '[1,{"a":2}]')
+        self.assertEqual(tojson("é🚀", ensure_ascii=True), json.dumps("é🚀"))
+        self.assertEqual(environment.from_string("{{ x | tojson }}").render(x=None), "null")
+        with self.assertRaisesRegex(ValueError, "sort_keys"):
+            tojson({"b": 1, "a": 2}, sort_keys=True)
+        self.assertEqual(environment.from_string("{{ a }}|{{ b }}|{{ c }}|{{ 2.0 }}|{{ d }}").render(
+            a=1.0, b=0.25, c=1e-07, d=7), "1.0|0.25|0.0|2.0|7")
+
+    def test_printed_values_and_filters_follow_llama_cpp(self):
+        # gather_string_parts_recursive: None, undefined and mappings print nothing, a list its
+        # items one after another; default() takes None as missing; format() leaves '%' as it is
+        environment = make_environment()
+        cases = {"{{ none }}": "", "{{ undefined_name }}": "", "{{ {'a': 1} }}": "",
+                 "{{ [1, 'a', none, [2.0]] }}": "1a2.0",
+                 "{{ 'a,b'.split(',') }}": "ab", "{{ range(3) | list }}": "012", "{{ {'a': 1}.items() | list }}": "a1",
+                 "{{ messages | map(attribute='role') }}": "useruser", "{{ none | default('d') }}": "d",
+                 "{{ '' | default('d') }}": "", "{{ '' | default('d', true) }}": "d", "{{ x | default('d') }}": "d",
+                 "{{ 1.0 | string }}": "1", "{{ [1, 2] | string }}": "[1, 2]", "{{ none | string }}": "None",
+                 "{{ '%.2f' | format(3.14159) }}": "%.2f", "{{ true }}{{ 3 }}": "True3"}
+        for template, expected in cases.items():
+            with self.subTest(template=template):
+                self.assertEqual(environment.from_string(template).render(
+                    messages=[{"role": "user"}, {"role": "user"}]), expected)
+
+    def test_string_filters_methods_and_operators_follow_llama_cpp(self):
+        # common/jinja: strip/trim remove ASCII whitespace only (isspace in the C locale), the case
+        # filters change ASCII letters only, split splits on one space, format fills '{}', `~` and
+        # `+` with a string write values as_string (None and undefined next to a string as nothing),
+        # join writes floats as printed, string writes containers as llama.cpp does, length counts
+        # UTF-8 bytes, reverse gives an array, and an attribute of an undefined value is undefined
+        environment = make_environment()
+        cases = {"{{ '\u00a0a\u3000' | trim }}": "\u00a0a\u3000", "{{ ' \u00a0a\u3000\n'.strip() }}": "\u00a0a\u3000",
+                 "{{ '\n x \t' | trim }}": "x", "{{ ' x '.lstrip() }}|{{ ' x '.rstrip() }}": "x | x",
+                 "{{ 'xxaxx'.strip('x') }}": "a", "{{ 'ééa'.lstrip('é') }}": "a", "{{ 3 | trim }}": "3",
+                 "{{ 'é ölçü' | upper }}|{{ 'ÉCOLE'.lower() }}": "é öLçü|École",
+                 "{{ 'hello-world  foo' | title }}|{{ 'aBC dEF' | capitalize }}": "Hello-world  Foo|Abc def",
+                 "{{ 'a b  c'.split() | length }}|{{ 'a,b,c'.rsplit(',', 1) | join('/') }}": "4|a,b/c",
+                 "{{ '{} items, {}' | format(3, none) }}|{{ '{}{}'.format(1, 2.0) }}": "3 items, None|12.0",
+                 "{{ '%d' | format(3) }}": "%d", "{{ 'a' ~ none ~ x ~ 1e-07 ~ [1, 'b'] ~ {'k': 0.5} }}":
+                 "a0.0[1, 'b']{'k': 0.5}", "{{ 'a' + none }}|{{ 1 + 'a' }}|{{ 1 + 2 }}|{{ [1] + [2] }}": "a|1a|3|12",
+                 "{{ [0.5, 1e-07, 2] | join(',') }}|{{ messages | join('-', attribute='role') }}": "0.5,0.0,2|user-user",
+                 "{{ {'d': 'x\ny', 'q': \"it's\", 'n': none} | string }}": "{'d': 'x\ny', 'q': \"it's\", 'n': None}",
+                 "{{ ('a', 1) | string }}|{{ ('a',) | string }}": "('a', 1)|('a',)", "{{ 'é' | length }}": "2",
+                 "{{ [1, 2] | reverse }}|{{ x.y.z is defined }}|{{ x.y.z }}": "21|False|",
+                 "{{ messages | select('role') | list | length }}": "2", "{{ x | sum }}": "0",
+                 "{{ '<r>' ~ ('<a>' | safe) ~ '</r>' }}|{{ ('<b>' | safe) + '&' }}|{{ 1.0 | safe }}": "<r><a></r>|<b>&|1"}
+        for template, expected in cases.items():
+            with self.subTest(template=template):
+                self.assertEqual(environment.from_string(template).render(
+                    messages=[{"role": "user"}, {"role": "user"}]), expected)
+        # what llama.cpp's jinja refuses where a template reaches it (jinja2 would render it)
+        for template in ("{{ 1 ~ 2 }}", "{{ none ~ none }}", "{{ '{0}' | format(1) }}", "{{ '{} {}' | format(1) }}",
+                         "{{ 'abc' | reverse }}", "{{ 'ab' | join }}", "{{ [true] | join }}", "{{ {'a': 1} | list }}",
+                         "{{ {'a': 1} | default(2) }}", "{{ ['a'] | map('upper') | list }}", "{{ [1] | select | list }}",
+                         "{{ [1.5] | sum }}", "{{ 1.5 | round }}", "{{ 'é'.strip('\u00a9') }}"):
+            with self.subTest(template=template), self.assertRaises(ValueError):
+                environment.from_string(template).render()
+        # jinja2 would fold a constant `~` into the template at compile time: not here
+        self.assertEqual(environment.from_string("{% set x = 'b' ~ none %}{{ x }}{{ 'c' ~ none }}").render(), "bc")
+
+    def test_generation_blocks_render_their_body(self):
+        # transformers' {% generation %} (Laguna's template): llama.cpp ignores the tags
+        template = ("{%- for m in messages %}<{{ m.role }}>{% if m.role == 'assistant' %}{% generation %}"
+                    "{{ m.content }}{% endgeneration %}{% else %}{{ m.content }}{% endif %}</{{ m.role }}>"
+                    "{%- endfor %}")
+        conv = {"messages": [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"}],
+                "tools": None}
+        rendered = render(conv, template, live=True)
+        self.assertEqual(rendered.text, "<user>Hi</user><assistant>Hello</assistant>")
+        self.assertEqual([rendered.text.encode()[a:b] for _, a, b in rendered.segments], [b"Hi", b"Hello"])
 
     def test_extra_context(self):
         template = "{{ messages[0].content }}{% if flag %}!{% endif %}"
@@ -498,6 +621,23 @@ class RealTemplateTests(unittest.TestCase):
         for index in spans[1]:
             self.assertEqual(spans[0][index], spans[1][index])
 
+    def test_live_edge_whitespace_renders_with_the_same_core_spans(self):
+        # Qwen3.8 trims message content (ASCII whitespace only, as llama.cpp does), Muse writes it raw
+        conv = conversation("train")
+        conv["messages"][1]["content"] = "\u3000Weather in Zürich?\u3000\n"
+        conv["messages"][3]["content"] += "\n"
+        conv["messages"][4]["content"] = "  " + conv["messages"][4]["content"] + "\n\n"
+        qwen = render(conv, self.qwen, live=True)
+        muse = render(conv, self.muse, bos_token=MUSE_BOS, live=True)
+        self.assertIn("\u3000Weather in Zürich?\u3000<|im_end|>", qwen.text)
+        self.assertIn("\u3000Weather in Zürich?\u3000\n", muse.text)
+        spans = [{index: rendered.text.encode()[start:end] for index, start, end in rendered.segments}
+                 for rendered in (qwen, muse)]
+        for index in spans[1].keys() & spans[0].keys():
+            self.assertEqual(spans[0][index], spans[1][index])
+        texts = segment_text_map(conv)
+        self.assertEqual(spans[0][qwen.segment_keys.index("4:content")].decode(), texts["4:content"].strip())
+
     def test_real_template_duplicates_and_transforms_are_rejected(self):
         doubled = self.muse.replace("{{- render_content(message['content']) -}}{{- '<|eot|>' -}}",
                                     "{{- render_content(message['content']) -}}"
@@ -567,6 +707,10 @@ class NewModelTemplateTests(unittest.TestCase):
         rendered = render(conv, self.ornith)
         spans = {rendered.segment_keys[i]: rendered.text.encode()[a:b].decode() for i, a, b in rendered.segments}
         self.assertEqual(spans["2:arg:0:city"], 'Zürich "Altstadt"\nCH')
+        # a running chat (live, the bridge engine) renders it, without a span for that argument
+        live = render(conv, self.qwen3, live=True)
+        self.assertIn('"city": "Zürich \\"Altstadt\\"\\nCH"', live.text)
+        self.assertEqual([live.segment_keys[i] for i in live.escaped], ["2:arg:0:city"])
 
     def test_qwen3_renders_reasoning_only_after_the_last_user_turn(self):
         conv = conversation("train")
@@ -633,6 +777,109 @@ class LlamaCppTemplateTests(unittest.TestCase):
                 self.assertTrue(report["identical"], report["differences"][:3])
                 self.assertEqual(report["counts"]["text_identical"], len(conversations))
                 self.assertGreater(report["counts"]["with_tool_calls"], 0)
+
+
+class TokenizerTwinTests(unittest.TestCase):
+    def test_twin_carries_the_tokenizer_and_templates_of_the_model(self):
+        import template_check
+        from tiny_fixture import _gguf_module, create_fixture
+        gguf = _gguf_module()
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory) / "model.gguf"
+            create_fixture(model, "muse-glimmer", control_tokens=["<|im_start|>", "<|im_end|>"],
+                           chat_template=QWEN_LIKE, bos_token="<|begin|>", add_bos=True)
+            twin = template_check.tokenizer_twin(model, Path(directory) / "twin.gguf")
+            source, copy_ = gguf.GGUFReader(str(model)), gguf.GGUFReader(str(twin))
+            fields = {name for name in source.fields if name.startswith("tokenizer.")}
+            self.assertEqual(fields, {name for name in copy_.fields if name.startswith("tokenizer.")})
+            for name in fields:
+                self.assertEqual(copy_.fields[name].contents(), source.fields[name].contents(), name)
+            self.assertEqual(copy_.fields["general.architecture"].contents(), "qwen3")
+            rows = {t.name: t.data.shape for t in copy_.tensors}
+            self.assertEqual(rows["token_embd.weight"][0], len(source.fields["tokenizer.ggml.tokens"].data))
+            self.assertEqual(gguf_tokenizer_info(twin), gguf_tokenizer_info(model))
+            with self.assertRaises(FileExistsError):
+                template_check.tokenizer_twin(model, twin)
+
+
+@unittest.skipUnless(SERVER, "set KVPARK_LLAMA_SERVER (a llama-server, CPU is enough) to compare with its "
+                     "/apply-template")
+class LlamaServerParityTests(unittest.TestCase):
+    """chat.py against llama-server's own jinja engine: expressions where it differs from jinja2,
+    the server comparison of template_check (BATTERY x OPTION_SETS) on tokenizer twins, and the
+    real local GGUFs when present."""
+
+    EXPRESSIONS = ("1.0 | string", "1.5", "4 / 2", "0.1 + 0.2", "'  x  ' | trim", "'a,b'.split(',')", "none",
+                   "[1, 'a', none]", "{'a': 1}", "range(3) | list", "{'a': 1}.items() | list", "none | default('d')",
+                   "'' | default('d', true)", "'%s-%d' | format('a', 1)", "{'a': [1, 2.0, 0.5]} | tojson",
+                   "{'a': 1} | tojson(indent=4)", "'é🚀' | tojson(ensure_ascii=true)",
+                   "[1, 2] | tojson(separators=(',', ':'))",
+                   "messages | map(attribute='role') | join(',')", "'a\\nb' | indent(2, true)", "true | string",
+                   "messages[0] | tojson", "3 is number", "'abc'[::-1]", "'a' ~ 1 ~ 1.0",
+                   "'\u00a0a\u3000 ' | trim", "' \u00a0a\u3000\\n'.strip()", "'ééa'.lstrip('é')", "'é ölçü' | upper",
+                   "'hello-world  foo' | title", "'aBC dEF' | capitalize", "'a b  c'.split() | length",
+                   "'{} items, {}' | format(3, none)", "'a' ~ none ~ 0.0000001 ~ [1, 'b'] ~ {'k': 0.5}",
+                   "'a' + none", "1 + 'a'", "[0.5, 0.0000001, 2] | join(',')", "{'d': 'x\\ny', 'q': \"it's\"} | string", "'é' | length",
+                   "[1, 2] | reverse", "x.y.z is defined", "messages | select('role') | list | length",
+                   "'<r>' ~ ('<a>' | safe) ~ '</r>'", "1.0 | safe")
+
+    def test_expressions_render_as_llama_cpp_renders_them(self):
+        import fixtures_media
+        import template_check
+        from tiny_fixture import create_fixture
+        template = "{%- set e = messages[0].content -%}" + "".join(
+            ("{%- if" if k == 0 else "{%- elif") + f" e == '{k}' -%}}{{{{ {expr} }}}}"
+            for k, expr in enumerate(self.EXPRESSIONS)) + (
+            "{%- elif e == 'ns' -%}{%- set ns = namespace(a=1) %}{%- for m in messages %}{%- set ns.a = ns.a + 1 %}"
+            "{%- endfor %}{{- ns.a }}{%- elif e == 'ws' -%}  a  {%- if true %}\n  b\n{% endif %}  c\n"
+            "{%- for x in [1,2] %}\n  {{ x }}\n{%- endfor %}\n{%- endif -%}")
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory) / "probe.gguf"
+            create_fixture(model, "qwen3", chat_template=template)
+            slots = Path(directory) / "slots"
+            slots.mkdir()
+            server = fixtures_media.Server(SERVER, model, slots, Path(directory) / "server.log",
+                                           fixtures_media.free_port(template_check.TWIN_PORTS), extra=["--jinja"])
+            try:
+                for key in [str(k) for k in range(len(self.EXPRESSIONS))] + ["ns", "ws"]:
+                    conv = {"messages": [{"role": "user", "content": key}, {"role": "assistant", "content": "A"},
+                                         {"role": "user", "content": "B"}], "tools": None}
+                    with self.subTest(expression=self.EXPRESSIONS[int(key)] if key.isdigit() else key):
+                        mine = compile_template(template).render(messages=conv["messages"], tools=None, bos_token="",
+                                                                 add_generation_prompt=True,
+                                                                 **server_context(server=True))
+                        self.assertEqual(mine, template_check.served_prompt(server.url, conv))
+            finally:
+                server.close()
+
+    def test_battery_on_a_fixture_twin_and_mismatches_are_reported(self):
+        import template_check
+        from tiny_fixture import create_fixture
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory) / "model.gguf"
+            create_fixture(model, "qwen3", control_tokens=["<|im_start|>", "<|im_end|>"], chat_template=QWEN_LIKE)
+            report = template_check.check_server(model, server_binary=SERVER, workdir=directory)
+            self.assertTrue(report["parity"], [c for c in report["cases"] if not c.get("context")][:2])
+            self.assertEqual(report["counts"]["cases"], len(template_check.BATTERY) * len(template_check.OPTION_SETS))
+            self.assertEqual((report["add_bos"], report["props_template_is_gguf"], report["tool_use_template"]),
+                             (False, True, False))
+            # a template whose rendering differs from llama.cpp's (dictsort prints nothing there)
+            odd = Path(directory) / "odd.gguf"
+            create_fixture(odd, "qwen3", chat_template="{{ {'b': 1, 'a': 2} | dictsort }}" + QWEN_LIKE)
+            report = template_check.check_server(odd, server_binary=SERVER, workdir=directory)
+            self.assertFalse(report["parity"])
+            self.assertEqual(report["counts"]["mismatch"], report["counts"]["cases"])
+            self.assertEqual(report["cases"][0]["first_difference"], 0)
+
+    def test_real_templates_have_parity(self):
+        import template_check
+        models = [m for m in (QWEN_GGUF, MUSE_GGUF, QWEN3_GGUF, ORNITH_GGUF) if m.is_file()]
+        if not models:
+            self.skipTest("no local GGUF")
+        for model in models:
+            with self.subTest(model=model.name), tempfile.TemporaryDirectory() as directory:
+                report = template_check.check_server(model, server_binary=SERVER, workdir=directory)
+                self.assertTrue(report["parity"], [c for c in report["cases"] if not c.get("context")][:2])
 
 
 if __name__ == "__main__":

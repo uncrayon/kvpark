@@ -72,6 +72,39 @@ def make_views(n=3000, latent_dim=6, seed=0):
     return views, spans, latent
 
 
+class TokenCaptures:
+    """The capture-set interface joint_spans reads: one document's byte ends and special flags."""
+
+    def __init__(self, document_id, byte_end, special):
+        self.document_ids = [document_id]
+        self.byte_end = np.asarray(byte_end, dtype=np.int64)
+        self.byte_start = np.concatenate([[0], self.byte_end[:-1]]).astype(np.int64)
+        self.special = np.asarray(special, dtype=np.uint8)
+
+    def __contains__(self, document_id):
+        return document_id in self.document_ids
+
+    def rows(self, document_id):
+        return slice(0, len(self.byte_end))
+
+
+class JointSpansTest(unittest.TestCase):
+    def test_tokens_that_spell_nothing_are_no_spans(self):
+        # a SentencePiece token kv_probe leaves empty (after a special token) repeats the byte end before it
+        record = {"document_id": "d0", "text": "<s>ab cd ef", "segments": [[0, 3, 11]], "segment_keys": ["0:content"],
+                  "split": "train"}
+
+        class View:
+            def __init__(self, name, byte_end, special):
+                self.name, self.records = name, {"d0": record}
+                self.captures = TokenCaptures("d0", byte_end, special)
+        views = [View("a", [3, 5, 8, 11], [1, 0, 0, 0]), View("b", [3, 3, 5, 5, 8, 11], [1, 0, 0, 0, 0, 0])]
+        spans = hub.joint_spans(views)
+        self.assertEqual(spans.document_ids, ["d0"])
+        np.testing.assert_array_equal(spans.rows["a"], [1, 2, 3])
+        np.testing.assert_array_equal(spans.rows["b"], [2, 4, 5])
+
+
 class HubTest(unittest.TestCase):
     def test_shared_latent_translates_between_every_pair(self):
         views, spans, _ = make_views()

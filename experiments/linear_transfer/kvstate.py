@@ -1,4 +1,5 @@
-"""Read and write llama.cpp sequence-state data for the pinned runtime (85d5703a3).
+"""Read and write llama.cpp sequence-state data for kvpark's pinned runtimes: llama.cpp a7b94df2c
+(the current pin) and 85d5703a3 (the previous one, which the production Qwen3.8 server still runs).
 
 Two containers carry the same memory payload:
 
@@ -8,20 +9,22 @@ Two containers carry the same memory payload:
 
 The payload is whatever ``llama_memory_i::state_write(io, seq_id, flags)`` emits, for one
 sequence. A ``ModelSpec`` built from GGUF metadata (mirroring the loader and
-``llama_model::create_memory``, src/llama-model.cpp:2230-2709) names the sections in write
+``llama_model::create_memory``, src/llama-model.cpp:2358-2891) names the sections in write
 order (``ModelSpec.layouts``):
 
     memory       GGUF architectures                            sections (flags 0)
     kv           qwen3, deepseek2, mistral4, hy_v4 without an   kv
-                 indexer
-    iswa         muse-glimmer                                   base, swa
+                 indexer, llama, mistral3, qwen3moe, hy_v3,
+                 phi3, gemma3 and laguna without a window
+    iswa         muse-glimmer, gemma3, gemma4, gpt-oss, laguna, base, swa
+                 mimo2
     hybrid       qwen35 (Qwen3.5/3.8, Ornith), qwen35moe,       attn, recurrent
                  qwen3next, minimax-01, jamba, falcon-h1,
                  granitehybrid, nemotron_h(_moe), plamo2,
                  lfm2moe, lfm2 without a sliding window,
                  kimi-k3, kimi-linear, bailingmoe3
     hybrid_iswa  lfm2 with a sliding window                     base, swa, recurrent
-    hybrid_idx   qwen4exp                                       attn, recurrent, indexer
+    hybrid_idx   qwen4exp, glm5-next (a7b94df2c only)           attn, recurrent, indexer
     recurrent    mamba, mamba2, rwkv6, rwkv6qwen2, rwkv7,       recurrent
                  arwkv7
     dsa          deepseek32, glm-dsa, hy_v4 with an indexer     kv, indexer
@@ -35,34 +38,45 @@ Recurrent rows stay opaque bytes; their structure and lengths are checked. Every
 files whose token words hold media chunks parse too (``parse_media_tokens``, ``MediaTokens``);
 ``truncate_state`` cuts a state before a token index (recurrent sections only by R0).
 
-Layout, with the pinned source it mirrors (paths under runtime/source):
+The two pins write the same containers, sections and rows except in three layouts
+(STATE_FORMAT_a7b94df.md; ``ModelSpec.llama_revision``, ``LLAMA_REVISIONS``): the nextn layers
+of deepseek2/mistral4's plain cache (``ModelSpec.nextn_cached``), qwen4exp's indexer rows
+(``ModelSpec.indexer_row_slots``, ``kv_shape``) and bailingmoe3's M-RoPE with rope sections
+(``model_rope_type``). A state does not say which wrote it; parse_state, parse_blob and
+parse_file read it with the spec's revision, else the other one, and the parsed state's spec is
+the reading that consumed it (``ModelSpec.layout_variants``); ``strict=True`` refuses the other
+reading, for code that keeps using its own spec. Old-pin states parse and serialize byte for byte
+as before.
 
-File, ``llama_context::state_seq_save_file`` (src/llama-context.cpp:3252-3270) and
-``state_seq_load_file`` (3198-3250)::
+Layout, with the source it mirrors (paths under runtime-next/src: the current pin with kvpark's
+slot-resume patch; line numbers are this pin's):
+
+File, ``llama_context::state_seq_save_file`` (src/llama-context.cpp:3378-3396) and
+``state_seq_load_file`` (3324-3376)::
 
     u32 magic = LLAMA_STATE_SEQ_MAGIC 0x67677371 'ggsq'   (include/llama.h:43,48)
     u32 version = LLAMA_STATE_SEQ_VERSION 3                (include/llama.h:49)
     u32 n_token_count
     i32 token words [n_token_count]
-    memory payload (state_seq_write_data, src/llama-context.cpp:3318-3324, flags 0)
+    memory payload (state_seq_write_data, src/llama-context.cpp:3444-3450, flags 0)
 
   The loader does not check for bytes after the payload; this module refuses them.
   llama-server stores ``server_tokens::serialize()`` as the token words
-  (tools/server/server-common.cpp:553-573, writer 278-316): LLAMA_TOKEN_NULL (-1),
-  SERVER_TOKENS_STATE_VERSION 1 (269), u32 n, n tokens, u32 n_media, media chunks.
-  ``server_tokens::deserialize`` (575-617) also accepts a plain token list whose first
+  (tools/server/server-common.cpp:570-590, writer 295-333): LLAMA_TOKEN_NULL (-1),
+  SERVER_TOKENS_STATE_VERSION 1 (286), u32 n, n tokens, u32 n_media, media chunks.
+  ``server_tokens::deserialize`` (592-634) also accepts a plain token list whose first
   word is not -1, which is what llama_state_seq_save_file with raw tokens produces.
   Media chunks follow as u32 start indices and the mtmd_input_chunk_save bytes of each
   chunk (``MediaChunk``; metadata only); a medium occupies n_tokens LLAMA_TOKEN_NULL
   entries and advances the position by n_pos (``MediaTokens``). Slot restore also requires
-  ``<file>.resume`` (tools/server/server-context.cpp:67-121, see ``ResumeFile``).
+  ``<file>.resume`` (tools/server/server-context.cpp:68-122, see ``ResumeFile``).
 
-Blob, ``llama_context::state_seq_get_data`` (src/llama-context.cpp:3080-3097) and
-``state_seq_set_data`` (3099-3134)::
+Blob, ``llama_context::state_seq_get_data`` (src/llama-context.cpp:3205-3222) and
+``state_seq_set_data`` (3224-3262; a failed restore discards what it read, 3259)::
 
-    u32 io_magic 0xaf143cd8 (3065), i32 seq_id, memory payload (flags as passed)
+    u32 io_magic 0xaf143cd8 (3190), i32 seq_id, memory payload (flags as passed)
 
-  Flags (include/llama.h:907-915): LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY (1) skips the
+  Flags (include/llama.h:920-928): LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY (1) skips the
   base cache of iSWA memory (src/llama-kv-cache-iswa.cpp:259-265), the attention
   cache of hybrid memory (src/llama-memory-hybrid.cpp:190-195) and the DSA cache of
   DSA-iSWA memory (src/llama-kv-cache-dsa-iswa.cpp:236-242); server checkpoints use it.
@@ -75,44 +89,54 @@ Memory payload order:
   hybrid (llama_memory_hybrid::state_write, src/llama-memory-hybrid.cpp:190-195):
       [attention KV section unless PARTIAL_ONLY] recurrent section
       attention = !is_recr(il), recurrent = is_recr(il) (Qwen, qwen3next, MiniMax-01:
-      il < n_layer() only, src/llama-model.cpp:2532-2538; falcon-h1: every layer in both;
+      il < n_layer() only, src/llama-model.cpp:2705-2711; falcon-h1: every layer in both;
       nemotron-h: attention = !is_recr && n_ff == 0, recurrent = is_recr && n_ff == 0, so
       MLP-only layers sit in neither; the KDA hybrids use the defaults of
       src/llama-memory-hybrid.cpp:46-64, so their attention section also holds the nextn
       layers, which the trunk never writes).
   hybrid-iSWA (lfm2 with a sliding window, src/llama-memory-hybrid-iswa.cpp:195-198):
       [base KV section unless PARTIAL_ONLY] SWA KV section, recurrent section
-  hybrid-idx (qwen4exp, src/llama-memory-hybrid-idx.cpp:204-214):
+  hybrid-idx (qwen4exp, glm5-next; src/llama-memory-hybrid-idx.cpp:259-269):
       [attention KV section] recurrent section [indexer KV section] (PARTIAL_ONLY skips both
-      KV sections); the indexer cache holds raw keys of the attention layers plus V rows that
-      are never written (its hparams copy keeps the model's V width with one KV head).
+      KV sections); the indexer cache holds raw keys of the attention layers, on a7b94df2c
+      K only, with the pooled keys beside them when the QSA layers pool blocks
+      (src/llama-memory-hybrid-idx.cpp:52-74), on 85d5703a3 plus V rows that are never written
+      (its hparams copy kept the model's V width with one KV head). glm5-next (GLM-5.3-Flash,
+      src/llama-model.cpp:2449-2490) keeps NoPE MLA latent rows (no k_pe) on its attention layers,
+      KDA rows on the others, and [key | gate | pooled] indexer rows on the indexer-typed ones.
   recurrent (mamba, mamba2, rwkv*: llama_memory_recurrent alone): recurrent section, any flags.
+  GQA models (GQA_ARCHITECTURES, GQA_CONVENTIONS: a plain or an iSWA cache with per-layer KV
+  heads and head sizes, src/llama-model.cpp:2789-2891): as plain KV or iSWA below; gemma4's shared
+  KV layers (attention.shared_kv_layers, past n_layer_kv_from_start) keep no cache and sit in no
+  section (llama_hparams::has_kv, the reuse callback). Their RoPE per layer kind: GQA_CONVENTIONS.
   plain KV (one llama_kv_cache over every layer of n_layer_all that passes the filter,
-  src/llama-model.cpp:2630-2709; llama_kv_cache::state_write ignores the flags,
-  src/llama-kv-cache.cpp:2053-2121):
-      KV section ("kv"), with or without PARTIAL_ONLY. deepseek2 and mistral4 have no
-      filter, so their nextn layers stay in the section as zero rows (src/llama-kv-cache.cpp
-      clears the buffers, 293; only the MTP context writes them).
+  src/llama-model.cpp:2812-2891; llama_kv_cache::state_write ignores the flags,
+  src/llama-kv-cache.cpp:2065-2133):
+      KV section ("kv"), with or without PARTIAL_ONLY. a7b94df2c filters the nextn layers out
+      of the main context's cache (n_layer_nextn > 0, a trunk and no router layer); 85d5703a3
+      had no filter for deepseek2 and mistral4, so there their nextn layers stay in the section
+      as zero rows (src/llama-kv-cache.cpp clears the buffers, 293; only the MTP context writes
+      them).
   DSA (llama_kv_cache_dsa::state_write, src/llama-kv-cache-dsa.cpp:162-165, flags ignored):
       MLA KV section ("kv": trunk layers) then the lightning-indexer key section ("indexer":
       deepseek32 every trunk layer, glm-dsa/hy_v4/dots3note the attention.indexer.types
-      layers, src/llama-model.cpp:2276-2345).
+      layers, src/llama-model.cpp:2405-2518).
   DSA-iSWA (dots3note, src/llama-kv-cache-dsa-iswa.cpp:236-242):
       [DSA sections over the non-sliding trunk layers ("base", "indexer") unless
       PARTIAL_ONLY] SWA KV section ("swa").
-  DeepSeek V4 (llama_kv_cache_dsv4::state_write, src/llama-kv-cache-dsv4.cpp:1594-1626):
+  DeepSeek V4 (llama_kv_cache_dsv4::state_write, src/llama-kv-cache-dsv4.cpp:1595-1627):
       u32 magic 0x34565344 'DSV4', u32 version 1, u32 mode (0 full, 1 PARTIAL_ONLY), then the
       raw K-only iSWA cache ([base KV section unless PARTIAL_ONLY] SWA KV section), [the CSA, HCA
       and lightning-indexer row sections ("csa", "hca", "lid") unless PARTIAL_ONLY], and the
       three compressor rings ("csa_state", "hca_state", "lid_state"). See ``CompressSpec``.
 
-KV section, ``llama_kv_cache::state_write`` (src/llama-kv-cache.cpp:2053-2121)::
+KV section, ``llama_kv_cache::state_write`` (src/llama-kv-cache.cpp:2065-2133)::
 
     u32 n_stream
     per stream: u32 cell_count; if 0 nothing else for this stream, else
-      meta (state_write_meta 2203-2234), per written cell in cell-index order:
+      meta (state_write_meta 2211-2242), per written cell in cell-index order:
         i32 pos, u32 n_seq_id, [llama_kv_cell_ext if has_cell_ext()], i32 seq_id[n_seq_id]
-      data (state_write_data 2236-2333):
+      data (state_write_data 2244-2341):
         u32 v_trans, u32 n_layer
         per layer: i32 k_type, u64 k_row_bytes, k rows [cell_count][k_row_bytes]
         v_trans == 0: per layer with V: i32 v_type, u64 v_row_bytes, v rows [cell_count][v_row_bytes]
@@ -121,90 +145,111 @@ KV section, ``llama_kv_cache::state_write`` (src/llama-kv-cache.cpp:2053-2121)::
                       (the transposed V cache, stored element-major)
 
   Cells with no data for the sequence are skipped, and so are SWA-masked cells
-  (2080-2085; ``llama_hparams::is_masked_swa`` src/llama-hparams.h:466-478: masked iff
+  (2092-2097; ``llama_hparams::is_masked_swa`` src/llama-hparams.h:480-492: masked iff
   pos_max - pos >= n_swa), so a SWA section holds only the last n_swa positions.
   Rows are ggml rows: n_embd_k_gqa(il) = n_head_kv * head_dim_k elements; only F32 (0)
   and F16 (1) are accepted (quantized caches also enable a Hadamard rotation,
-  src/llama-kv-cache.cpp:314-338), and q8_0 (8) in DeepSeek V4 caches, whose rotation is modelled. v_trans is ``!flash_attn`` (src/llama-model.cpp,
-  memory creation). ``llama_kv_cell_ext`` (src/llama-kv-cells.h:13-32) is i32 x, i32 y,
-  i32 tok, present iff n_pos_per_embd() > 1 (M-RoPE/IMROPE, src/llama-hparams.cpp:285-287)
-  or PLE (src/llama-kv-cache.cpp:1831-1834); for Qwen text tokens x = y = pos and tok is
-  the token id (apply_ubatch 1133-1151; text positions are broadcast to every M-RoPE
-  component in src/llama-batch.cpp:781-788).
-  MLA caches (key_length_mla and value_length_mla set, src/llama-hparams.cpp:297-302) are
+  src/llama-kv-cache.cpp:314-338), and q8_0 (8) in DeepSeek V4 caches, whose rotation is
+  modelled. v_trans is ``!flash_attn`` (src/llama-model.cpp, memory creation). A transposed V
+  cache of layers with different V widths (gemma4, mimo2) is padded to the widest
+  (src/llama-kv-cache.cpp:157-161, 208-210), but each layer's section still writes and reads its
+  own n_embd_v_gqa(il) elements.
+  ``llama_kv_cell_ext`` (src/llama-kv-cells.h:13-32) is i32 x, i32 y, i32 tok, present iff
+  n_pos_per_embd() > 1 (M-RoPE/IMROPE, src/llama-hparams.cpp:285-288)
+  or PLE (src/llama-kv-cache.cpp:1843-1846); for text tokens x = y = pos and tok is the token
+  id (apply_ubatch 1133-1151; text positions are broadcast to every M-RoPE component in
+  src/llama-batch.cpp:829-836). bailingmoe3 has M-RoPE cells on a7b94df2c when its GGUF has
+  rope sections (``model_rope_type``).
+  MLA caches (key_length_mla and value_length_mla set, src/llama-hparams.cpp:298-303) are
   K-only: no V tensor is allocated (src/llama-kv-cache.cpp:229-233), the V blocks are
-  skipped, and v_trans is still written and checked (2277, 2306, 2545-2548). Each K row is
-  ``[RMSNorm(c_kv) * attn_kv_a_norm (kv_lora) | k_pe]`` (src/models/deepseek2.cpp:526-590):
+  skipped, and v_trans is still written and checked (2285, 2314, 2558-2561). Each K row is
+  ``[RMSNorm(c_kv) * attn_kv_a_norm (kv_lora) | k_pe]`` (src/models/deepseek2.cpp:517-581):
   k_pe carries the architecture's RoPE (NORMAL pairing, YaRN included) except on the NoPE
   kimi-k3/kimi-linear, and attention reads V as the first kv_lora elements of K
-  (src/llama-graph.cpp:2891-2926), so attention.value_length plays no part. The DSA indexer section is a second K-only cache of one
-  ``indexer.key_length`` row per cell: H . RoPE(LayerNorm(W_k x)) (src/models/deepseek32.cpp:
-  238-260; hparams copy in src/llama-kv-cache-dsa.cpp:39-46).
-  On restore of one sequence (state_read_meta 2335-2436) the sequence is erased first,
+  (src/llama-graph.cpp:2985-3020), so attention.value_length plays no part. The DSA indexer
+  section is a second K-only cache of one ``indexer.key_length`` row per cell:
+  H . RoPE(LayerNorm(W_k x)) (src/models/deepseek32.cpp:238-260; hparams copy in
+  src/llama-kv-cache-dsa.cpp:39-46).
+  On restore of one sequence (state_read_meta 2343-2449) the sequence is erased first,
   n_seq_id must be 1, and cells go wherever find_slot puts them; state_read_data
-  (2508-2656) requires equal n_layer, types, row sizes and v_trans. The next batch is
+  (2521-2669) requires equal n_layer, types, row sizes and v_trans. A failed restore zeroes
+  the cells it wrote (state_clear, 2677-2780; a7b94df2c: 85d5703a3 only erased the sequence,
+  leaving their rows behind), and DSA, hybrid and hybrid-idx memories drop every part when a
+  later one fails; parsing and writing are unaffected. The next batch is
   validated against llama_memory_seq_pos_max (for iSWA the SWA cache's maximum,
   src/llama-kv-cache-iswa.cpp:142-149; for hybrid memory the smaller of the attention
   and recurrent maxima, src/llama-memory-hybrid.cpp:172-180; for DSA the MLA cache's
   maximum; for a plain cache its maximum). With one position per token it must start at
-  exactly pos_max + 1 (src/llama-batch.cpp:288-318); with M-RoPE/IMROPE (Qwen3.5,
-  n_pos_per_embd 4) only start > pos_max is required (src/llama-batch.cpp:255-287), so jumps
+  exactly pos_max + 1 (src/llama-batch.cpp:329-359); with M-RoPE/IMROPE (Qwen3.5,
+  n_pos_per_embd 4) only start > pos_max is required (src/llama-batch.cpp:296-328), so jumps
   pass. Those checks do not see every section's end, so ``StateFile.to_bytes`` refuses a
   state whose sections do not all end at the last token (``StateFile.check_positions``).
 
-Recurrent section, ``llama_memory_recurrent::state_write`` (src/llama-memory-recurrent.cpp:766-845)::
+Recurrent section, ``llama_memory_recurrent::state_write`` (src/llama-memory-recurrent.cpp:784-863)::
 
     u32 cell_count
-    meta (878-895) per cell: i32 pos, u32 n_seq_id (0 when one sequence is saved), i32 seq_id[n]
-    data (897-990): u32 s_trans (always 0), u32 n_layer (= hparams.n_layer(), the trunk)
+    meta (896-913) per cell: i32 pos, u32 n_seq_id (0 when one sequence is saved), i32 seq_id[n]
+    data (915-1008): u32 s_trans (always 0), u32 n_layer (= hparams.n_layer(), the trunk)
       per recurrent layer (r_l non-null): i32 r_type, u64 r_row_bytes, rows [cell_count][r_row_bytes]
         and on a PLE layer (p_l non-null): u64 p_row_bytes, rows [cell_count][p_row_bytes] (no type)
       per recurrent layer: i32 s_type, u64 s_row_bytes, rows [cell_count][s_row_bytes]
 
-  Rows are always F32 (src/llama-model.cpp:2503-2599). Their sizes come from
+  Rows are always F32 (src/llama-model.cpp:2676-2781). Their sizes come from
   n_embd_r()/n_embd_s()/ple_conv_state() (src/llama-hparams.cpp:208-275, see
   ``recurrent_row_floats``); a family can have 0-byte rows (MiniMax-01 R, LFM2 S).
 
-RoPE helpers mirror ggml-cpu (ggml/src/ggml-cpu/ops.cpp): angles as in
-ggml_rope_cache_init (5975-5989) and ggml_mrope_cache_init (5991-6056, interleaved
-sectors for IMROPE), the YaRN ramp/mix and magnitude of rope_yarn (5951-5973) with the
-correction dims of ggml_rope_yarn_corr_dims (ggml/src/ggml.c:4418-4430), pairs as in
-rotate_pairs (6063-6080) with NORMAL (adjacent) and NEOX/IMROPE (half-split) pairing
-(6206-6215) inside a window [offset, offset + n_rot) of the row (the MLA k_pe tail, the
-hy_v4 indexer tail); other dims pass through. ``Rope`` carries one call's parameters and
-``ModelSpec.rope`` picks them per layer; ``rope_runtime`` derives the runtime values
+RoPE helpers mirror ggml-cpu (ggml/src/ggml-cpu/ops.cpp; its rope kernels are the same on both
+pins): angles as in ggml_rope_cache_init (6203-6217) and ggml_mrope_cache_init (6219-6290,
+interleaved sectors for IMROPE, runs of sections for M-RoPE: ``rope_components``), the YaRN
+ramp/mix and magnitude of rope_yarn (6179-6201) with the correction dims of
+ggml_rope_yarn_corr_dims (ggml/src/ggml.c:4478-4490), pairs as in rotate_pairs (6291-6308)
+with NORMAL (adjacent) and NEOX/IMROPE/M-RoPE (half-split) pairing (6434-6443) inside a window
+[offset, offset + n_rot) of the row (the MLA k_pe tail, the hy_v4 indexer tail); other dims pass
+through. ``Rope`` carries one call's parameters and ``ModelSpec.rope`` picks them per layer; ``rope_runtime`` derives the runtime values
 (freq_base, freq_scale, ext_factor, the overwritten yarn_attn_factor, beta, n_ctx_orig)
-as llama_context does (src/llama-context.cpp:113-210) from the GGUF and llama-server's
+as llama_context does (src/llama-context.cpp:114-211) from the GGUF and llama-server's
 --rope-*/--yarn-* settings. Qwen3 (dense) rotates every key after k_norm with NEOX over the
 whole head (src/models/qwen3.cpp:57 asserts n_rot == head size, 96-104;
-LLAMA_ROPE_TYPE_NEOX, src/llama-model.cpp:2950), so its cached keys are
+LLAMA_ROPE_TYPE_NEOX, src/llama-model.cpp:3136), so its cached keys are
 cache_keys(Kcur_normed); without M-RoPE its cells carry no ext. Muse rotates keys of
 sliding layers with NORMAL pairing and rope.freq_base_swa (src/models/muse-glimmer.cpp:9-10,
-117-129); its full layers are NoPE, so their cached keys are Kcur_normed. Qwen rotates the
-first n_rot dims of every full-attention key with IMROPE (src/models/qwen35.cpp:296-309); for
+112-124); its full layers are NoPE, so their cached keys are Kcur_normed. Qwen rotates the
+first n_rot dims of every full-attention key with IMROPE (src/models/qwen35.cpp:310-323); for
 text the graph feeds positions (p, p, p, 0) (src/llama-graph.cpp:131-141), so pairs whose
 sector selects the fourth component stay unrotated (none for Qwen3.8's sections
 [11, 11, 10, 0] over 32 pairs). The forward rotation takes theta_scale from libm powf, cos/sin
 from libm cosf/sinf and logf for the YaRN magnitude, and emulates the fused multiply-adds of
-the pinned CPU build (the YaRN mix theta_interp * (1 - mix) + theta_extrap * mix, the
+the pinned CPU builds (the YaRN mix theta_interp * (1 - mix) + theta_extrap * mix, the
 magnitude 1 + 0.1 * logf(1 / freq_scale) and the pair rotation); it reproduces that build's
 cached keys bit for bit on the tiny fixtures (YaRN included) and matches
-ggml_rope_ext/ggml_rope_multi of the pinned libggml-cpu at the real Muse (NORM 128, base 5e5)
+ggml_rope_ext/ggml_rope_multi of the pinned libggml-cpu builds at the real Muse (NORM 128, base 5e5)
 and Qwen (IMROPE 64 of 256, base 1e7) geometries. Without libm it falls back to float64 math
 rounded to float32, and other backends (the live Vulkan/ROCm servers) round differently. The
 inverse is computed in float64.
 """
 
 import dataclasses
+import json
 import math
 import os
 from pathlib import Path
+import re
 import struct
 import tempfile
 
 import numpy as np
 
 
+# llama.cpp revisions whose states this module reads and writes, oldest first (ModelSpec.llama_revision):
+# kvpark's pin until October 2026, which the production Qwen3.8 server still runs, and the current pin.
+# Their states differ in three layouts only (STATE_FORMAT_a7b94df.md): a7b94df2c leaves the nextn layers out
+# of a plain-KV or iSWA trunk cache, caches qwen4exp's indexer keys K-only in k-pool rows, and gives
+# bailingmoe3 M-RoPE cells when its GGUF has rope sections. A state names no revision: the parsers read it
+# with the spec's revision, else with the other one (ModelSpec.layout_variants).
+LLAMA_REVISIONS = ("85d5703a3", "a7b94df2c")
+LLAMA_REVISION = "a7b94df2c"          # the default: the current pin
+LLAMA_REVISION_COMMITS = {"85d5703a3": "85d5703a3b1b47243213a39059a6e3076c92733a",
+                          "a7b94df2c": "a7b94df2c616bc1f62a73b964b4a71cb0dcc488e"}
 LLAMA_STATE_SEQ_MAGIC = 0x67677371
 LLAMA_STATE_SEQ_VERSION = 3
 IO_MAGIC = 0xAF143CD8
@@ -235,47 +280,111 @@ DSV4_K_ROWS_VERSION = 2
 DSV4_RING_VERSION = 1
 DSV4_RATIOS = (0, 4, 128)            # window only, CSA (+ lightning indexer), HCA (src/models/deepseek4.cpp:132-153)
 MLA_ARCHITECTURES = ("deepseek2", "mistral4", "hy_v4", "deepseek32", "glm-dsa", "dots3note",
-                     "kimi-k3", "kimi-linear", "bailingmoe3")
+                     "kimi-k3", "kimi-linear", "bailingmoe3", "glm5-next")
 # hybrids with plain (GQA) attention next to GatedDeltaNet, Mamba, Mamba-2, short-conv or lightning layers
 HYBRID_ARCHITECTURES = ("qwen3next", "qwen35moe", "qwen4exp", "minimax-01", "jamba", "falcon-h1", "granitehybrid",
                         "nemotron_h", "nemotron_h_moe", "plamo2", "lfm2", "lfm2moe")
-# recurrent-only models (llm_arch_is_recurrent, src/llama-arch.cpp:1052-1064): no per-token cache at all
+# recurrent-only models (llm_arch_is_recurrent, src/llama-arch.cpp:1110-1122): no per-token cache at all
 RECURRENT_ARCHITECTURES = ("mamba", "mamba2", "rwkv6", "rwkv6qwen2", "rwkv7", "arwkv7")
+# plain-attention models that take the context's RoPE settings: GQA K/V rows of every attention layer in
+# one plain cache, or in a global and a sliding-window cache (iSWA); see GQA_CONVENTIONS
+GQA_ARCHITECTURES = ("llama", "mistral3", "qwen3moe", "hy_v3", "phi3", "gemma3", "gemma4", "gpt-oss", "laguna",
+                     "mimo2")
 ARCHITECTURES = (("muse-glimmer", "qwen35", "qwen3") + MLA_ARCHITECTURES + HYBRID_ARCHITECTURES
-                 + RECURRENT_ARCHITECTURES + ("deepseek4",))
+                 + RECURRENT_ARCHITECTURES + ("deepseek4",) + GQA_ARCHITECTURES)
+# architectures a pinned revision lacks (the first revision that has them, LLAMA_REVISIONS order)
+ARCHITECTURE_SINCE = {"glm5-next": "a7b94df2c"}
 # memory layout per architecture: iSWA (base + SWA KV), hybrid (attention KV + recurrent), plain KV,
 # DSA (MLA KV + indexer keys), DSA-iSWA (MLA KV + indexer keys + SWA KV), hybrid-iSWA (base + SWA KV +
 # recurrent), hybrid-idx (attention KV + recurrent + indexer keys), recurrent (recurrent rows only);
-# hy_v4 is "dsa" when the GGUF has an indexer (attention.indexer.top_k > 0, src/llama-model.cpp:2322-2345)
-# and lfm2 "hybrid_iswa" when it has a sliding window (src/models/lfm2.cpp, src/llama-model.cpp:2541-2560)
+# hy_v4 is "dsa" when the GGUF has an indexer (attention.indexer.top_k > 0, src/llama-model.cpp:2451-2518)
+# and lfm2 "hybrid_iswa" when it has a sliding window (src/models/lfm2.cpp, src/llama-model.cpp:2714-2742);
+# gemma3 and laguna are "kv" without a sliding window (GQA_CONVENTIONS)
 MEMORY = {"muse-glimmer": "iswa", "qwen35": "hybrid", "qwen3": "kv", "deepseek2": "kv", "mistral4": "kv",
           "hy_v4": "kv", "deepseek32": "dsa", "glm-dsa": "dsa", "dots3note": "dsa_iswa", "kimi-k3": "hybrid",
           "kimi-linear": "hybrid", "bailingmoe3": "hybrid", **{a: "hybrid" for a in HYBRID_ARCHITECTURES},
-          "qwen4exp": "hybrid_idx", **{a: "recurrent" for a in RECURRENT_ARCHITECTURES}, "deepseek4": "dsv4"}
+          "qwen4exp": "hybrid_idx", "glm5-next": "hybrid_idx", **{a: "recurrent" for a in RECURRENT_ARCHITECTURES},
+          "deepseek4": "dsv4", **{a: "kv" for a in GQA_ARCHITECTURES},
+          **{a: "iswa" for a in ("gemma3", "gemma4", "gpt-oss", "laguna", "mimo2")}}
 MEMORY_LAYOUTS = ("kv", "iswa", "hybrid", "dsa", "dsa_iswa", "hybrid_iswa", "hybrid_idx", "recurrent", "dsv4")
-# "nextn": an attention layer the trunk never writes, kept in a KV section (zero rows); "parallel": a
-# layer in both the attention and the recurrent memory (falcon-h1); "mlp": a layer in neither (the
-# MLP-only layers of nemotron-h)
+# "nextn": an attention layer the trunk never writes, kept in a KV section (zero rows) where the
+# revision's cache keeps it (ModelSpec.nextn_cached); "parallel": a layer in both the attention and the
+# recurrent memory (falcon-h1); "mlp": a layer in neither (the MLP-only layers of nemotron-h); "shared": a
+# layer that attends to an earlier layer's cache and keeps none (gemma4's shared KV layers)
 LAYER_KINDS = {"muse-glimmer": {"full", "sliding"}, "qwen35": {"full", "recurrent"}, "qwen3": {"full"},
                "deepseek2": {"full", "nextn"}, "mistral4": {"full", "nextn"}, "hy_v4": {"full"},
                "deepseek32": {"full"}, "glm-dsa": {"full"}, "dots3note": {"full", "sliding"},
                "kimi-k3": {"full", "recurrent", "nextn"}, "kimi-linear": {"full", "recurrent", "nextn"},
-               "bailingmoe3": {"full", "recurrent", "nextn"},
+               "bailingmoe3": {"full", "recurrent", "nextn"}, "glm5-next": {"full", "recurrent"},
                **{a: {"full", "recurrent"} for a in HYBRID_ARCHITECTURES}, "falcon-h1": {"parallel"},
                "nemotron_h": {"full", "recurrent", "mlp"}, "nemotron_h_moe": {"full", "recurrent", "mlp"},
                "lfm2": {"full", "sliding", "recurrent"}, **{a: {"recurrent"} for a in RECURRENT_ARCHITECTURES},
-               "deepseek4": {"sliding", "nextn"}}
-# llama_model_rope_type (src/llama-model.cpp:2858-3035); kimi-k3/kimi-linear store k_pe unrotated;
-# granitehybrid rotates only when rope.scaling.finetuned (default true, src/models/granite-hybrid.cpp:16-20)
+               "deepseek4": {"sliding", "nextn"}, **{a: {"full"} for a in GQA_ARCHITECTURES},
+               **{a: {"full", "sliding"} for a in ("gemma3", "gpt-oss", "laguna", "mimo2")},
+               "gemma4": {"full", "sliding", "shared"}}
+# llama_model_rope_type (src/llama-model.cpp:3039-3229); kimi-k3/kimi-linear store k_pe unrotated and
+# glm5-next's latent rows hold no k_pe; granitehybrid rotates only when rope.scaling.finetuned (default
+# true, src/models/granite-hybrid.cpp:16-20); a7b94df2c runs bailingmoe3 with M-RoPE when the GGUF has
+# rope sections (model_rope_type)
 ROPE_TYPES = {"muse-glimmer": "norm", "qwen35": "imrope", "qwen3": "neox", "deepseek2": "norm", "mistral4": "norm",
               "hy_v4": "norm", "deepseek32": "norm", "glm-dsa": "norm", "dots3note": "norm", "kimi-k3": "none",
-              "kimi-linear": "none", "bailingmoe3": "norm", "qwen3next": "neox", "qwen35moe": "imrope",
-              "qwen4exp": "imrope", "minimax-01": "neox", "jamba": "none", "falcon-h1": "neox", "granitehybrid": "norm",
-              "nemotron_h": "none", "nemotron_h_moe": "none", "plamo2": "neox", "lfm2": "neox", "lfm2moe": "neox",
-              **{a: "none" for a in RECURRENT_ARCHITECTURES}, "deepseek4": "norm"}
+              "kimi-linear": "none", "bailingmoe3": "norm", "glm5-next": "none", "qwen3next": "neox",
+              "qwen35moe": "imrope", "qwen4exp": "imrope", "minimax-01": "neox", "jamba": "none", "falcon-h1": "neox",
+              "granitehybrid": "norm", "nemotron_h": "none", "nemotron_h_moe": "none", "plamo2": "neox", "lfm2": "neox",
+              "lfm2moe": "neox", **{a: "none" for a in RECURRENT_ARCHITECTURES}, "deepseek4": "norm",
+              **{a: "neox" for a in GQA_ARCHITECTURES}, "llama": "norm", "mistral3": "norm"}
+# How the GQA_ARCHITECTURES lay out their caches and rotate their keys (load_arch_hparams and the graph
+# of src/models/<arch>.cpp; layers as llama_hparams::is_swa / n_rot / n_embd_head_k(il) give them):
+#   window     None: no sliding window (phi3 disables the one its GGUFs declare, phi3.cpp:13-24);
+#              "array": attention.sliding_window_pattern flags, required (gemma4.cpp:5, mimo2.cpp:12);
+#              (period, dense_first, needed): load_swa_pattern (src/llama-model.cpp:3451-3458: flags, else
+#              a period, default `period`; dense_first: the full layer leads each period), and whether
+#              attention.sliding_window is required (else none or 0 means a plain cache)
+#   base_swa   the sliding layers' freq base without rope.freq_base_swa: the llama_hparams default 10000,
+#              or "train" (the GGUF's rope.freq_base); sliding layers never take the context's base
+#   scale_swa  the sliding layers' freq scale: 1, or "train" (1 / the GGUF's rope.scaling.factor)
+#   swa_rope   "context": sliding layers take the context's YaRN settings; "plain": none (laguna.cpp:
+#              181-190: ext_factor 0, attn_factor 1)
+#   n_rot      "first": every layer rotates the graph's n_rot = hparams.n_rot(0) dims; "layer": each layer
+#              its own type's (gemma4.cpp:194); "full-first": full layers n_rot(0), sliding layers
+#              rope.dimension_count_swa (laguna.cpp:179)
+#   factors    frequency factors (ModelSpec.rope_freq_factors): None; "all" (rope_freqs.weight when the
+#              GGUF has one, every layer: llama3 scaling, llama_model::get_rope_factors); "full" (required,
+#              full layers only: gemma4's proportional RoPE, gemma4.cpp:94-97, 202-206)
+#   nextn      whether nextn_predict_layers > 0 is modelled: mimo2's and hy_v3's trunk caches filter their
+#              nextn layers out on both revisions, so they sit in no section
+GQA_CONVENTIONS = {
+    "llama": dict(window=None, base_swa=None, scale_swa=None, swa_rope=None, n_rot="first", factors="all", nextn=False),
+    "mistral3": dict(window=None, base_swa=None, scale_swa=None, swa_rope=None, n_rot="first", factors="all",
+                     nextn=False),
+    "qwen3moe": dict(window=None, base_swa=None, scale_swa=None, swa_rope=None, n_rot="first", factors=None,
+                     nextn=False),
+    "hy_v3": dict(window=None, base_swa=None, scale_swa=None, swa_rope=None, n_rot="first", factors=None, nextn=True),
+    "phi3": dict(window=None, base_swa=None, scale_swa=None, swa_rope=None, n_rot="first", factors=None, nextn=False),
+    "gemma3": dict(window=(6, False, False), base_swa=10000.0, scale_swa=1.0, swa_rope="context", n_rot="first",
+                   factors=None, nextn=False),
+    "gemma4": dict(window="array", base_swa=10000.0, scale_swa=1.0, swa_rope="context", n_rot="layer", factors="full",
+                   nextn=False),
+    "gpt-oss": dict(window=(2, False, True), base_swa="train", scale_swa="train", swa_rope="context", n_rot="first",
+                    factors=None, nextn=False),
+    "laguna": dict(window=(4, True, False), base_swa="train", scale_swa=1.0, swa_rope="plain", n_rot="full-first",
+                   factors=None, nextn=False),
+    "mimo2": dict(window="array", base_swa=10000.0, scale_swa=1.0, swa_rope="context", n_rot="first", factors=None,
+                  nextn=True),
+}
+# architectures whose RoPE takes frequency factors from rope_freqs.weight, a tensor metadata does not
+# show (ModelSpec.from_gguf reads it; from_metadata takes it as rope_freq_factors)
+ROPE_FREQ_FACTOR_ARCHITECTURES = ("granitehybrid", "llama", "mistral3", "gemma4")
+# architectures whose RoPE a spec built from metadata alone cannot know, since it hangs on GGUF tensors
+# (gguf_rope_freq_factors reads them): rope_freqs.weight, and phi3's rope_factors_long/short, which
+# llama_model::get_rope_factors picks by the context size (refused; () when the GGUF has neither)
+ROPE_FACTOR_TENSOR_ARCHITECTURES = ROPE_FREQ_FACTOR_ARCHITECTURES + ("phi3",)
 # loaders that read rope.scaling.yarn_log_multiplier and divide it by 0.1 (src/models/deepseek2.cpp:34-38,
-# deepseek32.cpp:34-38; mistral4 reuses deepseek2's loader, models.h:1373-1377)
+# deepseek32.cpp:34-38; mistral4 reuses deepseek2's loader, models.h:1405-1409)
 YARN_LOG_MUL_ARCHITECTURES = ("deepseek2", "mistral4", "deepseek32")
+# loaders that read rope.scaling.yarn_log_multiplier as it is and the YaRN betas
+# (src/models/mistral3.cpp:7-9)
+YARN_GGUF_ARCHITECTURES = ("mistral3",)
 # DSA indexer keys: (RoPE pairing, rotated window, Hadamard, LayerNorm eps) per architecture.
 # deepseek32/dots3note: NEOX over the leading n_rot dims ([rope | nope]) then H, eps 1e-6
 # (src/models/deepseek32.cpp:9, 238-260; dots3note.cpp:10, 219-236); glm-dsa: NORM, H, f_norm_eps
@@ -284,14 +393,16 @@ YARN_LOG_MUL_ARCHITECTURES = ("deepseek2", "mistral4", "deepseek32")
 INDEXER_CONVENTIONS = {"deepseek32": ("neox", "head", True, 1e-6), "dots3note": ("neox", "head", True, 1e-6),
                        "glm-dsa": ("norm", "head", True, 0.0), "hy_v4": ("norm", "tail", False, "rms")}
 # recurrent row family per hybrid architecture (llama_hparams::n_embd_r/n_embd_s)
-RECURRENT_FAMILY = {"qwen35": "ssm", "kimi-k3": "kda", "kimi-linear": "kda", "bailingmoe3": "kda",
+RECURRENT_FAMILY = {"qwen35": "ssm", "kimi-k3": "kda", "kimi-linear": "kda", "bailingmoe3": "kda", "glm5-next": "kda",
                     **{a: "ssm" for a in HYBRID_ARCHITECTURES + ("mamba", "mamba2")}, "minimax-01": "lightning",
                     "lfm2": "shortconv", "lfm2moe": "shortconv",
                     **{a: "rwkv" for a in ("rwkv6", "rwkv6qwen2", "rwkv7", "arwkv7")}}
 # loaders that never read ssm.group_count (Mamba-1 style: n_group stays 0, src/models/mamba.cpp, jamba.cpp)
 SSM_WITHOUT_GROUPS = ("mamba", "jamba")
-# hybrids whose filters keep both caches to il < n_layer() (src/llama-model.cpp:2532-2538): their nextn
-# (MTP) layers sit in neither section of the main context
+# hybrids whose filters keep both caches to il < n_layer() (src/llama-model.cpp:2705-2711): their nextn
+# (MTP) layers sit in neither section of the main context. A plain-KV or iSWA trunk cache filters them out
+# too on a7b94df2c (n_layer_nextn > 0, a trunk and no router layer, src/llama-model.cpp:2812-2820; on
+# 85d5703a3 only step35, hy-v3, glm-dsa, mimo2 and deepseek32 did), see ModelSpec.nextn_cached
 NEXTN_FILTERED = ("qwen35", "qwen3next", "qwen35moe", "qwen4exp", "minimax-01")
 ROPE_SCALING_TYPES = ("none", "linear", "yarn", "longrope")
 RUNTIME_ROPE_KEYS = ("rope_scaling_type", "rope_freq_base", "rope_freq_scale", "yarn_ext_factor", "yarn_attn_factor",
@@ -367,8 +478,13 @@ class IndexerSpec:
     top_k: int = 0                # indexer keys only change outputs once a query sees more than top_k cells
     n_head: int = 0
     norm_eps: float = 0.0         # LayerNorm eps before the k_norm weight and bias
-    value_size: int = 0           # elements of the V row the section also stores (qwen4exp: never written,
-                                  # zeros); 0 for the K-only DSA caches
+    value_size: int = 0           # elements of the V row 85d5703a3's qwen4exp indexer cache also stores (never
+                                  # written, zeros); 0 for the K-only DSA caches (a7b94df2c's qwen4exp cache too)
+    kpool: int = 0                # k-pooling block size (qwen4exp: its attention.compress_ratios; glm5-next:
+                                  # attention.indexer.kpool); 0: none
+    kpool_row: int = 1            # head_size slots per cached row with k-pooling on a7b94df2c (qwen4exp
+                                  # [key | pooled], src/models/qwen4exp.cpp:81; glm5-next [key | gate | pooled],
+                                  # the llama_hparams default 3; ModelSpec.indexer_row_slots)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -376,28 +492,28 @@ class CompressSpec:
     """DeepSeek V4's compressed caches (llama_kv_cache_dsv4, src/llama-kv-cache-dsv4.h:155-175).
 
     Every trunk layer slides: its raw cache (an iSWA cache that is K-only, src/llama-kv-cache-dsv4.cpp:
-    1210-1260) keeps one latent per token for the last n_swa tokens, RoPE'd on its last n_rot dims
-    and read as both K and V (src/models/deepseek4.cpp:928-936). A layer of compress ratio 4 (CSA)
+    1211-1261) keeps one latent per token for the last n_swa tokens, RoPE'd on its last n_rot dims
+    and read as both K and V (src/models/deepseek4.cpp:927-935). A layer of compress ratio 4 (CSA)
     or 128 (HCA) also keeps one pooled row per completed block of ratio tokens, and CSA layers a
     lightning-indexer (LID) row per block; the tokens of an unfinished block live in an F32
-    compressor ring (state_size rows of a and score, src/llama-kv-cache-dsv4.cpp:1313-1329). Per
+    compressor ring (state_size rows of a and score, src/llama-kv-cache-dsv4.cpp:1314-1330). Per
     token, a = W_comp_kv x and s = W_comp_gate x + APE[pos mod ratio] (x the layer's attention
     input; the LID uses its own weights). A row is a per-channel softmax(s)-weighted sum of a over
     its block (HCA: the block's 128 tokens; CSA/LID: the previous block's 4 tokens in channels
     [0, D) and the block's own 4 in channels [D, 2D)), RMSNorm'd, RoPE'd at the block start with
-    the compress base, and Hadamard-rotated for the LID (src/models/deepseek4.cpp:471-589).
+    the compress base, and Hadamard-rotated for the LID (src/models/deepseek4.cpp:470-588).
 
-    Sections of a sequence save (state_write, src/llama-kv-cache-dsv4.cpp:1594-1626):
+    Sections of a sequence save (state_write, src/llama-kv-cache-dsv4.cpp:1595-1627):
 
         u32 'DSV4', u32 version 1, u32 mode (0 full, 1 PARTIAL_ONLY)
         raw iSWA cache:  [base KV section: every cell's metadata, no layers] SWA KV section
                          (K-only rows of every layer, nextn ones included, for the last n_swa cells);
                          both write n_stream = n_seq_max (-np): the raw cache is never unified
-        [K-row sections "csa", "hca", "lid" unless PARTIAL_ONLY] (dsv4_state_write_k_cache 332-362):
+        [K-row sections "csa", "hca", "lid" unless PARTIAL_ONLY] (dsv4_state_write_k_cache 333-363):
             u32 version 2, u32 n_rows = floor((pos_max + 1) / ratio), u32 ns (1 for a sequence),
             u32 n_layer; per layer: u32 il, i32 type, u64 ne0, u64 rows, u64 row_size, rows
         ring sections "csa_state", "hca_state", "lid_state" (llama_dsv4_comp_state::state_write
-        1080-1116): u32 version 1, u32 ratio, u32 state_size, u32 n_embd_state, u32 ns, u32 n_layer;
+        1081-1117): u32 version 1, u32 ratio, u32 state_size, u32 n_embd_state, u32 ns, u32 n_layer;
             per layer: u32 il, then kv and score each as (i32 type F32, u64 ne0, u64 rows,
             u64 row_size, state_size rows); a token's (a, s) sits at row pos % state_size
 
@@ -446,22 +562,26 @@ class SectionLayout:
 
 @dataclasses.dataclass(frozen=True)
 class ModelSpec:
-    """What the state layout depends on, per layer (index = model layer).
+    """What the state layout depends on, per layer (index = model layer), and the llama.cpp revision
+    (LLAMA_REVISIONS) whose layouts and RoPE the spec describes.
 
-    layer_types lists the trunk layers plus the nextn layers a KV section keeps; nextn layers
-    that every cache filters out are left out (as qwen35's)."""
+    layer_types lists the trunk layers plus the nextn layers a KV section keeps on some revision
+    (nextn_cached: a7b94df2c filters those of deepseek2 and mistral4 out); nextn layers that every
+    cache filters out on both are left out (as qwen35's). for_revision gives the same model on the
+    other revision."""
 
     architecture: str
-    layer_types: tuple            # "full" | "sliding" | "recurrent" | "nextn" | "parallel" | "mlp"
-    n_head_kv: tuple              # 0 for recurrent and MLP-only layers
+    layer_types: tuple            # "full" | "sliding" | "recurrent" | "nextn" | "parallel" | "mlp" | "shared"
+    n_head_kv: tuple              # 0 for recurrent, MLP-only and shared layers
     head_dim_k: tuple
     head_dim_v: tuple             # MLA: kv_lora (V is the first kv_lora elements of the K row)
     n_swa: int = 0
     rope_type: str = "none"       # "norm" (Muse sliding layers, MLA k_pe) | "imrope" (Qwen3.5) | "neox" (Qwen3)
-    n_rot: int = 0
+                                  # | "mrope" (bailingmoe3 with rope sections on a7b94df2c)
+    n_rot: int = 0                # rotated dims (of the sliding layers for Muse, of the full layers of a GQA model)
     rope_freq_base: float = 10000.0
     rope_freq_base_swa: float = 10000.0
-    rope_sections: tuple = (0, 0, 0, 0)
+    rope_sections: tuple = (0, 0, 0, 0)   # IMROPE/M-RoPE sections (bailingmoe3: the GGUF's, kept on any RoPE)
     recurrent_row_bytes: tuple = None   # (R, S) bytes per F32 row, when known
     kv_lora: tuple = None         # MLA: per-layer latent width; the attention cache is K-only
     memory_layout: str = None     # default MEMORY[architecture]
@@ -479,11 +599,19 @@ class ModelSpec:
     # GGUF has none; None leaves a rotating granitehybrid's factors unknown, and rope() refuses it
     rope_freq_factors: tuple = None
     compress: CompressSpec = None  # deepseek4: the compressed caches (memory "dsv4")
+    llama_revision: str = LLAMA_REVISION   # whose layouts and RoPE (LLAMA_REVISIONS)
+    n_rot_swa: int = 0            # GQA models: the sliding layers' rotated dims (0: none slide)
 
     def __post_init__(self):
         n = len(self.layer_types)
         if self.architecture not in ARCHITECTURES:
             raise StateFormatError(f"unsupported architecture {self.architecture!r}")
+        if self.llama_revision not in LLAMA_REVISIONS:
+            raise StateFormatError(f"unknown llama.cpp revision {self.llama_revision!r} (known: "
+                                   f"{', '.join(LLAMA_REVISIONS)})")
+        first = ARCHITECTURE_SINCE.get(self.architecture)
+        if first is not None and not self.since(first):
+            raise StateFormatError(f"llama.cpp {self.llama_revision} has no {self.architecture} (it came with {first})")
         if self.memory_layout is None:
             object.__setattr__(self, "memory_layout", MEMORY[self.architecture])
         if self.memory_layout not in MEMORY_LAYOUTS:
@@ -494,12 +622,16 @@ class ModelSpec:
         if not set(self.layer_types) <= allowed:
             raise StateFormatError(f"{self.architecture} layers must be {sorted(allowed)}")
         for il, kind in enumerate(self.layer_types):
-            if kind not in ("recurrent", "mlp") and min(self.n_head_kv[il], self.head_dim_k[il],
-                                                        self.head_dim_v[il]) <= 0:
+            if kind not in ("recurrent", "mlp", "shared") and min(self.n_head_kv[il], self.head_dim_k[il],
+                                                                  self.head_dim_v[il]) <= 0:
                 raise StateFormatError(f"invalid attention dimensions at layer {il}")
         nextn = [il for il, kind in enumerate(self.layer_types) if kind == "nextn"]
         if nextn and nextn != list(range(n - len(nextn), n)):
             raise StateFormatError("nextn layers must follow every trunk layer")
+        shared = [il for il, kind in enumerate(self.layer_types) if kind == "shared"]
+        if shared and (shared != list(range(n - len(shared), n)) or len(shared) > n - 2):
+            # llama_hparams::has_kv: the first n_layer_kv_from_start (>= 2) layers keep a cache
+            raise StateFormatError("shared KV layers must follow at least two layers with a cache")
         if self.architecture == "muse-glimmer":
             if self.rope_type != "norm" or self.n_swa <= 0:
                 raise StateFormatError("Muse needs NORM RoPE and a positive sliding window")
@@ -517,8 +649,14 @@ class ModelSpec:
             self._check_mla()
         elif self.architecture == "deepseek4":
             self._check_dsv4()
+        elif self.architecture in GQA_ARCHITECTURES:
+            self._check_gqa()
         else:
             self._check_generic()
+        if self.n_rot_swa and (self.architecture not in GQA_ARCHITECTURES or "sliding" not in self.layer_types
+                               or self.n_rot_swa < 0 or self.n_rot_swa % 2):
+            raise StateFormatError("a sliding layers' rotary width needs a GQA model with sliding layers, positive "
+                                   "and even")
         if (self.compress is not None) != (self.memory_layout == "dsv4"):
             raise StateFormatError("only the dsv4 memory (deepseek4) has compressed caches")
         if self.architecture in ("muse-glimmer", "qwen35", "qwen3") and (
@@ -531,16 +669,17 @@ class ModelSpec:
             raise StateFormatError("PLE rows need a positive multiple of 4 bytes and at least one PLE layer")
         if not set(self.ple_layers) <= set(self.recurrent_layers):
             raise StateFormatError("PLE rows sit on recurrent layers only")
-        if self.rope_freq_factors and (self.architecture != "granitehybrid" or self.rope_type == "none"
-                                       or len(self.rope_freq_factors) != self.n_rot // 2):
-            raise StateFormatError("RoPE frequency factors: granitehybrid only, one per rotated pair")
+        if self.rope_freq_factors and (self.architecture not in ROPE_FREQ_FACTOR_ARCHITECTURES
+                                       or self.rope_type == "none" or len(self.rope_freq_factors) != self.n_rot // 2):
+            raise StateFormatError(f"RoPE frequency factors: {', '.join(ROPE_FREQ_FACTOR_ARCHITECTURES)} only, one per "
+                                   "rotated pair (of the full layers)")
 
     def _check_generic(self):
         """The plain-attention hybrids and the recurrent-only models (HYBRID_ARCHITECTURES,
         RECURRENT_ARCHITECTURES): GQA K/V rows, the architecture's RoPE, no MLA."""
         expected = ROPE_TYPES[self.architecture]
         # "none" also covers granitehybrid without rope.scaling.finetuned (has_rope,
-        # src/llama-hparams.cpp:333-345) and models whose n_rot comes out 0
+        # src/llama-hparams.cpp:334-346) and models whose n_rot comes out 0
         if self.rope_type not in (expected, "none"):
             raise StateFormatError(f"{self.architecture} needs {expected} RoPE (or none)")
         if self.kv_lora is not None:
@@ -563,21 +702,56 @@ class ModelSpec:
                     or ix.head_size <= 0 or ix.value_size < 0:
                 raise StateFormatError("the qwen4exp indexer caches raw keys (no RoPE, no Hadamard) on every "
                                        "attention layer")
+            if ix.kpool < 0 or ix.kpool == 1 or ix.kpool_row < 1 or (ix.kpool_row > 1 and not ix.kpool):
+                raise StateFormatError("k-pooling needs blocks of more than one cell, and k-pool rows a block size")
         if self.recurrent_layers and self.recurrent_row_bytes is None:
             raise StateFormatError(f"{self.architecture} needs the recurrent row sizes")
         if self.memory_layout == "recurrent" and self.attention_layers:
             raise StateFormatError(f"{self.architecture} has recurrent layers only")
 
+    def _check_gqa(self):
+        """GQA_ARCHITECTURES: K/V rows of every attention layer (no MLA, no indexer, no recurrent rows), the
+        architecture's RoPE, a plain cache, or iSWA memory with sliding layers and a positive window."""
+        convention = GQA_CONVENTIONS[self.architecture]
+        expected = ROPE_TYPES[self.architecture]
+        if self.rope_type not in (expected, "none"):
+            raise StateFormatError(f"{self.architecture} needs {expected} RoPE (or none)")
+        if (self.kv_lora is not None or self.indexer is not None or self.recurrent_row_bytes is not None
+                or self.ple_layers):
+            raise StateFormatError(f"{self.architecture} has neither MLA rows, indexer keys nor recurrent rows")
+        sliding = "sliding" in self.layer_types
+        if (self.memory_layout != ("iswa" if sliding else "kv") or (sliding and self.n_swa <= 0)
+                or (not sliding and self.n_swa != 0)):
+            raise StateFormatError(f"{self.architecture} cannot use {self.memory_layout} memory with these layers "
+                                   "(sliding layers need iswa memory and a positive window, a plain cache neither)")
+        if sliding and convention["window"] is None:
+            raise StateFormatError(f"{self.architecture} has no sliding layers")
+        if self.memory_layout == "kv" and MEMORY[self.architecture] == "iswa" and not isinstance(
+                convention["window"], tuple):
+            raise StateFormatError(f"{self.architecture} always runs a sliding window")
+        if self.rope_type != "none":
+            for il in self.attention_layers:
+                n_rot = self.n_rot_swa if self.layer_types[il] == "sliding" else self.n_rot
+                if not 0 < n_rot <= self.head_dim_k[il]:
+                    raise StateFormatError(f"layer {il}: {n_rot} rotated dims for a key head of {self.head_dim_k[il]}")
+        if convention["factors"] == "full" and self.rope_type != "none" and self.rope_freq_factors == ():
+            raise StateFormatError(f"{self.architecture} needs its rope_freqs.weight frequency factors")
+
     def _check_mla(self):
-        if self.rope_type != ROPE_TYPES[self.architecture]:
-            raise StateFormatError(f"{self.architecture} needs {ROPE_TYPES[self.architecture]} RoPE")
+        expected = model_rope_type(self.architecture, self.rope_sections, self.llama_revision)
+        if self.rope_type != expected:
+            raise StateFormatError(f"{self.architecture} needs {expected} RoPE"
+                                   + (f" on {self.llama_revision} with rope sections {tuple(self.rope_sections)}"
+                                      if self.architecture == "bailingmoe3" else ""))
         if self.kv_lora is None or len(self.kv_lora) != len(self.layer_types):
             raise StateFormatError(f"{self.architecture} needs a per-layer kv_lora (MLA latent width)")
+        # glm5-next's NoPE latent rows hold no k_pe at all (src/models/glm5-next.cpp: n_rot() == 0)
+        k_pe_min = 0 if self.architecture == "glm5-next" else 1
         for il, kind in enumerate(self.layer_types):
             if kind == "recurrent":
                 continue
             lora, dim_k = self.kv_lora[il], self.head_dim_k[il]
-            if lora <= 0 or self.n_head_kv[il] != 1 or self.head_dim_v[il] != lora or dim_k <= lora:
+            if lora <= 0 or self.n_head_kv[il] != 1 or self.head_dim_v[il] != lora or dim_k - lora < k_pe_min:
                 raise StateFormatError(f"layer {il}: an MLA row is one KV head [c_kv (kv_lora) | k_pe] whose "
                                        f"V view is c_kv; got heads {self.n_head_kv[il]}, K {dim_k}, "
                                        f"V {self.head_dim_v[il]}, kv_lora {lora}")
@@ -586,16 +760,25 @@ class ModelSpec:
         sliding = "sliding" in self.layer_types
         if (self.memory_layout == "dsa_iswa") != sliding or (sliding and self.n_swa <= 0):
             raise StateFormatError("sliding MLA layers need the dsa_iswa memory and a positive window")
-        if self.memory_layout not in ("kv", "hybrid", "dsa", "dsa_iswa"):
+        indexed_hybrid = self.architecture == "glm5-next"
+        if self.memory_layout not in ("kv", "hybrid", "dsa", "dsa_iswa", "hybrid_idx") \
+                or (self.memory_layout == "hybrid_idx") != indexed_hybrid:
             raise StateFormatError(f"{self.architecture} cannot use {self.memory_layout} memory")
-        if (self.memory_layout == "hybrid") != (self.architecture in RECURRENT_FAMILY):
+        if (self.memory_layout in ("hybrid", "hybrid_idx")) != (self.architecture in RECURRENT_FAMILY):
             raise StateFormatError(f"{self.architecture} cannot use {self.memory_layout} memory")
         if "nextn" in self.layer_types and self.memory_layout not in ("kv", "hybrid"):
             raise StateFormatError("only plain-KV and hybrid caches keep nextn layers")
         ix = self.indexer
-        if (ix is not None) != (self.memory_layout in ("dsa", "dsa_iswa")):
+        if (ix is not None) != (self.memory_layout in ("dsa", "dsa_iswa", "hybrid_idx")):
             raise StateFormatError("DSA memories need an indexer spec, others none")
-        if ix is not None:
+        if ix is not None and indexed_hybrid:
+            # raw k-pool rows [key | gate | pooled] on attention layers (src/llama-memory-hybrid-idx.cpp:52-74;
+            # the rotation happens after pooling, at read time)
+            if not ix.layers or not set(ix.layers) <= set(self.layers_of("full")) or ix.rope_type != "none" \
+                    or ix.n_rot != 0 or ix.hadamard or ix.value_size or ix.kpool < 2 or ix.kpool_row != 3:
+                raise StateFormatError("glm5-next's indexer caches raw [key | gate | pooled] k-pool rows on attention "
+                                       "layers")
+        elif ix is not None:
             if not ix.layers or not set(ix.layers) <= set(self.layers_of("full", "sliding")) \
                     or list(ix.layers) != sorted(set(ix.layers)):
                 raise StateFormatError("indexer layers must be increasing attention layers")
@@ -638,14 +821,51 @@ class ModelSpec:
         return self.has_cell_ext("attention")
 
     def has_cell_ext(self, role="attention"):
-        """llama_kv_cache::has_cell_ext (src/llama-kv-cache.cpp:1831-1834) of a section's cache:
+        """llama_kv_cache::has_cell_ext (src/llama-kv-cache.cpp:1843-1846) of a section's cache:
         M-RoPE/IMROPE (n_pos_per_embd > 1) or a PLE model (the n-gram hash needs the token id).
         The qwen4exp indexer cache copies the hparams with rope type NONE (src/llama-memory-hybrid-idx.cpp:
-        44-56), so only PLE gives its cells an ext."""
+        52-74), so only PLE gives its cells an ext."""
         if role == "recurrent":
             return False
-        mrope = self.rope_type == "imrope" and role == "attention"
+        mrope = self.rope_type in ("imrope", "mrope") and role == "attention"
         return mrope or bool(self.ple_layers)
+
+    def since(self, revision):
+        """Whether the spec's llama.cpp revision is `revision` or a later one (LLAMA_REVISIONS order)."""
+        return LLAMA_REVISIONS.index(self.llama_revision) >= LLAMA_REVISIONS.index(revision)
+
+    @property
+    def nextn_cached(self):
+        """Whether the main context's attention cache keeps the nextn layers (zero rows: only an MTP
+        context writes them): the KDA hybrids' default attention filter (src/llama-memory-hybrid.cpp:
+        48-49) and DeepSeek V4's raw cache keep them on both revisions; a plain cache (deepseek2,
+        mistral4) on 85d5703a3 only, whose create_memory filtered five other architectures, while
+        a7b94df2c filters every plain-KV and iSWA trunk (src/llama-model.cpp:2812-2820)."""
+        if self.memory in ("hybrid", "dsv4"):
+            return True
+        return self.memory == "kv" and not self.since("a7b94df2c")
+
+    @property
+    def indexer_row_slots(self):
+        """head_size slots per cached indexer row: a7b94df2c caches a k-pooling indexer's keys with
+        the pooled keys beside them (qwen4exp [key | pooled]: llama_memory_hybrid_idx's hparams copy,
+        src/llama-memory-hybrid-idx.cpp:52-58); 1 otherwise. The slots after the key hold the pooled
+        key of a complete block in its last member's row, zeros or whatever a graph's padding entries
+        or a sequence edit left in the other rows (src/models/qwen4exp.cpp:762-797,
+        src/llama-memory-hybrid-idx.cpp:947-966). A restore re-pools every block from the keys
+        (state_read marks the sequence stale, src/llama-memory-hybrid-idx.cpp:288-296, and the next
+        ubatch rebuilds the pooled slots), so cache_keys leaves them zero and pre_rope_keys drops them.
+        glm5-next's rows hold [key | gate | pooled]: the gate (a per-token pool weight logit,
+        src/models/glm5-next.cpp:782-794) is per-token data like the key (indexer_key_slots)."""
+        ix = self.indexer
+        return ix.kpool_row if ix is not None and ix.kpool and self.since("a7b94df2c") else 1
+
+    @property
+    def indexer_key_slots(self):
+        """head_size slots of an indexer row that hold per-token data, which pre_rope_keys returns and
+        cache_keys takes: the key, and glm5-next's gate beside it; a k-pool row's pooled slot after
+        them is derived (indexer_row_slots)."""
+        return self.indexer_row_slots - 1 if self.indexer_row_slots > 1 else 1
 
     @property
     def n_layer_trunk(self):
@@ -698,7 +918,7 @@ class ModelSpec:
         recurrent = SectionLayout("recurrent", "recurrent", self.recurrent_layers, role="recurrent")
         if memory == "kv":
             # llama_kv_cache::state_write writes the whole cache whatever the flags
-            return [kv("kv", self.layers_of("full", "nextn"))]
+            return [kv("kv", self.layers_of("full", "nextn") if self.nextn_cached else self.layers_of("full"))]
         if memory == "dsa":
             # llama_kv_cache_dsa::state_write passes the flags to two plain caches, which ignore them
             return [kv("kv", self.layers_of("full")), kv("indexer", self.indexer.layers, role="indexer")]
@@ -710,12 +930,12 @@ class ModelSpec:
                    kv("swa", self.layers_of("sliding"), sliding=True)]
             return out[2:] if partial else out
         if memory == "recurrent":
-            # llama_memory_recurrent::state_write ignores the flags (src/llama-memory-recurrent.cpp:766-845)
+            # llama_memory_recurrent::state_write ignores the flags (src/llama-memory-recurrent.cpp:784-863)
             return [recurrent]
         if memory == "dsv4":
             # the raw cache's base part keeps cell metadata only (every layer slides, the nextn ones
             # too), then the pooled rows (full saves only) and the rings (src/llama-kv-cache-dsv4.cpp:
-            # 1594-1626)
+            # 1595-1627)
             raw = [kv("base", ()), kv("swa", self.layers_of("sliding", "nextn"), sliding=True)]
             rows = [SectionLayout(p.name, "rows", p.layers, role="pooled") for p in self.pools()]
             rings = [SectionLayout(p.name + "_state", "ring", p.layers, role="ring") for p in self.pools()]
@@ -728,7 +948,7 @@ class ModelSpec:
         attention = kv("attn", self.layers_of("full", "nextn", "parallel"))
         if memory == "hybrid_idx":
             # attention, recurrent, then the indexer keys, which share the PARTIAL_ONLY gate
-            # (src/llama-memory-hybrid-idx.cpp:204-214)
+            # (src/llama-memory-hybrid-idx.cpp:259-269)
             return [recurrent] if partial else [attention, recurrent, kv("indexer", self.indexer.layers,
                                                                           role="indexer")]
         return [recurrent] if partial else [attention, recurrent]
@@ -742,6 +962,45 @@ class ModelSpec:
             if layout.name == name:
                 return layout
         raise KeyError(f"{self.architecture} state has no {name} section (flags {flags})")
+
+    def for_revision(self, revision):
+        """The same model on another llama.cpp revision (LLAMA_REVISIONS, or what llama_revision_of
+        reads): that revision's layouts and RoPE."""
+        revision = _known_revision(revision)
+        if revision == self.llama_revision:
+            return self
+        rope_type = self.rope_type
+        if self.architecture == "bailingmoe3":
+            rope_type = model_rope_type(self.architecture, self.rope_sections, revision)
+        return dataclasses.replace(self, llama_revision=revision, rope_type=rope_type)
+
+    def _layout_key(self):
+        """What a state's bytes depend on: the sections of both flag values and each layer's row shapes."""
+        out = []
+        for flags in (FLAGS_NONE, FLAGS_PARTIAL_ONLY):
+            for layout in self.layouts(flags):
+                shapes = ()
+                if layout.kind == "kv":
+                    shapes = tuple((il, self.kv_shape(il, "k", layout.role), self.kv_shape(il, "v", layout.role))
+                                   for il in layout.layers)
+                out.append((flags, layout, shapes))
+        return tuple(out)
+
+    def layout_variants(self):
+        """This spec, then the same model on each other revision whose states differ (newest first):
+        the readings parse_state, parse_blob and parse_file try in turn, since a state names no
+        revision. Most architectures have one."""
+        out, keys = [self], {self._layout_key()}
+        for revision in reversed(LLAMA_REVISIONS):
+            first = ARCHITECTURE_SINCE.get(self.architecture)
+            if first is not None and LLAMA_REVISIONS.index(revision) < LLAMA_REVISIONS.index(first):
+                continue                    # that revision has no such model
+            other = self.for_revision(revision)
+            key = other._layout_key()
+            if key not in keys:
+                out.append(other)
+                keys.add(key)
+        return out
 
     def row_elements(self, layer, key):
         """Elements of the logical attention row (MLA V: the c_kv view of K)."""
@@ -758,8 +1017,12 @@ class ModelSpec:
             if self.indexer is None or layer not in self.indexer.layers:
                 raise StateFormatError(f"layer {layer} has no indexer keys")
             if key == "k":
-                return 1, self.indexer.head_size
-            return (1, self.indexer.value_size) if self.indexer.value_size else None
+                return 1, self.indexer.head_size * self.indexer_row_slots
+            # a7b94df2c creates the qwen4exp indexer cache as an MLA-style K-only cache
+            # (src/llama-memory-hybrid-idx.cpp:64-66); 85d5703a3 kept the never written V rows
+            if self.indexer.value_size and not self.since("a7b94df2c"):
+                return 1, self.indexer.value_size
+            return None
         if key == "v" and self.k_only(layer):
             return None
         return self.head_shape(layer, key)
@@ -767,7 +1030,7 @@ class ModelSpec:
     def rope(self, layer, role="attention"):
         """The Rope that turned this layer's pre-RoPE keys into cached keys, or None (NoPE)."""
         kind = self.layer_types[layer]
-        if kind in ("recurrent", "mlp"):
+        if kind in ("recurrent", "mlp", "shared"):
             raise ValueError(f"layer {layer} has no attention cache ({kind})")
         if self.memory_layout == "dsv4":
             return self._dsv4_rope(layer, role)
@@ -783,24 +1046,34 @@ class ModelSpec:
                         freq_scale=self.rope_freq_scale, **common)
         if self.rope_type == "none" or (self.architecture == "muse-glimmer" and kind == "full"):
             return None
-        if self.architecture == "granitehybrid" and self.rope_freq_factors is None:
-            raise StateFormatError("granitehybrid RoPE frequency factors are unknown (rope_freqs.weight is an optional "
-                                   "tensor): build the spec with ModelSpec.from_gguf, or pass rope_freq_factors= to "
+        if self.architecture in ROPE_FACTOR_TENSOR_ARCHITECTURES and self.rope_freq_factors is None:
+            raise StateFormatError(f"{self.architecture} RoPE frequency factors are unknown (GGUF tensors: "
+                                   "rope_freqs.weight, phi3's rope_factors_long/short): build the spec with "
+                                   "ModelSpec.from_gguf, or pass rope_freq_factors=gguf_rope_freq_factors(...) to "
                                    "from_metadata (() when the GGUF has none)")
         sliding = kind == "sliding"
         base = self.rope_freq_base_swa if sliding else self.rope_freq_base
         scale = self.rope_freq_scale_swa if sliding else self.rope_freq_scale
         offset = self.kv_lora[layer] if self.k_only(layer) else 0
-        sections = self.rope_sections if self.rope_type == "imrope" else None
-        return Rope(self.rope_type, self.n_rot, base, offset=offset, sections=sections, freq_scale=scale,
-                    freq_factors=self.rope_freq_factors or None, **common)
+        sections = self.rope_sections if self.rope_type in ("imrope", "mrope") else None
+        n_rot, factors = self.n_rot, self.rope_freq_factors or None
+        if sliding and self.architecture in GQA_ARCHITECTURES:
+            # a GQA model's sliding layers: their own rotary width, frequency factors only where every layer
+            # takes them, and laguna's plain RoPE (GQA_CONVENTIONS)
+            convention = GQA_CONVENTIONS[self.architecture]
+            n_rot = self.n_rot_swa
+            factors = factors if convention["factors"] == "all" else None
+            if convention["swa_rope"] == "plain":
+                common = {}
+        return Rope(self.rope_type, n_rot, base, offset=offset, sections=sections, freq_scale=scale,
+                    freq_factors=factors, **common)
 
     def _dsv4_rope(self, layer, role):
         """DeepSeek V4: NORM RoPE on the last n_rot dims of a row (rope_set_offset). Window-only layers
         (ratio 0, and the nextn ones) rotate their latents with freq_base and no YaRN; compressed
         layers rotate their latents ("attention") and their pooled rows ("pooled": CSA/HCA rows at the
         block start, "lid": indexer rows) with the compress base, the context's YaRN and an attn_factor
-        that cancels ggml's YaRN magnitude (src/models/deepseek4.cpp:11-17, 903-910, 509-512, 582-585)."""
+        that cancels ggml's YaRN magnitude (src/models/deepseek4.cpp:11-17, 902-909, 508-511, 581-584)."""
         cs = self.compress
         ratio = cs.ratios[layer] if layer < len(cs.ratios) else 0
         width = {"attention": self.head_dim_k[layer], "pooled": self.head_dim_k[layer],
@@ -816,7 +1089,7 @@ class ModelSpec:
                     beta_fast=self.rope_beta_fast, beta_slow=self.rope_beta_slow, n_ctx_orig=self.rope_n_ctx_orig)
 
     @classmethod
-    def from_metadata(cls, meta, *, runtime=None, rope_freq_factors=None):
+    def from_metadata(cls, meta, *, runtime=None, rope_freq_factors=None, llama_revision=None):
         """Spec from a GGUF metadata mapping (key -> value, arrays as lists).
 
         runtime: the receiving context's RoPE settings where they differ from the GGUF, as
@@ -826,26 +1099,35 @@ class ModelSpec:
         value means unset.
 
         rope_freq_factors: the rope_freqs.weight tensor, which metadata does not show; () when
-        the GGUF has none. Only granitehybrid uses it, and a rotating granitehybrid spec built
-        without it refuses rope() (from_gguf reads it)."""
+        the GGUF has none (gguf_rope_freq_factors reads it). Only ROPE_FREQ_FACTOR_ARCHITECTURES
+        use it (granitehybrid, llama, mistral3; gemma4 on its full layers), and a rotating spec of
+        one of ROPE_FACTOR_TENSOR_ARCHITECTURES (those and phi3, which takes () here) built without
+        it refuses rope() (from_gguf reads it).
+
+        llama_revision: the llama.cpp revision whose layouts and RoPE the spec describes, as an
+        entry of LLAMA_REVISIONS or anything llama_revision_of reads (a commit, llama-server's
+        /props build_info); default LLAMA_REVISION. The parsers settle it from a state anyway."""
         architecture = meta.get("general.architecture")
         if architecture not in ARCHITECTURES:
             raise StateFormatError(f"unsupported architecture {architecture!r}")
+        revision = LLAMA_REVISION if llama_revision is None else _known_revision(llama_revision)
         get = _metadata_getter(meta, architecture + ".")
         if architecture == "deepseek4":
-            spec = cls._dsv4_from_metadata(architecture, meta, get, runtime)
+            spec = cls._dsv4_from_metadata(architecture, meta, get, runtime, revision)
         elif architecture in MLA_ARCHITECTURES:
-            spec = cls._mla_from_metadata(architecture, meta, get, runtime)
+            spec = cls._mla_from_metadata(architecture, meta, get, runtime, revision)
         elif architecture in HYBRID_ARCHITECTURES + RECURRENT_ARCHITECTURES:
-            spec = cls._generic_from_metadata(architecture, meta, get, runtime)
+            spec = cls._generic_from_metadata(architecture, meta, get, runtime, revision)
+        elif architecture in GQA_ARCHITECTURES:
+            spec = cls._gqa_from_metadata(architecture, meta, get, runtime, revision)
         else:
-            spec = cls._dense_from_metadata(architecture, meta, get, runtime)
+            spec = cls._dense_from_metadata(architecture, meta, get, runtime, revision)
         if rope_freq_factors is not None:
             spec = dataclasses.replace(spec, rope_freq_factors=tuple(float(x) for x in rope_freq_factors))
         return spec
 
     @classmethod
-    def _dense_from_metadata(cls, architecture, meta, get, runtime):
+    def _dense_from_metadata(cls, architecture, meta, get, runtime, revision):
         """muse-glimmer, qwen35 and qwen3."""
         if runtime and any(runtime.get(key) is not None for key in RUNTIME_ROPE_KEYS):
             raise StateFormatError(f"runtime RoPE overrides are not supported for {architecture}")
@@ -855,9 +1137,10 @@ class ModelSpec:
         if n_layer <= 0 or nextn < 0:
             raise StateFormatError("invalid block count")
         if architecture in ("muse-glimmer", "qwen3") and nextn:
-            # Muse's iSWA cache and a dense model's plain cache have no layer filter
-            # (src/llama-model.cpp:2610-2709), so nextn layers would sit in the (base) cache
-            # (is_swa is false past n_layer(), src/llama-hparams.cpp:19-21); not modelled.
+            # 85d5703a3 gives Muse's iSWA cache and a dense model's plain cache no layer filter, so
+            # nextn layers would sit in the (base) cache (is_swa is false past n_layer(),
+            # src/llama-hparams.cpp:19-21), while a7b94df2c filters them out; no such GGUF is known
+            # and neither is modelled.
             raise StateFormatError(f"{architecture} with nextn_predict_layers > 0 is not supported")
         embd = int(get("embedding_length"))
         types = []
@@ -883,7 +1166,7 @@ class ModelSpec:
                         raise StateFormatError("invalid sliding-window period")
                     sliding = il % int(pattern) < int(pattern) - 1
                 types.append("sliding" if sliding else "full")
-        # head sizes as llama_model::load_hparams sets them (src/llama-model.cpp:1334-1370):
+        # head sizes as llama_model::load_hparams sets them (src/llama-model.cpp:1436-1472):
         # full layers key_length/value_length (default n_embd / n_head of layer 0), sliding
         # layers key_length_swa/value_length_swa defaulting to the full sizes, per
         # llama_hparams::n_embd_head_k/v(il) (src/llama-hparams.cpp:140-154).
@@ -907,29 +1190,31 @@ class ModelSpec:
         if scaling not in (None, "none", "linear") or factor not in (0.0, 1.0):
             raise StateFormatError(f"RoPE scaling {scaling!r} with factor {factor} is not supported")
         base = float(get("rope.freq_base", 10000.0))
-        # n_rot_full defaults to the full head size, n_rot_swa to n_rot_full (src/llama-model.cpp:1344-1370)
+        # n_rot_full defaults to the full head size, n_rot_swa to n_rot_full (src/llama-model.cpp:1446-1472)
         n_rot_full = int(get("rope.dimension_count", full_k))
         if architecture == "qwen3":
             # src/models/qwen3.cpp asserts n_rot == the head size (rope.dimension_count is optional)
             if n_rot_full != full_k:
                 raise StateFormatError(f"qwen3 rotates the whole head: n_rot {n_rot_full} != head size {full_k}")
             return cls(architecture, tuple(types), tuple(heads_kv), tuple(dim_k), tuple(dim_v),
-                       rope_type="neox", n_rot=n_rot_full, rope_freq_base=base, rope_freq_base_swa=base)
+                       rope_type="neox", n_rot=n_rot_full, rope_freq_base=base, rope_freq_base_swa=base,
+                       llama_revision=revision)
         if architecture == "muse-glimmer":
             return cls(architecture, tuple(types), tuple(heads_kv), tuple(dim_k), tuple(dim_v),
                        n_swa=int(get("attention.sliding_window")), rope_type="norm",
                        n_rot=int(get("rope.dimension_count_swa", n_rot_full)),
-                       rope_freq_base=base, rope_freq_base_swa=float(get("rope.freq_base_swa", base)))
+                       rope_freq_base=base, rope_freq_base_swa=float(get("rope.freq_base_swa", base)),
+                       llama_revision=revision)
         r_floats, s_floats = recurrent_row_floats(meta, "ssm")
         sections = tuple(int(x) for x in get("rope.dimension_sections"))
         sections = (sections + (0, 0, 0, 0))[:4]
         return cls(architecture, tuple(types), tuple(heads_kv), tuple(dim_k), tuple(dim_v),
                    rope_type="imrope", n_rot=n_rot_full,
                    rope_freq_base=base, rope_freq_base_swa=base, rope_sections=sections,
-                   recurrent_row_bytes=(4 * r_floats, 4 * s_floats))
+                   recurrent_row_bytes=(4 * r_floats, 4 * s_floats), llama_revision=revision)
 
     @classmethod
-    def _mla_from_metadata(cls, architecture, meta, get, runtime):
+    def _mla_from_metadata(cls, architecture, meta, get, runtime, revision):
         prefix = architecture + "."
         nextn = int(get("nextn_predict_layers", 0))
         n_all = int(get("block_count"))
@@ -939,11 +1224,12 @@ class ModelSpec:
         if nextn and architecture == "hy_v4":
             # no nextn filter and is_indexer_full() aborts past n_layer() (src/llama-hparams.cpp)
             raise StateFormatError("hy_v4 with nextn_predict_layers > 0 is not supported")
-        # deepseek2/mistral4 (plain cache, no filter) and the KDA hybrids (default !is_recr filter)
-        # keep nextn layers in the trunk cache; deepseek32, glm-dsa and dots3note filter them out
+        # the KDA hybrids (default !is_recr filter) keep nextn layers in the trunk cache, and so does
+        # deepseek2/mistral4's plain cache on 85d5703a3 (ModelSpec.nextn_cached); deepseek32, glm-dsa
+        # and dots3note filter them out on both revisions
         keep_nextn = architecture in ("deepseek2", "mistral4", "kimi-k3", "kimi-linear", "bailingmoe3")
         if not (meta.get(prefix + "attention.key_length_mla") and meta.get(prefix + "attention.value_length_mla")):
-            # without them llama.cpp builds the expanded MHA cache of legacy deepseek2 GGUFs (deepseek2.cpp:602-643)
+            # without them llama.cpp builds the expanded MHA cache of legacy deepseek2 GGUFs (deepseek2.cpp:593-634)
             raise StateFormatError(f"{architecture} without attention.key_length_mla/value_length_mla "
                                    "(an expanded MHA cache) is not supported")
         embd = int(get("embedding_length"))
@@ -955,7 +1241,7 @@ class ModelSpec:
         # reads the c_kv view of K as V, so the logical V width is kv_lora whatever
         # attention.value_length says. The kimi-linear and bailingmoe3 converters write the base
         # class's head_dim or nothing there (conversion/kimi_linear.py:119, bailingmoe3.py:71,
-        # base.py:1379-1381); kimi-k3 overwrites n_embd_head_v_full (src/models/kimi-k3.cpp:24-26).
+        # base.py:1379-1381); kimi-k3 overwrites n_embd_head_v_full (src/models/kimi-k3.cpp:26-28).
         value_length = kv_lora
         n_rot = int(get("rope.dimension_count", key_length))
         memory = MEMORY[architecture]
@@ -972,7 +1258,7 @@ class ModelSpec:
             heads = int(get("attention.head_count_kv", get("attention.head_count", layer=il), layer=il))
             if il >= n_layer:
                 kind = "nextn"
-            elif memory == "hybrid":
+            elif memory in ("hybrid", "hybrid_idx"):
                 kind = "recurrent" if heads == 0 else "full"
             elif swa_pattern is not None and il < len(swa_pattern) and bool(swa_pattern[il]):
                 kind = "sliding"
@@ -991,27 +1277,52 @@ class ModelSpec:
             memory = "dsa"
         if memory in ("dsa", "dsa_iswa"):
             indexer = _indexer_from_metadata(architecture, meta, get, n_layer, n_rot)
+        elif memory == "hybrid_idx":
+            # glm5-next: raw [key | gate | pooled] rows on the attention layers its indexer types flag
+            # (get_key_or_arr over n_layer(), default every layer; src/models/glm5-next.cpp:40-47)
+            flags = meta.get(prefix + "attention.indexer.types", 1)
+            flags = list(flags) if isinstance(flags, (list, tuple, np.ndarray)) else [flags] * n_layer
+            if len(flags) < n_layer:
+                raise StateFormatError(f"{prefix}attention.indexer.types holds {len(flags)} values for {n_layer} layers")
+            kpool = int(get("attention.indexer.kpool"))
+            if kpool < 2:
+                raise StateFormatError(f"{architecture} needs an indexer k-pool of at least 2 cells")
+            indexer = IndexerSpec(tuple(il for il, kind in enumerate(types) if kind == "full" and flags[il]),
+                                  int(get("attention.indexer.key_length")), 0, "none", hadamard=False,
+                                  top_k=int(get("attention.indexer.top_k")),
+                                  n_head=int(get("attention.indexer.head_count", 0)), kpool=kpool, kpool_row=3)
         recurrent_bytes = None
-        if memory == "hybrid":
+        if memory in ("hybrid", "hybrid_idx"):
             r_floats, s_floats = recurrent_row_floats(meta, RECURRENT_FAMILY[architecture])
             recurrent_bytes = (4 * r_floats, 4 * s_floats)
         base_swa = float(get("rope.freq_base_swa")) if architecture == "dots3note" else rope["freq_base"]
+        sections = (0, 0, 0, 0)
+        if architecture == "bailingmoe3" and meta.get(prefix + "rope.dimension_sections") is not None:
+            # Ling 3.0 VL files carry [t, h, w, 0] sections, read by get_key_or_arr(..., 4)
+            # (src/models/bailingmoe3.cpp:18, src/llama-model-loader.cpp:459-496): an array of four,
+            # or one value for all four; a7b94df2c refuses other lengths (85d5703a3 never reads them)
+            value = get("rope.dimension_sections")
+            values = list(value) if isinstance(value, (list, tuple, np.ndarray)) else [value] * 4
+            if len(values) != 4:
+                raise StateFormatError(f"bailingmoe3 rope.dimension_sections has {len(values)} values, not 4")
+            sections = tuple(int(x) for x in values)
         return cls(architecture, tuple(types), tuple(heads_kv), tuple(dim_k), tuple(dim_v), n_swa=n_swa,
-                   rope_type=ROPE_TYPES[architecture], n_rot=n_rot, rope_freq_base=rope["freq_base"],
+                   rope_type=model_rope_type(architecture, sections, revision), n_rot=n_rot,
+                   rope_freq_base=rope["freq_base"], rope_sections=sections,
                    # dots3note's sliding layers take freq_base_swa but the context's freq_scale
                    # (src/models/dots3note.cpp:189, 335-340)
                    rope_freq_base_swa=base_swa, recurrent_row_bytes=recurrent_bytes, kv_lora=tuple(lora),
                    memory_layout=memory, rope_freq_scale=rope["freq_scale"], rope_freq_scale_swa=rope["freq_scale"],
                    rope_ext_factor=rope["ext_factor"], rope_attn_factor=rope["attn_factor"],
                    rope_beta_fast=rope["beta_fast"], rope_beta_slow=rope["beta_slow"],
-                   rope_n_ctx_orig=rope["n_ctx_orig"], indexer=indexer)
+                   rope_n_ctx_orig=rope["n_ctx_orig"], indexer=indexer, llama_revision=revision)
 
     @classmethod
-    def _dsv4_from_metadata(cls, architecture, meta, get, runtime):
+    def _dsv4_from_metadata(cls, architecture, meta, get, runtime, revision):
         """deepseek4 as llama_model_deepseek4::load_arch_hparams (src/models/deepseek4.cpp:19-79) and
-        llama_kv_cache_dsv4 (src/llama-kv-cache-dsv4.cpp:1210-1336) set it up: every trunk layer
+        llama_kv_cache_dsv4 (src/llama-kv-cache-dsv4.cpp:1211-1337) set it up: every trunk layer
         slides, and the main context's raw cache also keeps the nextn (MTP) layers (it zeroes
-        n_layer_nextn in its hparams copy, 1246, and MTP layers are flagged sliding, 72-74), whose
+        n_layer_nextn in its hparams copy, 1247, and MTP layers are flagged sliding, 72-74), whose
         rows the trunk never writes. The loader drops nextn_predict_layers when the GGUF lacks
         blk.<n_layer>.nextn.eh_proj.weight, which metadata does not show (from_gguf checks it)."""
         nextn = int(get("nextn_predict_layers", 0))
@@ -1039,13 +1350,14 @@ class ModelSpec:
                    rope_freq_base_swa=rope["freq_base"], memory_layout="dsv4", rope_freq_scale=rope["freq_scale"],
                    rope_freq_scale_swa=rope["freq_scale"], rope_ext_factor=rope["ext_factor"],
                    rope_attn_factor=rope["attn_factor"], rope_beta_fast=rope["beta_fast"],
-                   rope_beta_slow=rope["beta_slow"], rope_n_ctx_orig=rope["n_ctx_orig"], compress=compress)
+                   rope_beta_slow=rope["beta_slow"], rope_n_ctx_orig=rope["n_ctx_orig"], compress=compress,
+                   llama_revision=revision)
 
     @classmethod
-    def _generic_from_metadata(cls, architecture, meta, get, runtime):
+    def _generic_from_metadata(cls, architecture, meta, get, runtime, revision):
         """Plain-attention hybrids and recurrent-only models, as llama_model::load_hparams
-        (src/llama-model.cpp:1270-1366), the architecture's load_arch_hparams (src/models/<arch>.cpp)
-        and create_memory's layer filters (src/llama-model.cpp:2493-2600) set them up."""
+        (src/llama-model.cpp:1372-1468), the architecture's load_arch_hparams (src/models/<arch>.cpp)
+        and create_memory's layer filters (src/llama-model.cpp:2666-2782) set them up."""
         prefix = architecture + "."
         nextn = int(get("nextn_predict_layers", 0))
         n_all = int(get("block_count"))
@@ -1070,13 +1382,13 @@ class ModelSpec:
         if nextn and architecture not in NEXTN_FILTERED and not (
                 architecture in ("nemotron_h", "nemotron_h_moe") and all(n_ff[il] for il in range(n_layer, n_all))):
             # nemotron's filters take attention layers with n_ff == 0, and nextn layers are never
-            # recurrent (src/llama-model.cpp:2525-2531, src/models/nemotron-h.cpp:12-16): the MTP block
+            # recurrent (src/llama-model.cpp:2698-2704, src/models/nemotron-h.cpp:12-16): the MTP block
             # the converter writes (an attention and an MLP layer, n_ff = the MoE width,
             # conversion/nemotron.py:262-345) sits in neither section. With n_ff == 0, and under the
             # default filters, nextn layers would sit in the main attention cache; not modelled
             raise StateFormatError(f"{architecture} with nextn_predict_layers > 0 is not supported "
                                    "(nextn layers would sit in the attention cache)")
-        # head sizes and n_rot follow layer 0's head count (src/llama-model.cpp:1335-1366); plamo2 reads
+        # head sizes and n_rot follow layer 0's head count (src/llama-model.cpp:1437-1468); plamo2 reads
         # the head sizes again whatever layer 0 holds
         full_k = full_v = n_rot_full = 0
         if heads[0] > 0:
@@ -1124,7 +1436,7 @@ class ModelSpec:
         rope = {"freq_base": 10000.0, "freq_scale": 1.0, "ext_factor": 0.0, "attn_factor": 1.0, "beta_fast": 32.0,
                 "beta_slow": 1.0, "n_ctx_orig": 0}
         sections = (0, 0, 0, 0)
-        # the graphs rotate every layer with hparams.n_rot() = n_rot(0) (src/llama-graph.cpp:1463); a
+        # the graphs rotate every layer with hparams.n_rot() = n_rot(0) (src/llama-graph.cpp:1464); a
         # model whose layer 0 has no heads gets n_rot 0 and so no rotation at all (inferred: a
         # converted PLaMo2, whose layer 0 is Mamba and which writes no rope.dimension_count)
         n_rot = n_rot_swa if types[0] == "sliding" else n_rot_full
@@ -1145,13 +1457,20 @@ class ModelSpec:
         memory = "hybrid_iswa" if n_swa else MEMORY[architecture]
         indexer = None
         if memory == "hybrid_idx":
-            # raw W_k x keys on every attention layer; the copied hparams keep the model's V width
-            # with one KV head, so the section also stores (never written) V rows
-            # (src/llama-memory-hybrid-idx.cpp:44-56, src/models/qwen4exp.cpp:575-590)
+            # raw W_k x keys on every attention layer. On 85d5703a3 the copied hparams keep the model's
+            # V width with one KV head, so the section also stores (never written) V rows; a7b94df2c
+            # caches K only, with the pooled keys beside them when the QSA layers pool blocks of
+            # compress_ratio cells (src/llama-memory-hybrid-idx.cpp:52-74, src/models/qwen4exp.cpp:64-83)
+            ratios = meta.get(prefix + "attention.compress_ratios", [])
+            ratios = list(ratios) if isinstance(ratios, (list, tuple, np.ndarray)) else [ratios] * n_all
+            pools = sorted({int(r) for r in ratios if int(r)})
+            if len(pools) > 1 or pools == [1]:
+                raise StateFormatError(f"qwen4exp QSA layers need one compress ratio above 1, got {pools}")
             indexer = IndexerSpec(tuple(il for il, kind in enumerate(types) if kind == "full"),
                                   int(get("attention.indexer.key_length")), 0, "none", hadamard=False,
                                   top_k=int(get("attention.indexer.top_k")),
-                                  n_head=int(get("attention.indexer.head_count")), value_size=full_v)
+                                  n_head=int(get("attention.indexer.head_count")), value_size=full_v,
+                                  kpool=pools[0] if pools else 0, kpool_row=2 if pools else 1)
         return cls(architecture, tuple(types), tuple(kv_heads), tuple(dim_k), tuple(dim_v), n_swa=n_swa,
                    rope_type=rope_type, n_rot=n_rot, rope_freq_base=rope["freq_base"],
                    rope_freq_base_swa=rope["freq_base"], rope_sections=sections, recurrent_row_bytes=recurrent_bytes,
@@ -1159,15 +1478,124 @@ class ModelSpec:
                    rope_ext_factor=rope["ext_factor"], rope_attn_factor=rope["attn_factor"],
                    rope_beta_fast=rope["beta_fast"], rope_beta_slow=rope["beta_slow"],
                    rope_n_ctx_orig=rope["n_ctx_orig"], indexer=indexer, recurrent_p_bytes=4 * p_floats,
-                   ple_layers=ple_layers)
+                   ple_layers=ple_layers, llama_revision=revision)
 
     @classmethod
-    def from_gguf(cls, path, *, runtime=None):
-        """Spec from a GGUF file's metadata (reads the header only, via gguf_tensors / gguf-py).
+    def _gqa_from_metadata(cls, architecture, meta, get, runtime, revision):
+        """GQA_ARCHITECTURES as llama_model_base::load_hparams (src/llama-model.cpp:1300-1490), the
+        architecture's load_arch_hparams and graph (src/models/<arch>.cpp, GQA_CONVENTIONS) and
+        create_memory (src/llama-model.cpp:2789-2891: one llama_kv_cache, or llama_kv_cache_iswa when
+        layers slide) set them up: per-layer KV heads, head sizes as llama_hparams::n_embd_head_k(il)
+        gives them (key_length/value_length, key_length_swa/value_length_swa on sliding layers), and
+        each layer kind's RoPE. gemma4's shared KV layers (the last attention.shared_kv_layers, past
+        n_layer_kv_from_start) keep no cache: they attend to an earlier layer's (the reuse callback,
+        src/llama-model.cpp:2796-2805) and sit in no section."""
+        prefix = architecture + "."
+        convention = GQA_CONVENTIONS[architecture]
+        nextn = int(get("nextn_predict_layers", 0))
+        n_all = int(get("block_count"))
+        n_layer = n_all - nextn
+        if n_layer <= 0 or nextn < 0:
+            raise StateFormatError("invalid block count")
+        if nextn and not convention["nextn"]:
+            # a7b94df2c filters them out of the trunk cache, while 85d5703a3 keeps them there as zero
+            # rows; no such GGUF is known and neither is modelled
+            raise StateFormatError(f"{architecture} with nextn_predict_layers > 0 is not supported")
+        heads = _per_layer(meta, prefix + "attention.head_count", 0, n_all)
+        # head_count_kv defaults to head_count, layer by layer
+        heads_kv = (_per_layer(meta, prefix + "attention.head_count_kv", 0, n_all)
+                    if prefix + "attention.head_count_kv" in meta else heads)
+        if heads[0] <= 0:
+            raise StateFormatError(f"{architecture} needs attention heads in layer 0")
+        embd = int(get("embedding_length"))
+        full_k = int(get("attention.key_length", embd // heads[0]))
+        full_v = int(get("attention.value_length", embd // heads[0]))
+        swa_k, swa_v = int(get("attention.key_length_swa", full_k)), int(get("attention.value_length_swa", full_v))
+        n_rot_full = int(get("rope.dimension_count", full_k))
+        n_rot_swa = int(get("rope.dimension_count_swa", n_rot_full))
+        window, n_swa, sliding = convention["window"], 0, [False] * n_layer
+        pattern = meta.get(prefix + "attention.sliding_window_pattern")
+        flags = pattern if isinstance(pattern, (list, tuple, np.ndarray)) else None
+        if window == "array" and flags is None:
+            raise StateFormatError(f"{architecture} needs an attention.sliding_window_pattern array")
+        if window is not None:
+            needed = window == "array" or window[2]
+            n_swa = int(get("attention.sliding_window") if needed else meta.get(prefix + "attention.sliding_window", 0)
+                        or 0)
+            if needed and n_swa <= 0:
+                raise StateFormatError(f"{architecture} needs a positive attention.sliding_window")
+        if n_swa > 0:
+            if flags is not None:
+                # flags past the array's end stay 0 (get_arr into is_swa_impl)
+                sliding = [il < len(flags) and bool(flags[il]) for il in range(n_layer)]
+            if flags is None or (window != "array" and revision == "85d5703a3"):
+                # llama_hparams::set_swa_pattern (src/llama-hparams.cpp:7-22); 85d5703a3's gemma3, gpt-oss
+                # and laguna loaders read a period only and leave the default one for flags
+                # (get_key_or_arr into a scalar); their converters write no pattern
+                period, dense_first, _ = window
+                period = int(pattern) if pattern is not None and flags is None else period
+                if period < 0:
+                    raise StateFormatError("invalid sliding-window period")
+                by_period = [period == 0 or (il % period != 0 if dense_first else il % period < period - 1)
+                             for il in range(n_layer)]
+                if flags is not None and by_period != sliding:
+                    raise StateFormatError(f"85d5703a3 ignores {architecture}'s sliding_window_pattern flags (their "
+                                           "layers differ by pin; not modelled)")
+                sliding = by_period
+            if not any(sliding):
+                # create_memory asserts is_swa_any() for a sliding-window model
+                raise StateFormatError(f"{architecture} has a sliding window but no sliding layer")
+        shared = int(meta.get(prefix + "attention.shared_kv_layers", 0) or 0) if architecture == "gemma4" else 0
+        if shared < 0 or n_all - shared < 2:
+            raise StateFormatError(f"{architecture}: {shared} shared KV layers leave fewer than two with a cache")
+        types, kv_heads, dim_k, dim_v = [], [], [], []
+        for il in range(n_layer):
+            if il >= n_all - shared:
+                types.append("shared"), kv_heads.append(0), dim_k.append(0), dim_v.append(0)
+                continue
+            types.append("sliding" if sliding[il] else "full")
+            kv_heads.append(heads_kv[il])
+            dim_k.append(swa_k if sliding[il] else full_k)
+            dim_v.append(swa_v if sliding[il] else full_v)
+        # the graph's n_rot is hparams.n_rot(0), the rotary width of layer 0's kind (src/llama-graph.cpp:1464)
+        first = n_rot_swa if sliding[0] else n_rot_full
+        n_rot = n_rot_full if convention["n_rot"] == "layer" else first
+        n_rot_sliding = 0
+        if any(sliding):
+            n_rot_sliding = first if convention["n_rot"] == "first" else n_rot_swa
+        if architecture in ("llama", "gpt-oss") and {n_rot} != {dim_k[il] for il in range(n_layer)} | {
+                dim_v[il] for il in range(n_layer)}:
+            # llama.cpp asserts it (llama.cpp:103), gpt-oss shapes its heads with n_rot (openai-moe.cpp:91)
+            raise StateFormatError(f"{architecture} rotates whole heads: n_rot {n_rot} must equal every head size")
+        rope = rope_runtime(meta, runtime=runtime)
+        base_train, scale_train = _rope_train(meta)
+        # the sliding layers' base and scale are the model's own (llama_model::get_rope_freq_base/_scale,
+        # src/llama-model.cpp:2335-2341), never the context's
+        base_swa, scale_swa = rope["freq_base"], rope["freq_scale"]
+        if any(sliding):
+            default = base_train if convention["base_swa"] == "train" else convention["base_swa"]
+            base_swa = float(np.float32(get("rope.freq_base_swa", default)))
+            scale_swa = scale_train if convention["scale_swa"] == "train" else float(convention["scale_swa"])
+        return cls(architecture, tuple(types), tuple(kv_heads), tuple(dim_k), tuple(dim_v), n_swa=n_swa if any(sliding)
+                   else 0, rope_type=ROPE_TYPES[architecture], n_rot=n_rot, rope_freq_base=rope["freq_base"],
+                   rope_freq_base_swa=base_swa, memory_layout="iswa" if any(sliding) else "kv",
+                   rope_freq_scale=rope["freq_scale"], rope_freq_scale_swa=scale_swa, rope_ext_factor=rope["ext_factor"],
+                   rope_attn_factor=rope["attn_factor"], rope_beta_fast=rope["beta_fast"],
+                   rope_beta_slow=rope["beta_slow"], rope_n_ctx_orig=rope["n_ctx_orig"], llama_revision=revision,
+                   n_rot_swa=n_rot_sliding)
 
-        granitehybrid passes its optional rope_freqs.weight tensor to ggml_rope_ext as frequency
-        factors (model.get_rope_factors, src/models/granite-hybrid.cpp:106-120, 210-216), so the
-        spec carries it, or () when the GGUF has none."""
+    @classmethod
+    def from_gguf(cls, path, *, runtime=None, llama_revision=None):
+        """Spec from a GGUF file's metadata (reads the header only, via gguf_tensors / gguf-py);
+        llama_revision as from_metadata's.
+
+        granitehybrid, llama and mistral3 pass their optional rope_freqs.weight tensor to ggml_rope_ext
+        as frequency factors (llama_model::get_rope_factors, src/llama-model.cpp:2343-2356;
+        src/models/granite-hybrid.cpp:106-120, 210-216, llama.cpp:140), and gemma4 its required one on
+        the full layers (gemma4.cpp:202-206), so the spec carries it (ROPE_FREQ_FACTOR_ARCHITECTURES),
+        or () when the GGUF has none (phi3 too). Without rope_freqs.weight, get_rope_factors picks
+        rope_factors_long or _short by the context size, which a spec cannot know: refused
+        (gguf_rope_freq_factors)."""
         import gguf_tensors
         meta = gguf_tensors.read_metadata(path, max_array=1 << 16)
         if meta.get("general.architecture") == "deepseek4":
@@ -1177,13 +1605,45 @@ class ModelSpec:
             probe = f"blk.{n_all - nextn}.nextn.eh_proj.weight"
             if nextn > 0 and probe not in gguf_tensors.reader(path)[1]:
                 meta = dict(meta, **{"deepseek4.nextn_predict_layers": 0})
-        spec = cls.from_metadata(meta, runtime=runtime)
-        if spec.architecture == "granitehybrid" and spec.rope_type != "none":
-            factors = ()
-            if "rope_freqs.weight" in gguf_tensors.reader(path)[1]:
-                factors = np.asarray(gguf_tensors.read_tensor(path, "rope_freqs.weight"), dtype=np.float32).ravel()
-            spec = dataclasses.replace(spec, rope_freq_factors=tuple(float(x) for x in factors))
-        return spec
+        spec = cls.from_metadata(meta, runtime=runtime, llama_revision=llama_revision)
+        factors = gguf_rope_freq_factors(path, spec)
+        return spec if factors is None else dataclasses.replace(spec, rope_freq_factors=factors)
+
+
+def gguf_rope_freq_factors(path, spec):
+    """The RoPE frequency factors of the GGUF model `spec` describes, as ModelSpec.rope_freq_factors
+    takes them (ModelSpec.from_gguf; a spec from metadata alone: from_metadata(rope_freq_factors=)).
+
+    None when the spec needs none (not ROPE_FACTOR_TENSOR_ARCHITECTURES, or no RoPE); else the
+    rope_freqs.weight tensor, from whichever file of a split GGUF holds it, or () without one. ggml_rope_ext
+    reads the first n_rot / 2 factors (gemma4's tensor has one per pair of the whole head, gemma4.cpp:96),
+    so a longer tensor is cut there. Without rope_freqs.weight, llama_model::get_rope_factors
+    (src/llama-model.cpp:2343-2356) picks rope_factors_long or _short by the context size, which a spec
+    cannot know: refused (phi3's LongRoPE models)."""
+    import gguf_tensors
+    if spec.architecture not in ROPE_FACTOR_TENSOR_ARCHITECTURES or spec.rope_type == "none":
+        return None
+    # a split GGUF keeps its tensors in any of its files (llama_split_path names)
+    files = [str(path)]
+    count = int(gguf_tensors.metadata_value(str(path), "split.count", 1) or 1)
+    match = re.match(r"^(?P<prefix>.+)-(?P<number>\d{5})-of-(?P<count>\d{5})\.gguf$", Path(path).name)
+    if count > 1 and match is not None:
+        files = [str(Path(path).with_name(f"{match['prefix']}-{n:05d}-of-{count:05d}.gguf"))
+                 for n in range(1, count + 1)]
+    where = {}
+    for name in ("rope_freqs.weight", "rope_factors_long.weight", "rope_factors_short.weight"):
+        where[name] = next((f for f in files if Path(f).is_file() and name in gguf_tensors.reader(f)[1]), None)
+    if where["rope_freqs.weight"] is None and (where["rope_factors_long.weight"]
+                                               or where["rope_factors_short.weight"]):
+        raise StateFormatError(f"{spec.architecture} with rope_factors_long/short and no rope_freqs.weight takes "
+                               "its RoPE frequency factors by the context size, which is not modelled")
+    if spec.architecture == "phi3" or where["rope_freqs.weight"] is None:
+        return ()
+    factors = np.asarray(gguf_tensors.read_tensor(where["rope_freqs.weight"], "rope_freqs.weight"),
+                         dtype=np.float32).ravel()
+    if len(factors) > spec.n_rot // 2:
+        factors = factors[:spec.n_rot // 2]
+    return tuple(float(x) for x in factors)
 
 
 def _metadata_getter(meta, prefix):
@@ -1199,6 +1659,73 @@ def _metadata_getter(meta, prefix):
             value = value[layer]
         return value
     return get
+
+
+def _per_layer(meta, key, default, n_all):
+    """get_key_or_arr: a scalar for every layer or an array of exactly n_layer_all values."""
+    value = meta.get(key, default)
+    if isinstance(value, (list, tuple, np.ndarray)):
+        if len(value) != n_all:
+            raise StateFormatError(f"{key} holds {len(value)} values for {n_all} layers")
+        return [int(x) for x in value]
+    return [int(value)] * n_all
+
+
+def _rope_train(meta):
+    """(float32 rope_freq_base_train, rope_freq_scale_train) as llama_model_base::load_hparams reads
+    them (src/llama-model.cpp:1416-1432): the GGUF's base, and 1 / rope.scaling.factor (1 without a
+    factor), whatever the scaling type; the context's values come from rope_runtime."""
+    f32 = np.float32
+    prefix = f"{meta.get('general.architecture')}."
+    factor = f32(meta.get(prefix + "rope.scaling.factor", meta.get(prefix + "rope.scale_linear", 0.0)) or 0.0)
+    return float(f32(meta.get(prefix + "rope.freq_base", 10000.0))), float(f32(1.0) if factor == 0 else f32(f32(1.0) / factor))
+
+
+def model_rope_type(architecture, sections=(0, 0, 0, 0), revision=LLAMA_REVISION):
+    """llama_model_rope_type on a revision: ROPE_TYPES[architecture], except that a7b94df2c runs
+    bailingmoe3 with M-RoPE when its GGUF has rope sections (llama_hparams::use_mrope: the first
+    two nonzero; src/llama-model.cpp:3112-3114, src/llama-hparams.cpp:352-354)."""
+    since = LLAMA_REVISIONS.index(_known_revision(revision)) >= LLAMA_REVISIONS.index("a7b94df2c")
+    if architecture == "bailingmoe3" and since and len(sections) == 4 and sections[0] > 0 and sections[1] > 0:
+        return "mrope"
+    return ROPE_TYPES[architecture]
+
+
+def llama_revision_of(info):
+    """The LLAMA_REVISIONS entry a llama.cpp runtime names, or None when it names no known one.
+
+    info: a commit hash (full or abbreviated); llama-server's build_info "b<number>-<commit>"
+    (/props) or --version line ("... (build <number>, commit <commit>)"); or the path of a tool
+    build_collector.py built, whose <tool>.build.json manifest names its runtime_source_revision
+    (a path object, or a string naming an existing file or manifest; other strings are text).
+    A build of an exported source names the enclosing repository's commit instead (unknown here)
+    unless it was given LLAMA_BUILD_COMMIT."""
+    if isinstance(info, str) and ("/" in info or os.sep in info) and (
+            os.path.exists(info) or os.path.exists(info + ".build.json")):
+        info = Path(info)
+    if isinstance(info, os.PathLike):
+        manifest = Path(str(info) + ".build.json")
+        try:
+            info = json.loads(manifest.read_text(encoding="utf-8")).get("runtime_source_revision")
+        except (OSError, ValueError, AttributeError):
+            return None
+    if not isinstance(info, str):
+        return None
+    for commit in re.findall(r"[0-9a-f]{7,40}", info.lower()):
+        for revision, full in LLAMA_REVISION_COMMITS.items():
+            if full.startswith(commit):
+                return revision
+    return None
+
+
+def _known_revision(revision):
+    """A LLAMA_REVISIONS entry, from itself or anything llama_revision_of reads; else StateFormatError."""
+    if revision in LLAMA_REVISIONS:
+        return revision
+    known = llama_revision_of(revision)
+    if known is None:
+        raise StateFormatError(f"unknown llama.cpp revision {revision!r} (known: {', '.join(LLAMA_REVISIONS)})")
+    return known
 
 
 def _indexer_from_metadata(architecture, meta, get, n_layer, n_rot):
@@ -1282,15 +1809,16 @@ def ple_rows_from_metadata(meta):
 def rope_runtime(meta, *, runtime=None):
     """The RoPE values a llama_context hands to every ggml_rope_ext call, from GGUF metadata and
     the context's settings (llama_context_params names, see ModelSpec.from_metadata), as
-    llama_model::load_hparams (src/llama-model.cpp:1293-1330) and llama_context's constructor
-    (src/llama-context.cpp:113-210) derive them, in float32 like the C code:
+    llama_model::load_hparams (src/llama-model.cpp:1395-1432) and llama_context's constructor
+    (src/llama-context.cpp:114-211) derive them, in float32 like the C code:
 
     freq_base, freq_scale (1 / rope.scaling.factor; 1 with scaling none), ext_factor (1 for yarn
     unless set), n_ctx_orig (yarn_orig_ctx, rope.scaling.original_context_length, context_length),
-    beta_fast/beta_slow (32/1: these loaders do not read the GGUF beta keys) and attn_factor:
-    with ext_factor != 0 it is overwritten with get_mscale(f, m) / get_mscale(f, m_all)
-    / (1 + 0.1 ln f), where m_all = yarn_log_multiplier / 0.1 and m = m_all for arch deepseek2
-    only (1 otherwise), or get_mscale(f, 1) / (1 + 0.1 ln f) without the key; then times
+    beta_fast/beta_slow (32/1: the loaders but mistral3's do not read the GGUF beta keys) and
+    attn_factor: with ext_factor != 0 it is overwritten with get_mscale(f, m) / get_mscale(f, m_all)
+    / (1 + 0.1 ln f), where m_all = yarn_log_multiplier / 0.1 (as it is for mistral3,
+    YARN_GGUF_ARCHITECTURES) and m = m_all for arch deepseek2 only (1 otherwise), or get_mscale(f, 1)
+    / (1 + 0.1 ln f) without the key; then times
     rope.scaling.attn_factor. ggml multiplies cos/sin by attn_factor * (1 + 0.1 ln(1 / freq_scale))
     when ext_factor != 0 (Rope.magnitude), so the effective k_pe magnitude is 1 for DeepSeek-V2
     style mscale == mscale_all_dim and for m_all = 1, and 1 + 0.1 ln f without the key (up to
@@ -1323,6 +1851,13 @@ def rope_runtime(meta, *, runtime=None):
     log_mul = f32(0.0)
     if architecture in YARN_LOG_MUL_ARCHITECTURES and meta.get(prefix + "rope.scaling.yarn_log_multiplier"):
         log_mul = f32(f32(meta[prefix + "rope.scaling.yarn_log_multiplier"]) / f32(0.1))
+    elif architecture in YARN_GGUF_ARCHITECTURES:
+        log_mul = f32(meta.get(prefix + "rope.scaling.yarn_log_multiplier", 0.0) or 0.0)
+    # llama_hparams yarn_beta_fast/slow (32, 1) unless the loader reads the GGUF's (YARN_GGUF_ARCHITECTURES)
+    beta_train = (32.0, 1.0)
+    if architecture in YARN_GGUF_ARCHITECTURES:
+        beta_train = (float(f32(meta.get(prefix + "rope.scaling.yarn_beta_fast", 32.0))),
+                      float(f32(meta.get(prefix + "rope.scaling.yarn_beta_slow", 1.0))))
     scaling = runtime.get("rope_scaling_type") or scaling
     if scaling not in ROPE_SCALING_TYPES or scaling == "longrope":
         raise StateFormatError(f"RoPE scaling {scaling!r} is not supported")
@@ -1354,8 +1889,8 @@ def rope_runtime(meta, *, runtime=None):
     beta_fast = f32(runtime.get("yarn_beta_fast", -1.0))
     beta_slow = f32(runtime.get("yarn_beta_slow", -1.0))
     return {"freq_base": float(freq_base), "freq_scale": float(freq_scale), "ext_factor": float(ext_factor),
-            "attn_factor": float(attn_factor), "beta_fast": float(beta_fast if beta_fast >= 0 else 32.0),
-            "beta_slow": float(beta_slow if beta_slow >= 0 else 1.0), "n_ctx_orig": n_ctx_orig,
+            "attn_factor": float(attn_factor), "beta_fast": float(beta_fast if beta_fast >= 0 else beta_train[0]),
+            "beta_slow": float(beta_slow if beta_slow >= 0 else beta_train[1]), "n_ctx_orig": n_ctx_orig,
             "scaling": scaling, "yarn_log_mul": float(log_mul)}
 
 
@@ -1593,9 +2128,9 @@ def token_words(tokens, *, server_packed=False):
 class MediaChunk:
     """One image or audio chunk of llama-server's token words: an mtmd_input_chunk as
     mtmd_input_chunk_save writes it (metadata only, never pixels or samples; tools/mtmd/mtmd.cpp:
-    29-136, 262-411, 2399-2450). It occupies n_tokens cells (LLAMA_TOKEN_NULL entries of the token
-    list) and advances the position by n_pos (mtmd_input_chunk_get_n_pos, mtmd.cpp:2351-2361,
-    2525-2537)."""
+    29-136, 262-411, 2411-2462). It occupies n_tokens cells (LLAMA_TOKEN_NULL entries of the token
+    list) and advances the position by n_pos (mtmd_input_chunk_get_n_pos, mtmd.cpp:2363-2373,
+    2537-2549)."""
 
     start: int                    # token-list index of its first cell
     n_tokens: int                 # cells (one KV cell per attention layer each)
@@ -1614,7 +2149,7 @@ class MediaChunk:
 
 @dataclasses.dataclass(frozen=True, eq=False)
 class MediaTokens:
-    """server_tokens as a slot file stores it (tools/server/server-common.cpp:553-617): the token
+    """server_tokens as a slot file stores it (tools/server/server-common.cpp:570-634): the token
     list (one entry per cell; LLAMA_TOKEN_NULL inside a media chunk) and the media chunks by start."""
 
     tokens: np.ndarray            # int32 [cells]
@@ -1622,7 +2157,7 @@ class MediaTokens:
     server_packed: bool           # server_tokens::serialize() words (else a plain token list)
 
     def pos_next(self, n_tokens=None):
-        """server_tokens::pos_next (server-common.cpp:372-418): the position after the first n_tokens
+        """server_tokens::pos_next (server-common.cpp:389-435): the position after the first n_tokens
         entries (all by default), media counting n_pos each; n_tokens must not cut a chunk."""
         n = len(self.tokens) if n_tokens is None else int(n_tokens)
         if not 0 <= n <= len(self.tokens):
@@ -1638,7 +2173,7 @@ class MediaTokens:
     def cell_positions(self):
         """int64 [cells]: the position of each token-list entry's cell (the time component for
         M-RoPE: every cell of an M-RoPE image sits at the image's first position; HunyuanVL and
-        NORMAL images and audio count up, mtmd_image_tokens_get_decoder_pos, mtmd.cpp:2466-2520)."""
+        NORMAL images and audio count up, mtmd_image_tokens_get_decoder_pos, mtmd.cpp:2478-2532)."""
         out = np.arange(len(self.tokens), dtype=np.int64)
         for chunk in self.media:
             if chunk.pos_type == "mrope":
@@ -1648,7 +2183,7 @@ class MediaTokens:
         return out
 
     def to_words(self):
-        """The token words (server_tokens::serialize, server-common.cpp:278-316, 553-573): the
+        """The token words (server_tokens::serialize, server-common.cpp:295-333, 570-590): the
         marker, version, u32 n, the n entries, u32 n_media, the start indices, then each chunk as
         u32 size and its bytes, zero-padded to whole words; or the plain ids."""
         tokens = np.asarray(self.tokens, dtype="<i4")
@@ -1667,7 +2202,7 @@ class MediaTokens:
         return words
 
     def truncated(self, cut):
-        """The first `cut` entries (server_tokens::keep_first, server-common.cpp:636-667: a chunk
+        """The first `cut` entries (server_tokens::keep_first, server-common.cpp:653-684: a chunk
         is kept whole or dropped, never cut)."""
         cut = int(cut)
         self.pos_next(cut)
@@ -1746,7 +2281,7 @@ def parse_media_chunk(blob, start=0):
 
 def parse_media_tokens(words):
     """MediaTokens of a state file's token words, with server_tokens::deserialize's checks
-    (server-common.cpp:575-617) and validate's (738-772): every LLAMA_TOKEN_NULL run is exactly a
+    (server-common.cpp:592-634) and validate's (755-789): every LLAMA_TOKEN_NULL run is exactly a
     media chunk starting at its first entry, chunks have n_tokens > 0 and n_pos > 0, nothing but
     zero padding follows. Plain token lists (no -1 marker) hold no media."""
     words = np.asarray(words)
@@ -2048,7 +2583,7 @@ def recurrent_reset(part, position):
     """The recurrent section of `part`'s layout reset to zeros in one cell at `position`.
 
     A zero row is exactly the state a fresh sequence starts from (build_rs clears row rs_z and
-    copies it to cells without a source, src/llama-graph.cpp:3427-3432), so this is the R0
+    copies it to cells without a source, src/llama-graph.cpp:3529-3534), so this is the R0
     reset for every recurrent family: R, S and PLE rows alike, 0-byte rows included."""
     def zeros(rows):
         return {layer: OpaqueRows(r.ggml_type, r.row_bytes, bytes(r.row_bytes)) for layer, r in rows.items()}
@@ -2070,7 +2605,7 @@ def _stream_count(reader, what):
 # writes the DSV4 header.)
 
 def _parse_pooled_rows(spec, reader, layout):
-    """A K-row section (dsv4_state_write_k_cache, src/llama-kv-cache-dsv4.cpp:332-362)."""
+    """A K-row section (dsv4_state_write_k_cache, src/llama-kv-cache-dsv4.cpp:333-363)."""
     pool, where = spec.pool(layout.name), f"{layout.name} rows"
     version = reader.u32(f"{where} version")
     if version != DSV4_K_ROWS_VERSION:
@@ -2119,7 +2654,7 @@ def _write_pooled_rows(spec, part, layout):
 
 
 def _parse_compressor_ring(spec, reader, layout):
-    """A compressor ring section (llama_dsv4_comp_state::state_write, src/llama-kv-cache-dsv4.cpp:1080-1116)."""
+    """A compressor ring section (llama_dsv4_comp_state::state_write, src/llama-kv-cache-dsv4.cpp:1081-1117)."""
     pool, where = spec.pool(layout.name[:-len("_state")]), layout.name
     version, ratio, size, width = (reader.u32(f"{where} {field}")
                                    for field in ("version", "ratio", "state_size", "n_embd_state"))
@@ -2169,7 +2704,7 @@ def media_cut(media, *, before=()):
     """Token-list index where the first media chunk's span begins (len(tokens) without media):
     the chunk's start, moved back over the `before` token ids that sit right in front of it.
     mtmd appends the projector's img_beg/aud_beg text (e.g. Qwen-VL's <|vision_start|>) to the
-    text chunk before each medium (tools/mtmd/mtmd.cpp:1311-1354), so they are not part of the
+    text chunk before each medium (tools/mtmd/mtmd.cpp:1319-1362), so they are not part of the
     rendered conversation text; pass their ids to cut before them."""
     if isinstance(media, StateFile):
         media = media.media
@@ -2237,7 +2772,7 @@ def truncate_state(state_file, cut, *, recurrent=None, sliding="native"):
             positions = np.asarray(stream.positions, dtype=np.int64)
             keep = positions < dropped_from
             if layout.sliding and sliding == "native":
-                # is_masked_swa (src/llama-hparams.h:466-478) against the new end
+                # is_masked_swa (src/llama-hparams.h:480-492) against the new end
                 keep &= last - positions < spec.n_swa
                 needed = np.unique(cell_positions[last - cell_positions < spec.n_swa])
                 missing = np.setdiff1d(needed, positions[keep])
@@ -2286,28 +2821,51 @@ def _parse_payload(spec, reader, flags):
     return SequenceState(spec, flags, parts)
 
 
-def parse_state(data, spec, *, flags=FLAGS_NONE):
-    """Parse a bare memory payload (what memory->state_write wrote)."""
-    reader = _Reader(data)
-    state = _parse_payload(spec, reader, flags)
-    reader.finish("memory state")
-    return state
+def _parse_to_end(spec, data, offset, flags, what, strict=False):
+    """The payload from `offset` to the end of data, read with spec's revision, else (unless strict)
+    with the other revisions whose layouts of the model differ (ModelSpec.layout_variants): a state
+    does not name the llama.cpp that wrote it, and the readings cannot both consume it (their layer
+    counts, row sizes, V blocks or cell extensions differ). The parsed state carries the spec that
+    read it; when none does, the error of spec's own reading is raised."""
+    errors = []
+    for variant in ([spec] if strict else _variants(spec)):
+        reader = _Reader(data, offset)
+        try:
+            state = _parse_payload(variant, reader, flags)
+            reader.finish(what)
+            return state
+        except StateFormatError as error:
+            errors.append(error)
+    raise errors[0]
 
 
-def parse_blob(data, spec, *, flags=FLAGS_NONE):
-    """Parse a llama_state_seq_get_data(_ext) blob written with `flags`."""
+def _variants(spec):
+    """spec, then (only when spec's own reading failed) its other layout variants."""
+    yield spec
+    yield from spec.layout_variants()[1:]
+
+
+def parse_state(data, spec, *, flags=FLAGS_NONE, strict=False):
+    """Parse a bare memory payload (what memory->state_write wrote); state.spec is the reading that
+    fits (another revision of spec's model when spec's own does not, see _parse_to_end). Code that
+    goes on using `spec` itself for layouts or RoPE (pre_rope_keys, cache_keys, spec.layouts) must
+    pass strict=True, which refuses a state of another revision's layout, or use state.spec: an
+    85d5703a3 state of a bailingmoe3 model with rope sections reads as NORM RoPE, not M-RoPE."""
+    return _parse_to_end(spec, data, 0, flags, "memory state", strict)
+
+
+def parse_blob(data, spec, *, flags=FLAGS_NONE, strict=False):
+    """Parse a llama_state_seq_get_data(_ext) blob written with `flags` (revision and strict as parse_state)."""
     reader = _Reader(data)
     magic = reader.u32("io magic")
     if magic != IO_MAGIC:
         raise StateFormatError(f"not a sequence state blob (magic {magic:#010x})")
     seq_id = reader.i32("seq id")
-    state = _parse_payload(spec, reader, flags)
-    reader.finish("sequence state blob")
-    return StateBlob(seq_id, state)
+    return StateBlob(seq_id, _parse_to_end(spec, data, reader.pos, flags, "sequence state blob", strict))
 
 
-def parse_file(data, spec):
-    """Parse a llama_state_seq_save_file file (llama-server slot save)."""
+def parse_file(data, spec, *, strict=False):
+    """Parse a llama_state_seq_save_file file (llama-server slot save; revision and strict as parse_state)."""
     reader = _Reader(data)
     magic = reader.u32("file magic")
     version = reader.u32("file version")
@@ -2316,13 +2874,11 @@ def parse_file(data, spec):
     count = reader.u32("token count")
     words = reader.array("<i4", count, "token words").copy()
     parse_media_tokens(words)
-    state = _parse_payload(spec, reader, FLAGS_NONE)
-    reader.finish("sequence state file")
-    return StateFile(words, state)
+    return StateFile(words, _parse_to_end(spec, data, reader.pos, FLAGS_NONE, "sequence state file", strict))
 
 
-def read_file(path, spec):
-    return parse_file(Path(path).read_bytes(), spec)
+def read_file(path, spec, *, strict=False):
+    return parse_file(Path(path).read_bytes(), spec, strict=strict)
 
 
 def write_new(path, data):
@@ -2390,7 +2946,7 @@ def template_layout(state):
 
 @dataclasses.dataclass
 class Checkpoint:
-    """common_prompt_checkpoint as the resume file stores it (common/common.h:1165-1181)."""
+    """common_prompt_checkpoint as the resume file stores it (common/common.h:1253-1269)."""
 
     n_tokens: int
     pos_min: int
@@ -2405,7 +2961,7 @@ class Checkpoint:
 
 @dataclasses.dataclass
 class ResumeFile:
-    """slot_resume_file (tools/server/server-context.cpp:41-121): draft/speculative state and checkpoints."""
+    """slot_resume_file (tools/server/server-context.cpp:42-122): draft/speculative state and checkpoints."""
 
     draft: bytes = b""
     speculative: bytes = b""
@@ -2457,14 +3013,35 @@ def parse_resume(data, *, n_prompt_tokens=None):
 
 # -- RoPE (ggml-cpu conventions) -----------------------------------------------------------
 
-def rope_angles(positions, n_rot, base, sections=None):
+def rope_components(n_pairs, sections, *, interleaved=True):
+    """The position component (0 t, 1 h, 2 w, 3 e) each rotated pair takes, as ggml_mrope_cache_init
+    (ggml/src/ggml-cpu/ops.cpp:6219-6290) picks it: interleaved sectors for IMROPE, consecutive runs
+    of sections[0], [1], [2] pairs (then e) for M-RoPE, both modulo the sections' sum."""
+    sections = [int(x) for x in sections]
+    if len(sections) != 4 or min(sections) < 0 or sum(sections[:3]) == 0:
+        raise ValueError("M-RoPE sections must be four nonnegative counts, not all of the first three zero")
+    total, out = sum(sections), []
+    for index in range(n_pairs):
+        sector = index % total
+        if interleaved:
+            component = (1 if sector % 3 == 1 and sector < 3 * sections[1] else
+                         2 if sector % 3 == 2 and sector < 3 * sections[2] else
+                         0 if sector % 3 == 0 and sector < 3 * sections[0] else 3)
+        else:
+            component = (0 if sector < sections[0] else 1 if sector < sections[0] + sections[1] else
+                         2 if sector < sum(sections[:3]) else 3)
+        out.append(component)
+    return tuple(out)
+
+
+def rope_angles(positions, n_rot, base, sections=None, *, interleaved=True):
     """float32 angles [n, n_rot/2] as ggml builds its rope cache (no YaRN, no freq factors).
 
-    With `sections` (IMROPE) each rotated pair takes theta_t/h/w/e as
-    ggml_mrope_cache_init does. For text tokens the first three position components
-    equal the token position and the fourth is 0 (llm_graph_input_pos::set_input,
-    src/llama-graph.cpp:131-141), so pairs whose sector falls to theta_e are not rotated.
-    Qwen3.8's sections [11, 11, 10, 0] over 32 pairs never reach theta_e.
+    With `sections` (IMROPE, or M-RoPE with interleaved=False) each rotated pair takes
+    theta_t/h/w/e as ggml_mrope_cache_init does (rope_components). For text tokens the first
+    three position components equal the token position and the fourth is 0
+    (llm_graph_input_pos::set_input, src/llama-graph.cpp:127-147), so pairs whose sector falls to
+    theta_e are not rotated. Qwen3.8's sections [11, 11, 10, 0] over 32 pairs never reach theta_e.
     """
     if n_rot <= 0 or n_rot % 2:
         raise ValueError("n_rot must be a positive even number")
@@ -2475,15 +3052,8 @@ def rope_angles(positions, n_rot, base, sections=None):
         angles[:, index] = theta
         theta = (theta * theta_scale).astype(np.float32)
     if sections is not None:
-        sections = [int(x) for x in sections]
-        if len(sections) != 4 or min(sections) < 0 or sum(sections[:3]) == 0:
-            raise ValueError("IMROPE sections must be four nonnegative counts, not all of the first three zero")
-        total = sum(sections)
-        for index in range(n_rot // 2):
-            sector = index % total
-            text = ((sector % 3 == 1 and sector < 3 * sections[1]) or (sector % 3 == 2 and sector < 3 * sections[2])
-                    or (sector % 3 == 0 and sector < 3 * sections[0]))
-            if not text:
+        for index, component in enumerate(rope_components(n_rot // 2, sections, interleaved=interleaved)):
+            if component == 3:
                 angles[:, index] = 0
     return angles
 
@@ -2517,7 +3087,7 @@ def _logf(x):
 
 def rope_theta_scale(base, n_rot):
     """float32 powf(freq_base, -2.0f/n_dims) as ggml_compute_forward_rope computes it
-    (ggml/src/ggml-cpu/ops.cpp:6143); libm powf through ctypes when available, else the
+    (ggml/src/ggml-cpu/ops.cpp:6371); libm powf through ctypes when available, else the
     float64 power rounded to float32. numpy's float32 power can differ from powf by 1 ulp
     (base 1e7, n_dims 16), which changes every rotated key."""
     base, exponent = np.float32(base), np.float32(-2.0) / np.float32(n_rot)
@@ -2528,7 +3098,7 @@ def rope_theta_scale(base, n_rot):
 
 
 def yarn_corr_dims(n_dims, n_ctx_orig, base, beta_fast=32.0, beta_slow=1.0):
-    """float32 (low, high) as ggml_rope_yarn_corr_dims computes them (ggml/src/ggml.c:4418-4430):
+    """float32 (low, high) as ggml_rope_yarn_corr_dims computes them (ggml/src/ggml.c:4478-4490):
     floor/ceil of n_dims * logf(n_ctx_orig / (beta * 2 * pi)) / (2 * logf(base)), clamped to
     [0, n_dims - 1]."""
     f32 = np.float32
@@ -2575,8 +3145,9 @@ def _cos_sin(angles):
 class Rope:
     """One ggml_rope_ext (or text-position ggml_rope_multi) call as ggml-cpu evaluates it.
 
-    mode: "norm" (adjacent pairs), "neox" (pairs i, i + n_dims/2) or "imrope" (NEOX pairs with
-    IMROPE sectors); the pairs live in [offset, offset + n_dims) of the last axis and every
+    mode: "norm" (adjacent pairs), "neox" (pairs i, i + n_dims/2), "imrope" (NEOX pairs with
+    IMROPE sectors) or "mrope" (NEOX pairs with M-RoPE sections: GGML_ROPE_TYPE_MROPE applies
+    cos/sin in NEOX order); the pairs live in [offset, offset + n_dims) of the last axis and every
     other dim passes through. freq_scale, ext_factor, attn_factor, beta_* and n_ctx_orig are
     the runtime values (rope_runtime), so ext_factor = 0 and attn_factor = 1 give plain RoPE."""
 
@@ -2594,18 +3165,19 @@ class Rope:
     freq_factors: tuple = None    # per rotated pair: theta / factor (ggml_rope_cache_init's freq_factors)
 
     def __post_init__(self):
-        if self.mode not in ("norm", "neox", "imrope") or self.n_dims <= 0 or self.n_dims % 2 or self.offset < 0:
-            raise ValueError("RoPE needs mode norm/neox/imrope, a positive even n_dims and offset >= 0")
+        if self.mode not in ("norm", "neox", "imrope", "mrope") or self.n_dims <= 0 or self.n_dims % 2 \
+                or self.offset < 0:
+            raise ValueError("RoPE needs mode norm/neox/imrope/mrope, a positive even n_dims and offset >= 0")
         if self.freq_factors is not None and len(self.freq_factors) != self.n_dims // 2:
             raise ValueError("RoPE frequency factors need one value per rotated pair")
-        if (self.mode == "imrope") != (self.sections is not None):
-            raise ValueError("IMROPE (and only IMROPE) takes sections")
+        if (self.mode in ("imrope", "mrope")) != (self.sections is not None):
+            raise ValueError("IMROPE and M-RoPE (and only they) take sections")
         if self.ext_factor != 0 and self.n_ctx_orig <= 0:
             raise ValueError("YaRN needs the original context length")
 
     def magnitude(self):
         """float32 factor on cos/sin: attn_factor, times fmaf(logf(1 / freq_scale), 0.1f, 1.0f)
-        with YaRN (rope_yarn, ops.cpp:5961-5969, as the pinned build contracts it)."""
+        with YaRN (rope_yarn, ops.cpp:6189-6197, as the pinned builds contract it)."""
         f32 = np.float32
         mscale = f32(self.attn_factor)
         if self.ext_factor != 0:
@@ -2616,7 +3188,7 @@ class Rope:
     def cos_sin(self, positions):
         """float32 (cos, sin) [n, n_dims/2] with the magnitude applied, as ggml's rope cache."""
         f32 = np.float32
-        extrap = rope_angles(positions, self.n_dims, self.base, self.sections)
+        extrap = rope_angles(positions, self.n_dims, self.base, self.sections, interleaved=self.mode == "imrope")
         if self.freq_factors is not None:
             extrap = (extrap / np.asarray(self.freq_factors, dtype=f32)).astype(f32)
         interp = (extrap * f32(self.freq_scale)).astype(f32)
@@ -2749,25 +3321,34 @@ def cache_keys(spec, layer, k_pre_rope, positions, *, role="attention"):
     attention: Kcur_normed (Muse, Qwen), or the MLA row [RMSNorm(c_kv) * g | k_pe] whose k_pe
     tail gets the architecture's RoPE (YaRN included; NoPE kimi rows pass through);
     indexer: the k_norm LayerNorm output, rotated and then multiplied by H where the
-    architecture stores Hadamard-rotated keys."""
+    architecture stores Hadamard-rotated keys (k_pre_rope [n, 1, head_size]); a k-pool row
+    (ModelSpec.indexer_row_slots) takes its per-token slots (indexer_key_slots: glm5-next's
+    [key | gate]) and gets a zero pooled slot, which a restore re-pools."""
     kind = spec.layer_types[layer]
-    if kind in ("recurrent", "mlp"):
+    if kind in ("recurrent", "mlp", "shared"):
         raise ValueError(f"layer {layer} has no attention cache ({kind})")
     rope = spec.rope(layer, role)
     x = np.asarray(k_pre_rope, dtype=np.float32)
     out = x.copy() if rope is None else rope.apply(x, positions)
     if role == "indexer" and spec.indexer.hadamard:
         out = _hadamard_rows(out)
+    if role == "indexer" and spec.indexer_row_slots > 1:
+        pooled = np.zeros(out.shape[:-1] + (spec.indexer.head_size,), dtype=np.float32)
+        out = np.concatenate([out, pooled], axis=-1)
     return out
 
 
 def pre_rope_keys(spec, layer, k_cache, positions, *, role="attention"):
-    """Inverse of cache_keys: de-rotate stored keys back to pre-RoPE coordinates (float32)."""
+    """Inverse of cache_keys: de-rotate stored keys back to pre-RoPE coordinates (float32); of a
+    k-pool indexer row only the per-token slots (ModelSpec.indexer_key_slots: the key, glm5-next's
+    key and gate)."""
     kind = spec.layer_types[layer]
-    if kind in ("recurrent", "mlp"):
+    if kind in ("recurrent", "mlp", "shared"):
         raise ValueError(f"layer {layer} has no attention cache ({kind})")
     rope = spec.rope(layer, role)
     x = np.asarray(k_cache, dtype=np.float32)
+    if role == "indexer" and spec.indexer_row_slots > 1:
+        x = x[..., :spec.indexer.head_size * spec.indexer_key_slots]
     if role == "indexer" and spec.indexer.hadamard:
         x = _hadamard_rows(x)
     return x.copy() if rope is None else rope.invert(x, positions)
@@ -2786,7 +3367,7 @@ def mla_split(spec, layer, k_rows):
 
 def value_rows(spec, stream, layer):
     """V rows of a parsed attention stream: stream.v, or for MLA the c_kv view of K (the first
-    kv_lora elements, which attention reads as V, src/llama-graph.cpp:2918-2924)."""
+    kv_lora elements, which attention reads as V, src/llama-graph.cpp:3012-3018)."""
     if layer in stream.v:
         return stream.v[layer]
     return mla_split(spec, layer, stream.k[layer])[0]
@@ -2797,7 +3378,7 @@ def mla_renormalize_latent(c_kv, weight, eps=1e-6):
     RMS 1 (llama.cpp's rms_norm, x / sqrt(mean(x^2) + eps)), multiply by g.
 
     weight is blk.N.attn_kv_a_norm.weight and eps the model's attention.layer_norm_rms_epsilon
-    (build_norm passes f_norm_rms_eps, src/llama-graph.cpp:1591). Elements where g == 0 come
+    (build_norm passes f_norm_rms_eps, src/llama-graph.cpp:1609). Elements where g == 0 come
     back 0 (the cache holds 0 there too); their normalized values are lost, so the RMS is taken
     over the other elements, which on average hold the same share of the unit mean square."""
     c = np.asarray(c_kv, dtype=np.float64)
@@ -2834,10 +3415,11 @@ def build_kv_stream(spec, layers, positions, k, v, *, dtype="f16", v_trans=False
                     role="attention"):
     """One stream of cache-ready K/V: k[layer], v[layer] are [len(positions), heads, dim].
 
-    Cells are written in the given (strictly increasing) position order. For IMROPE and PLE
-    models `tokens_at` (token id per cell) fills the cell ext (x = y = pos). K-only layers
-    (MLA, the DSA indexer) take no V; v may then be None. A nextn layer missing from k gets
-    zero rows, and so do the qwen4exp indexer's V rows (never written), as in a native save.
+    Cells are written in the given (strictly increasing) position order. For IMROPE, M-RoPE and
+    PLE models `tokens_at` (token id per cell) fills the cell ext (x = y = pos). K-only layers
+    (MLA, the DSA indexer, a7b94df2c's qwen4exp indexer) take no V; v may then be None. A nextn
+    layer missing from k gets zero rows, and so do the V rows of 85d5703a3's qwen4exp indexer
+    (never written), as in a native save.
     """
     if dtype not in DTYPE_NAMES:
         raise StateFormatError("dtype must be f16 or f32")
@@ -2886,7 +3468,7 @@ def build_muse_state(spec, tokens, positions, k, v, *, swa_positions=None, dtype
     swa_positions: subset of `positions` stored for the sliding layers (default: those a
     native save keeps, pos > max(positions) - n_swa). llama-server re-processes the prompt
     unless the SWA part reaches back more than n_swa positions or a checkpoint exists, and
-    aborts on zero SWA cells (tools/server/server-context.cpp:3366-3458).
+    aborts on zero SWA cells (tools/server/server-context.cpp:3546-3638).
     dtype/v_trans must match the receiving context (cache type; v_trans = not flash-attn).
     """
     if spec.architecture != "muse-glimmer":
@@ -3011,7 +3593,8 @@ def build_dense_state(spec, tokens, positions, k, v=None, *, indexer_k=None, dty
 
 def describe(state):
     """Small JSON-able summary of a SequenceState."""
-    out = {"architecture": state.spec.architecture, "flags": state.flags, "sections": []}
+    out = {"architecture": state.spec.architecture, "llama_revision": state.spec.llama_revision, "flags": state.flags,
+           "sections": []}
     for part in state.parts:
         if isinstance(part, KVCache):
             streams = []

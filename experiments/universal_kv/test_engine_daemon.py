@@ -510,7 +510,7 @@ class DaemonTest(unittest.TestCase):
                          (os.environ["OPENBLAS_NUM_THREADS"], "cpu"))
         self.assertEqual(request(directory, {"op": "stats"})["engine"], ping["engine"])
         # what this engine handles beyond older ones: the bridge drops those skips for it
-        self.assertEqual(ping["features"], ["media-source", "template-options", "recurrent-mean"])
+        self.assertEqual(ping["features"], ["media-source", "template-options", "recurrent-mean", "vocabularies"])
         stats = request(directory, {"op": "stats"})
         self.assertEqual((stats["features"], stats["recurrent_means"]), (ping["features"], []))
 

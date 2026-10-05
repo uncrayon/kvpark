@@ -105,8 +105,10 @@ def main(argv=None):
     hubs["indexer"] = hub_module.load_indexer_ridges(args.hub)       # DSA targets: their indexer keys
     table_path = (args.tables or args.hub.parent / "token-tables") / f"{args.target.split('=', 1)[0]}.npz"
     table = handoff.TokenTable(table_path) if table_path.is_file() else None
-    s_spec, t_spec = kvstate.ModelSpec.from_gguf(s_gguf), kvstate.ModelSpec.from_gguf(t_gguf)
-    _, _, artifacts = verify_runtime(args.probe.resolve())
+    revision, _, artifacts = verify_runtime(args.probe.resolve())
+    # the probe's runtime saves the states: its revision's layouts, which they are read strictly with
+    s_spec, t_spec = (kvstate.ModelSpec.from_gguf(gguf, llama_revision=kvstate.llama_revision_of(revision))
+                      for gguf in (s_gguf, t_gguf))
     keep = set(args.sources.split(",")) if args.sources else None
 
     conversations = [json.loads(line) for line in open(args.corpus, encoding="utf-8") if line.strip()]
@@ -151,9 +153,10 @@ def main(argv=None):
     inputs, means = [], {}
     for d in documents:
         did = d["id"]
-        source_state = kvstate.read_file(next((args.output / "states-s").rglob(f"{did}/{d['P_s']}.state")), s_spec)
+        source_state = kvstate.read_file(next((args.output / "states-s").rglob(f"{did}/{d['P_s']}.state")), s_spec,
+                                         strict=True)
         native_path = next((args.output / "states-t").rglob(f"{did}/{d['t0']}.state"))
-        template = kvstate.read_file(native_path, t_spec)
+        template = kvstate.read_file(native_path, t_spec, strict=True)
         source = translate.Side(s_name, s_spec, d["records"]["s"], tokens["s"][did], gguf=s_gguf)
         target = translate.Side(t_name, t_spec, d["records"]["t"], tokens["t"][did], gguf=t_gguf)
         out = built / did

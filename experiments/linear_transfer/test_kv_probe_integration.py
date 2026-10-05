@@ -4,7 +4,9 @@ CPU checks: KVPARK_KV_PROBE=/path/to/binary. Vulkan checks (tiny fixtures on the
 KVPARK_KV_PROBE_VULKAN=/path/to/a binary built against a GGML_VULKAN=ON runtime. The
 MLA/DSA and hybrid captures also run the attention hybrids test-llama-archs writes when
 KVPARK_LLAMA_ARCHS=/path/to/test-llama-archs is set (given a byte vocabulary so the probe
-can tokenize text for them).
+can tokenize text for them; written as tiny_fixture.llama_archs_model does). The probe may run
+on either pinned runtime (85d5703a3 or a7b94df2c): saved states are read as the revision that
+wrote them, and that is the probe manifest's revision where it names one.
 """
 
 import contextlib
@@ -21,7 +23,8 @@ import numpy as np
 
 import kvstate
 from captures import Capture
-from tiny_fixture import YARN_V2, _gguf_module, copy_with_metadata, create_fixture, create_mla_fixture
+from tiny_fixture import YARN_V2, _gguf_module, copy_with_metadata, create_fixture, create_gemma_fixture, \
+    create_mla_fixture, fuse_qkv, llama_archs_model
 
 
 PROBE = os.environ.get("KVPARK_KV_PROBE")
@@ -60,31 +63,19 @@ def expected_tokens(text):
     return ids, ends, special
 
 
-def copy_with_byte_vocabulary(source, path):
-    """A copy of a test-llama-archs GGUF (tokenizer "no_vocab", n_vocab ids) whose tokenizer is gpt2 with
-    one token per byte 0..n_vocab-1 and no merges, so kv_probe can tokenize ASCII text for it; tensors
-    and every other key unchanged (as tiny_fixture.copy_with_metadata, with array-valued keys)."""
+def copy_with_tokenizer(source, path, replaced, *, removed=()):
+    """A copy of a GGUF whose tokenizer keys are `replaced` ({key: (value, type, sub_type)}) and
+    `removed`; tensors and every other key unchanged (as tiny_fixture.copy_with_metadata, with
+    array-valued keys)."""
     gguf = _gguf_module()
-    from gguf.vocab import bytes_to_unicode
     path = Path(path)
     if path.exists():
         raise FileExistsError(path)
     reader = gguf.GGUFReader(source)
     writer = gguf.GGUFWriter(path, reader.get_field(gguf.Keys.General.ARCHITECTURE).contents())
-    n_vocab = len(reader.get_field("tokenizer.ggml.tokens").data)
-    if n_vocab > 256:
-        raise ValueError("a byte vocabulary holds at most 256 tokens")
-    symbols = bytes_to_unicode()
-    replaced = {"tokenizer.ggml.model": ("gpt2", gguf.GGUFValueType.STRING, None),
-                "tokenizer.ggml.pre": ("gpt-2", gguf.GGUFValueType.STRING, None),
-                "tokenizer.ggml.tokens": ([symbols[b] for b in range(n_vocab)], gguf.GGUFValueType.ARRAY,
-                                          gguf.GGUFValueType.STRING),
-                "tokenizer.ggml.token_type": ([int(gguf.TokenType.NORMAL)] * n_vocab, gguf.GGUFValueType.ARRAY,
-                                              gguf.GGUFValueType.INT32),
-                "tokenizer.ggml.merges": (["<unused-left> <unused-right>"], gguf.GGUFValueType.ARRAY,
-                                          gguf.GGUFValueType.STRING)}
     for field in reader.fields.values():
-        if field.name == gguf.Keys.General.ARCHITECTURE or field.name.startswith("GGUF.") or field.name in replaced:
+        if (field.name == gguf.Keys.General.ARCHITECTURE or field.name.startswith("GGUF.") or field.name in replaced
+                or field.name in removed):
             continue
         value_type = field.types[0]
         if value_type == gguf.GGUFValueType.ARRAY and not field.data:
@@ -103,6 +94,54 @@ def copy_with_byte_vocabulary(source, path):
         writer.write_tensor_data(tensor.data, tensor_endianess=reader.endianess)
     writer.close()
     return path
+
+
+def copy_with_byte_vocabulary(source, path):
+    """A copy of a test-llama-archs GGUF (tokenizer "no_vocab", n_vocab ids) whose tokenizer is gpt2 with
+    one token per byte 0..n_vocab-1 and no merges, so kv_probe can tokenize ASCII text for it; tensors
+    and every other key unchanged."""
+    gguf = _gguf_module()
+    from gguf.vocab import bytes_to_unicode
+    n_vocab = len(gguf.GGUFReader(source).get_field("tokenizer.ggml.tokens").data)
+    if n_vocab > 256:
+        raise ValueError("a byte vocabulary holds at most 256 tokens")
+    symbols = bytes_to_unicode()
+    array, string, int32 = gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.STRING, gguf.GGUFValueType.INT32
+    return copy_with_tokenizer(source, path, {
+        "tokenizer.ggml.model": ("gpt2", string, None), "tokenizer.ggml.pre": ("gpt-2", string, None),
+        "tokenizer.ggml.tokens": ([symbols[b] for b in range(n_vocab)], array, string),
+        "tokenizer.ggml.token_type": ([int(gguf.TokenType.NORMAL)] * n_vocab, array, int32),
+        "tokenizer.ggml.merges": (["<unused-left> <unused-right>"], array, string)})
+
+
+# a SentencePiece vocabulary (tokenizer "llama", as Jamba's): <unk>, BOS, EOS, two control tokens,
+# a byte token per byte (byte fallback) and a few pieces, U+2581 for a space
+SPM_SPECIAL = [("<unk>", 2), ("<s>", 3), ("</s>", 3), ("<|im_start|>", 3), ("<|im_end|>", 3)]
+SPM_PIECES = ["\u2581", "hi", "\u2581hi", "ok", "go", "\u2581go"]
+
+
+def spm_vocabulary():
+    """[(token, type)] of the SentencePiece fixture vocabulary (types as llama_token_type)."""
+    return SPM_SPECIAL + [(f"<0x{b:02X}>", 6) for b in range(256)] + [(piece, 1) for piece in SPM_PIECES]
+
+
+def copy_with_spm_vocabulary(source, path, *, add_space_prefix=None):
+    """A copy of a GGUF whose tokenizer is the SentencePiece spm_vocabulary() (scores: the piece
+    length, so longer pieces win), with tokenizer.ggml.add_space_prefix when given (absent: llama.cpp's
+    default for SentencePiece, true); a vocab-only load (kv_probe tokenize) reads nothing else."""
+    gguf = _gguf_module()
+    vocabulary = spm_vocabulary()
+    array, string, int32 = gguf.GGUFValueType.ARRAY, gguf.GGUFValueType.STRING, gguf.GGUFValueType.INT32
+    uint32 = gguf.GGUFValueType.UINT32
+    replaced = {"tokenizer.ggml.model": ("llama", string, None),
+                "tokenizer.ggml.tokens": ([token for token, _ in vocabulary], array, string),
+                "tokenizer.ggml.token_type": ([kind for _, kind in vocabulary], array, int32),
+                "tokenizer.ggml.scores": ([float(len(token)) for token, _ in vocabulary], array,
+                                          gguf.GGUFValueType.FLOAT32),
+                "tokenizer.ggml.bos_token_id": (1, uint32, None), "tokenizer.ggml.eos_token_id": (2, uint32, None)}
+    if add_space_prefix is not None:
+        replaced["tokenizer.ggml.add_space_prefix"] = (bool(add_space_prefix), gguf.GGUFValueType.BOOL, None)
+    return copy_with_tokenizer(source, path, replaced, removed=("tokenizer.ggml.pre", "tokenizer.ggml.merges"))
 
 
 def probe_supports(model, workdir):
@@ -136,6 +175,8 @@ class KvProbeIntegrationTests(unittest.TestCase):
         # probes older than --device (kv-probe-build-s1) stay usable for the rest of this class
         usage = subprocess.run([PROBE, "--help"], capture_output=True, text=True, timeout=60).stdout
         cls.has_device_option = "--device" in usage
+        # and probes older than SentencePiece add_space_prefix tokenizing (kv-probe-build-e2), which never read the key
+        cls.reads_space_prefix = b"tokenizer.ggml.add_space_prefix" in Path(PROBE).read_bytes()
 
     @classmethod
     def tearDownClass(cls):
@@ -242,6 +283,43 @@ class KvProbeIntegrationTests(unittest.TestCase):
         output = directory / "tokens"
         result = self.run_probe("tokenize", self.models["muse-glimmer"], docs, output)
         self.assert_fails(result, output, 'duplicate json key "text"')
+
+    def test_tokenize_drops_the_sentencepiece_space_prefix(self):
+        # A SentencePiece tokenizer with add_space_prefix (Jamba's) tokenizes the text that starts the
+        # input, and each text after a special token, with a space in front, which the first piece
+        # prints: the pieces drop it there (as engine.spelled_pieces), so they join to the text, and a
+        # lone U+2581 token spells nothing (byte_end repeats). Without add_space_prefix the pieces are
+        # the text as they are.
+        if not self.reads_space_prefix:
+            self.skipTest("this kv_probe predates SentencePiece add_space_prefix tokenizing")
+        chat, plain = "<|im_start|>hi\nok go<|im_end|>\n", "ok go"
+        index = {token: i for i, (token, _) in enumerate(spm_vocabulary())}
+        byte = {b"\n": index["<0x0A>"]}
+        cases = {
+            True: [(chat, ["<|im_start|>", "▁hi", byte[b"\n"], "ok", "▁go", "<|im_end|>", "▁",
+                           byte[b"\n"]], [12, 14, 15, 17, 20, 30, 30, 31], [1, 0, 0, 0, 0, 1, 0, 0]),
+                   (plain, ["▁", "ok", "▁go"], [0, 2, 5], [0, 0, 0])],
+            False: [(chat, ["<|im_start|>", "hi", byte[b"\n"], "ok", "▁go", "<|im_end|>", byte[b"\n"]],
+                     [12, 14, 15, 17, 20, 30, 31], [1, 0, 0, 0, 0, 1, 0]),
+                    (plain, ["ok", "▁go"], [2, 5], [0, 0])]}
+        for prefix, documents in cases.items():
+            with self.subTest(add_space_prefix=prefix):
+                directory = self.workdir()
+                model = copy_with_spm_vocabulary(self.models["qwen3"], directory / "spm.gguf",
+                                                 add_space_prefix=None if prefix else False)
+                docs = self.write_docs(directory, [{"document_id": document_id(text), "text": text}
+                                                   for text, _, _, _ in documents])
+                output = directory / "tokens"
+                result = self.run_probe("tokenize", model, docs, output)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                capture = Capture(output)           # the capture checks: byte ends never decrease
+                for (text, tokens, ends, flags), document in zip(documents, capture.documents, strict=True):
+                    rows = capture.rows(document["document_id"])
+                    self.assertEqual(capture.token_id[rows].tolist(),
+                                     [index.get(token, token) for token in tokens])
+                    self.assertEqual(capture.byte_end[rows].tolist(), ends)
+                    self.assertEqual(capture.special[rows].tolist(), flags)
+                    self.assertEqual(ends[-1], len(text.encode("utf-8")))
 
     def test_command_line_rejects_unknown_and_repeated_options(self):
         directory = self.workdir()
@@ -933,27 +1011,8 @@ HYBRID_ARCHS = ("kimi-linear", "qwen3next", "qwen35moe", "qwen4exp", "plamo2", "
 ASCII = ("Plain ASCII only: the archs fixtures know bytes 0-127. " * 3).strip()
 
 
-@unittest.skipUnless(PROBE, "set KVPARK_KV_PROBE to enable real llama.cpp kv-probe checks")
-class KvProbeFamilyTests(unittest.TestCase):
-    """Captures of the MLA/DSA family (the [c_kv | k_pe] row from two graph nodes, its c_kv view, the
-    indexer keys) and of the attention layers of the new hybrids, against the probe's own saved states
-    parsed with kvstate: K is the de-rotated cache row, V the stored V (an MLA layer's c_kv view)."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.temp = tempfile.TemporaryDirectory(prefix="kvpark-kv-probe-families-")
-        cls.root = Path(cls.temp.name)
-        cls.models = {}
-        for name, (architecture, options) in MLA_FIXTURES.items():
-            cls.models[name] = cls.root / f"{name}.gguf"
-            create_mla_fixture(cls.models[name], architecture, **options)
-        if not probe_supports(cls.models["deepseek2"], cls.root):
-            cls.temp.cleanup()
-            raise unittest.SkipTest("this kvpark-kv-probe predates the MLA/DSA and hybrid tables; rebuild it")
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.temp.cleanup()
+class ProbeStateMixin:
+    """kv_probe collect and save-state runs on one document, checked against kvstate (cls.root holds them)."""
 
     def workdir(self):
         return Path(tempfile.mkdtemp(dir=self.root))
@@ -987,6 +1046,11 @@ class KvProbeFamilyTests(unittest.TestCase):
         return capture, kvstate.read_file(saved / report["documents"][0]["states"][0]["file"], spec)
 
     def check_against_state(self, spec, capture, state):
+        # the state's reading: spec's model on the revision that wrote it (the probe manifest's, if named)
+        self.assertEqual(state.state.spec, spec.for_revision(state.state.spec.llama_revision))
+        if kvstate.llama_revision_of(PROBE) is not None and len(spec.layout_variants()) > 1:
+            self.assertEqual(state.state.spec.llama_revision, kvstate.llama_revision_of(PROBE))
+        spec = state.state.spec
         self.assertEqual([kind for kind in spec.layer_types if kind != "nextn"], capture.layer_types)
         checked = set()
         for part, layout in zip(state.state.parts, spec.layouts(state.state.flags)):
@@ -1011,6 +1075,29 @@ class KvProbeFamilyTests(unittest.TestCase):
                 checked.add((key, layer))
         self.assertEqual(checked | {("v", layer) for key, layer in checked if key == "k"},
                          {(key, layer) for key in capture.keys() for layer in capture.layers(key)})
+
+
+@unittest.skipUnless(PROBE, "set KVPARK_KV_PROBE to enable real llama.cpp kv-probe checks")
+class KvProbeFamilyTests(ProbeStateMixin, unittest.TestCase):
+    """Captures of the MLA/DSA family (the [c_kv | k_pe] row from two graph nodes, its c_kv view, the
+    indexer keys) and of the attention layers of the new hybrids, against the probe's own saved states
+    parsed with kvstate: K is the de-rotated cache row, V the stored V (an MLA layer's c_kv view)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory(prefix="kvpark-kv-probe-families-")
+        cls.root = Path(cls.temp.name)
+        cls.models = {}
+        for name, (architecture, options) in MLA_FIXTURES.items():
+            cls.models[name] = cls.root / f"{name}.gguf"
+            create_mla_fixture(cls.models[name], architecture, **options)
+        if not probe_supports(cls.models["deepseek2"], cls.root):
+            cls.temp.cleanup()
+            raise unittest.SkipTest("this kvpark-kv-probe predates the MLA/DSA and hybrid tables; rebuild it")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp.cleanup()
 
     def test_mla_rows_and_indexer_keys_match_the_saved_cache(self):
         text = "Latent caches: one row of [c_kv | k_pe] per token and layer. " * 2
@@ -1105,15 +1192,18 @@ class KvProbeFamilyTests(unittest.TestCase):
 
     @unittest.skipUnless(LLAMA_ARCHS, "set KVPARK_LLAMA_ARCHS for the test-llama-archs hybrids")
     def test_state_captures_of_graphs_without_names(self):
+        # the K-only MLA hybrids and hy_v4; GLM5-Next (a7b94df2c only) with NoPE latents and indexer keys that
+        # hold the per-token gate beside the key (ModelSpec.indexer_key_slots)
         out = self.workdir()
-        for architecture in ("kimi-k3", "bailingmoe3", "hy_v4"):
+        for architecture in ("kimi-k3", "bailingmoe3", "hy_v4", "glm5-next"):
             with self.subTest(architecture=architecture):
-                result = subprocess.run([LLAMA_ARCHS, "-a", architecture, "-s", "7", "-o", str(out)],
-                                        capture_output=True, text=True, timeout=600)
-                self.assertEqual(result.returncode, 0, result.stderr[-400:])
-                model = copy_with_byte_vocabulary(next(out.glob(f"{architecture}-*.gguf")),
-                                                  out / f"{architecture}.vocab.gguf")
-                spec = kvstate.ModelSpec.from_gguf(model)
+                try:
+                    source = llama_archs_model(LLAMA_ARCHS, architecture, out)
+                except RuntimeError:
+                    self.assertEqual(architecture, "glm5-next")     # the 85d5703a3 test-llama-archs has none
+                    continue
+                model = copy_with_byte_vocabulary(source, out / f"{architecture}.vocab.gguf")
+                spec = kvstate.ModelSpec.from_gguf(model, llama_revision=kvstate.llama_revision_of(Path(PROBE)))
                 capture = self.collect_v2(model, "states", ASCII)
                 attention = [il for il in spec.attention_layers if spec.layer_types[il] != "nextn"]
                 self.assertEqual(capture.layers("k"), attention)
@@ -1123,6 +1213,10 @@ class KvProbeFamilyTests(unittest.TestCase):
                     np.testing.assert_array_equal(capture.array("v", layer),
                                                   capture.array("k", layer)[..., :spec.kv_lora[layer]])
                 self.assertEqual(capture.layers("ik"), list(spec.indexer.layers) if spec.indexer else [])
+                for layer in capture.layers("ik"):
+                    self.assertEqual(capture.array("ik", layer).shape[1:],
+                                     (1, spec.indexer.head_size * spec.indexer_key_slots))
+                    self.assertEqual(capture.indexer[layer], spec.indexer.head_size * spec.indexer_key_slots)
 
     @unittest.skipUnless(LLAMA_ARCHS, "set KVPARK_LLAMA_ARCHS for the test-llama-archs hybrids")
     def test_only_lfm2_reads_the_sliding_window(self):
@@ -1131,10 +1225,7 @@ class KvProbeFamilyTests(unittest.TestCase):
         out = self.workdir()
         for architecture in ("jamba", "kimi-linear"):
             with self.subTest(architecture=architecture):
-                result = subprocess.run([LLAMA_ARCHS, "-a", architecture, "-s", "7", "-o", str(out)],
-                                        capture_output=True, text=True, timeout=600)
-                self.assertEqual(result.returncode, 0, result.stderr[-400:])
-                vocab = copy_with_byte_vocabulary(next(out.glob(f"{architecture}-*.gguf")),
+                vocab = copy_with_byte_vocabulary(llama_archs_model(LLAMA_ARCHS, architecture, out),
                                                   out / f"{architecture}.vocab.gguf")
                 model = out / f"{architecture}.window.gguf"
                 copy_with_metadata(vocab, model, values={f"{architecture}.attention.sliding_window": 16})
@@ -1148,10 +1239,7 @@ class KvProbeFamilyTests(unittest.TestCase):
         out = self.workdir()
         for architecture in HYBRID_ARCHS + ("kimi-k3", "bailingmoe3", "hy_v4"):
             with self.subTest(architecture=architecture):
-                result = subprocess.run([LLAMA_ARCHS, "-a", architecture, "-s", "7", "-o", str(out)],
-                                        capture_output=True, text=True, timeout=600)
-                self.assertEqual(result.returncode, 0, result.stderr[-400:])
-                model = copy_with_byte_vocabulary(next(out.glob(f"{architecture}-*.gguf")),
+                model = copy_with_byte_vocabulary(llama_archs_model(LLAMA_ARCHS, architecture, out),
                                                   out / f"{architecture}.vocab.gguf")
                 spec = kvstate.ModelSpec.from_gguf(model)
                 if architecture in HYBRID_ARCHS:
@@ -1162,6 +1250,194 @@ class KvProbeFamilyTests(unittest.TestCase):
                 result, _ = self.probe("collect", model, [{"document_id": document_id(ASCII), "text": ASCII}])
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("capture key k is only defined for", result.stderr)
+
+
+# GQA models (kvstate.GQA_ARCHITECTURES) the probe captures: gguf-py Gemma models (both pins), then
+# test-llama-archs ones given a byte vocabulary, and llama, phi3 and mimo2 again with a fused attn_qkv
+# (as Phi-3 and MiMo-V2.5 GGUFs have it); hy_v3 names no pre-RoPE key and glm5-next (a7b94df2c only)
+# neither, so they serve save-state and seed-score only
+GQA_GEMMA = {"gemma4": ("gemma4", {}), "gemma4-shared": ("gemma4", {"layers": 8, "shared_kv_layers": 2}),
+             "gemma3-tiny": ("gemma3", {})}
+GQA_ARCHS = ("llama", "mistral3", "qwen3moe", "phi3", "gemma3", "gpt-oss", "laguna", "mimo2")
+UNNAMED_ARCHS = ("hy_v3", "glm5-next")
+
+
+@unittest.skipUnless(PROBE, "set KVPARK_KV_PROBE to enable real llama.cpp kv-probe checks")
+class KvProbeGqaTests(ProbeStateMixin, unittest.TestCase):
+    """Captures of the GQA models (plain and sliding-window caches, per-layer KV heads and head sizes,
+    gemma4's shared KV layers) against the probe's own saved states: K the de-rotated cache row, V the
+    stored V (gemma4's RMS-normed one), the layer table kvstate's. The documents outlast the
+    test-llama-archs models' window (32), so their sliding sections hold only its last cells."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory(prefix="kvpark-kv-probe-gqa-")
+        cls.root = Path(cls.temp.name)
+        cls.models = {}
+        for name, (architecture, options) in GQA_GEMMA.items():
+            cls.models[name] = cls.root / f"{name}.gguf"
+            create_gemma_fixture(cls.models[name], architecture, **options)
+        if not probe_supports(cls.models["gemma4"], cls.root):
+            cls.temp.cleanup()
+            raise unittest.SkipTest("this kvpark-kv-probe predates the GQA table rows; rebuild it")
+        for architecture in (GQA_ARCHS + UNNAMED_ARCHS) if LLAMA_ARCHS else ():
+            try:
+                source = llama_archs_model(LLAMA_ARCHS, architecture, cls.root / "archs")
+            except RuntimeError:
+                continue                        # 85d5703a3's test-llama-archs saves no such model
+            if architecture == "phi3":
+                # without rope_factors_long/short (kvstate refuses factors picked by the context size)
+                plain = cls.root / "phi3-plain.gguf"
+                copy_with_metadata(source, plain, drop_tensors=["rope_factors_long.weight",
+                                                                "rope_factors_short.weight"])
+                source = plain
+            cls.models[architecture] = copy_with_byte_vocabulary(source, cls.root / f"{architecture}.vocab.gguf")
+            if architecture in ("llama", "phi3", "mimo2"):
+                # one attn_qkv projection, as Phi-3 and MiMo-V2.5 GGUFs have it: build_qkv's K and V views
+                # (llama, phi3), mimo2's unnamed views of "wqkv"
+                cls.models[f"{architecture}-fused"] = cls.root / f"{architecture}-fused.vocab.gguf"
+                fuse_qkv(cls.models[architecture], cls.models[f"{architecture}-fused"])
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp.cleanup()
+
+    def test_gqa_captures_match_the_saved_cache(self):
+        for name, model in self.models.items():
+            if name in UNNAMED_ARCHS:
+                continue
+            with self.subTest(model=name):
+                spec = kvstate.ModelSpec.from_gguf(model)
+                capture, state = self.capture_and_state(model, spec, ASCII)
+                self.check_against_state(spec, capture, state)
+                self.assertEqual(capture.layers("k"), list(spec.attention_layers))
+                for layer in capture.layers("k"):
+                    self.assertEqual(capture.array("k", layer).shape[1:], spec.head_shape(layer, "k"))
+                    self.assertEqual(capture.array("v", layer).shape[1:], spec.head_shape(layer, "v"))
+                if spec.memory == "iswa" and spec.n_swa < len(capture.token_id):
+                    # the sliding sections keep only the window's last cells, and were checked on them
+                    swa = state.state.part("swa").stream()
+                    self.assertEqual(len(swa.positions), spec.n_swa)
+        if "gemma4-shared" in self.models:
+            report = Capture(self.capture_and_state(self.models["gemma4-shared"],
+                                                    kvstate.ModelSpec.from_gguf(self.models["gemma4-shared"]),
+                                                    ASCII)[0].path).report
+            self.assertEqual([layer["attention"] for layer in report["layers"]][-2:], ["shared", "shared"])
+
+    def test_fused_qkv_projection_is_read_by_columns(self):
+        # mimo2 with one attn_qkv: Q, K and V are unnamed views of the projection "wqkv" [Q | K | V]
+        # (mimo2.cpp:129-142), so the probe reads (and patches) its columns; they equal the split model's
+        # projections bit for bit, and patching K and V with their own values leaves every score as it was
+        if "mimo2-fused" not in self.models:
+            self.skipTest("this test-llama-archs writes no mimo2 model")
+        record = {"document_id": document_id(ASCII), "text": ASCII}
+        captures, keys = {}, {"k": "all", "v": "all", "q": "all"}
+        for name in ("mimo2", "mimo2-fused"):
+            result, output = self.probe("collect", self.models[name], [record], spec=keys)
+            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+            captures[name] = Capture(output)
+        report = captures["mimo2-fused"].report
+        self.assertEqual({c["tensor"] for c in report["captures"]}, {"wqkv-0", "wqkv-1"})
+        for key in "kvq":
+            for layer in captures["mimo2"].layers(key):
+                np.testing.assert_array_equal(np.asarray(captures["mimo2-fused"].array(key, layer)),
+                                              np.asarray(captures["mimo2"].array(key, layer)), err_msg=f"{key}-{layer}")
+        # patch-score: K and V of layer 1 patched with the run's own values (on a GPU, in device memory: the
+        # projection's other columns are written back unchanged), then scaled up
+        token_ids = np.asarray(captures["mimo2-fused"].token_id, dtype="<i4")
+        positions = np.arange(1, len(token_ids) - 8, 3)
+        for binary, device in [(PROBE, "cpu")] + ([(PROBE_VULKAN, "vulkan")] if PROBE_VULKAN else []):
+            with self.subTest(device=device):
+                directory = self.workdir()
+
+                def run(mode, records, name):
+                    docs = directory / f"{name}.jsonl"
+                    docs.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+                    (directory / "spec.json").write_text(json.dumps({"k": [1], "v": [1]}), encoding="utf-8")
+                    output = directory / name
+                    result = subprocess.run([binary, "--mode", mode, "--model", str(self.models["mimo2-fused"]),
+                                             "--input", str(docs), "--output", str(output), "--ctx", "256",
+                                             "--batch", "32", "--threads", "2", "--device", device,
+                                             *(["--capture-spec", str(directory / "spec.json")] if mode == "collect"
+                                               else [])], capture_output=True, text=True, timeout=300)
+                    self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+                    return output
+                capture = Capture(run("collect", [record], "native"))
+                conditions = [{"name": "native", "patch_dir": None}]
+                for name, scale in (("sanity", 1.0), ("scaled", 40.0)):
+                    path = directory / name
+                    path.mkdir()
+                    np.save(path / "positions.npy", positions.astype(np.int32))
+                    for key in "kv":
+                        rows = scale * np.asarray(capture.array(key, 1))[positions]
+                        np.save(path / f"{key}-1.npy", rows.astype(np.float32))
+                    conditions.append({"name": name, "patch_dir": str(path)})
+                scored = dict(record, expected_token_sha256=hashlib.sha256(token_ids.tobytes()).hexdigest(),
+                              score_ranges=[[len(ASCII) // 2, len(ASCII)]], conditions=conditions)
+                output = run("patch-score", [scored], "scores")
+                document = json.loads((output / "results.json").read_text(encoding="utf-8"))["documents"][0]
+                scores = {c["name"]: np.load(output / "scores" / document["document_id"] / f"{c['name']}.npy")
+                          for c in document["conditions"]}
+                found = {c["name"]: c for c in document["conditions"]}
+                self.assertEqual(found["sanity"]["applied_rows"], {"k-1": len(positions), "v-1": len(positions)})
+                np.testing.assert_array_equal(scores["sanity"], scores["native"])
+                self.assertFalse(np.array_equal(scores["scaled"][:, 0], scores["native"][:, 0]))
+
+    def test_sliding_patterns_follow_the_runtime(self):
+        # gemma3 flags that disagree with its period: a7b94df2c reads them (load_swa_pattern), 85d5703a3 a period
+        # only, keeping its default (6) for an array, so a probe built against it refuses them, as kvstate does;
+        # a period of 0 makes every layer slide (set_swa_pattern). The saved states show the runtime's layers.
+        key = "gemma3.attention.sliding_window_pattern"
+        flagged, every = self.root / "gemma3-flags.gguf", self.root / "gemma3-period0.gguf"
+        if not flagged.exists():
+            copy_with_metadata(self.models["gemma3-tiny"], flagged, remove=(key,), values={key: [1, 0] * 3})
+            copy_with_metadata(self.models["gemma3-tiny"], every, values={key: 0})
+        revision = kvstate.llama_revision_of(PROBE) or kvstate.LLAMA_REVISION
+        record = {"document_id": document_id(ASCII), "text": ASCII}
+        for model, layers in ((flagged, ["sliding", "full"] * 3), (every, ["sliding"] * 6)):
+            with self.subTest(model=model.name):
+                result, tokens = self.probe("tokenize", model, [record])
+                if revision == "85d5703a3" and model == flagged:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("ignores gemma3's sliding_window_pattern flags", result.stderr)
+                    with self.assertRaisesRegex(kvstate.StateFormatError, "ignores gemma3's sliding_window_pattern"):
+                        kvstate.ModelSpec.from_gguf(model, llama_revision=revision)
+                    continue
+                self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+                report = json.loads((tokens / "report.json").read_text(encoding="utf-8"))
+                self.assertEqual([layer["attention"] for layer in report["layers"]], layers)
+                spec = kvstate.ModelSpec.from_gguf(model, llama_revision=revision)
+                self.assertEqual(list(spec.layer_types), layers)
+                n = len(np.load(tokens / "token_id.npy"))
+                result, saved = self.probe("save-state", model, [dict(record, save_at=[n])])
+                self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+                report = json.loads((saved / "report.json").read_text(encoding="utf-8"))
+                data = (saved / report["documents"][0]["states"][0]["file"]).read_bytes()
+                self.assertEqual(kvstate.parse_file(data, spec).to_bytes(), data)
+
+    def test_models_without_named_keys_save_states(self):
+        # hy_v3's k_norm output and glm5-next's latent row have no node name to capture: collect is refused,
+        # save-state writes what kvstate reads
+        for name in UNNAMED_ARCHS:
+            if name not in self.models:
+                continue
+            with self.subTest(model=name):
+                model = self.models[name]
+                record = {"document_id": document_id(ASCII), "text": ASCII}
+                result, _ = self.probe("collect", model, [record])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("capture key k is only defined for", result.stderr)
+                result, tokens = self.probe("tokenize", model, [record])
+                self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+                n = len(np.load(tokens / "token_id.npy"))
+                result, saved = self.probe("save-state", model, [dict(record, save_at=[n])])
+                self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+                report = json.loads((saved / "report.json").read_text(encoding="utf-8"))
+                data = (saved / report["documents"][0]["states"][0]["file"]).read_bytes()
+                spec = kvstate.ModelSpec.from_gguf(model)
+                parsed = kvstate.parse_file(data, spec)
+                self.assertEqual(parsed.to_bytes(), data)
+                self.assertEqual(len(parsed.tokens), n)
 
 
 @unittest.skipUnless(PROBE and LLAMA_ARCHS, "set KVPARK_KV_PROBE and KVPARK_LLAMA_ARCHS for the DeepSeek V4 captures")
@@ -1177,13 +1453,8 @@ class KvProbeDsv4Tests(unittest.TestCase):
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory(prefix="kvpark-kv-probe-dsv4-")
         cls.root = Path(cls.temp.name)
-        out = cls.root / "archs"
-        out.mkdir()
-        result = subprocess.run([LLAMA_ARCHS, "-a", "deepseek4", "-s", "7", "-o", str(out)], capture_output=True,
-                                text=True, timeout=600)
-        if result.returncode != 0:
-            raise RuntimeError(f"test-llama-archs deepseek4: {result.stderr[-400:]}")
-        cls.model = copy_with_byte_vocabulary(out / "deepseek4-moe.gguf", cls.root / "deepseek4-bytes.gguf")
+        cls.model = copy_with_byte_vocabulary(llama_archs_model(LLAMA_ARCHS, "deepseek4", cls.root / "archs"),
+                                              cls.root / "deepseek4-bytes.gguf")
         if not probe_supports(cls.model, cls.root):
             cls.temp.cleanup()
             raise unittest.SkipTest("this kvpark-kv-probe predates the DeepSeek V4 row; rebuild it")

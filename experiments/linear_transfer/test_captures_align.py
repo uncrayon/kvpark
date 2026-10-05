@@ -131,6 +131,14 @@ class CaptureTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             write_synthetic_capture(path, self.documents(), arrays, n_layer=8)
 
+    def test_tokens_that_spell_nothing_are_accepted(self):
+        # kv_probe drops the space a SentencePiece tokenizer puts after a special token: a lone
+        # U+2581 token there spells nothing, so its byte_end repeats the previous one
+        documents = [{"document_id": doc_id(0), "byte_end": [2, 2, 4], "token_id": [0, 1, 2], "special": [1, 0, 0]},
+                     {"document_id": doc_id(1), "byte_end": [0, 2, 4, 6, 8, 10]}]
+        capture = open_capture(write_synthetic_capture(self.root / "cap", documents, self.arrays(9), n_layer=8))
+        np.testing.assert_array_equal(capture.byte_start, [0, 2, 2, 0, 0, 2, 4, 6, 8])
+
     def test_handwritten_npy_v1_header_as_the_cpp_writer_produces(self):
         path = write_synthetic_capture(self.root / "cap", self.documents(), self.arrays(8), n_layer=8)
         values = self.rng.normal(size=(8, 2, 4)).astype("<f4")
@@ -165,7 +173,7 @@ class CaptureTests(unittest.TestCase):
             "fortran": lambda p: np.save(p / "k-3.npy", np.asfortranarray(np.zeros((8, 2, 4), "<f4"))),
             "shape": lambda p: np.save(p / "k-3.npy", np.zeros((8, 4, 2), "<f4")),
             "token_dtype": lambda p: np.save(p / "token_id.npy", np.zeros(8, np.int64)),
-            "byte_end": lambda p: np.save(p / "byte_end.npy", np.asarray([2, 2, 4, 2, 4, 6, 8, 10], "<i8")),
+            "byte_end": lambda p: np.save(p / "byte_end.npy", np.asarray([2, 4, 2, 2, 4, 6, 8, 10], "<i8")),
             "special": lambda p: np.save(p / "special.npy", np.full(8, 2, np.uint8)),
             "missing": lambda p: (p / "v-7.npy").unlink(),
             "symlink": lambda p: ((p / "k-3.npy").rename(p / "real.npy"),
@@ -365,6 +373,25 @@ class AlignTests(unittest.TestCase):
         self.assertEqual(int(np.sum(classes == UNMATCHED)), 0)
         self.assertEqual(int(np.sum(classes == STRADDLING)), 0)
         self.assertGreater(int(np.sum(classes == ALIGNED)), 50)
+
+    def test_tokens_that_spell_nothing_stay_unmatched(self):
+        # a SentencePiece token kv_probe leaves empty repeats the previous byte_end: it is no pair of its own,
+        # and the token before it still aligns (a repeated key would pair the wrong rows)
+        splitter = lambda text: fake_tokenize(text, words)
+        src_records, tgt_records, src_tokens, tgt_tokens = self.build(sample_conversations(), splitter, splitter)
+        plain = align(src_records, self.capture(src_records, src_tokens, "qwen35"),
+                      tgt_records, self.capture(tgt_records, tgt_tokens, "muse-glimmer"))
+        start, end = tgt_records[0]["segments"][0][1:]
+        ends, special = (np.asarray(a) for a in tgt_tokens[0])
+        empty = int(np.flatnonzero((ends > start) & (ends < end))[1]) + 1     # after a token inside the segment
+        tgt_tokens[0] = (np.insert(ends, empty, ends[empty - 1]), np.insert(special, empty, 0))
+        tgt_set = self.capture(tgt_records, tgt_tokens, "muse-glimmer")
+        result = align(src_records, self.capture(src_records, src_tokens, "qwen35"), tgt_records, tgt_set)
+        self.assertEqual(int(result.tgt_class[empty]), UNMATCHED)
+        shifted = np.where((plain.doc == 0) & (plain.tgt_position >= empty), 1, 0)
+        np.testing.assert_array_equal(result.src_row, plain.src_row)
+        np.testing.assert_array_equal(result.tgt_position, plain.tgt_position + shifted)
+        self.assertEqual(int(np.sum(result.tgt_class == STRADDLING)), 0)
 
     def test_special_token_inside_segment_rejects_document(self):
         conversations = sample_conversations()

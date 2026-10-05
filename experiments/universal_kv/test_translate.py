@@ -61,8 +61,10 @@ def mla_metadata(architecture, n_layer, *, kv_lora=8, rope=4, nextn=0, yarn=None
 
 # top_k 9: the 9-token target prompt of the MLA tests fits (zero indexer keys are exact)
 INDEXER = {"attention.indexer.head_count": 2, "attention.indexer.key_length": 64, "attention.indexer.top_k": 9}
-# deepseek2 with YaRN (DeepSeek-V2 style magnitude 1) and a nextn layer the cache keeps as zero rows
-DEEPSEEK2 = kvstate.ModelSpec.from_metadata(mla_metadata("deepseek2", 2, nextn=1, yarn=(4.0, 64, 0.0707)))
+# deepseek2 with YaRN (DeepSeek-V2 style magnitude 1) and a nextn layer, which 85d5703a3's cache keeps as
+# zero rows (a7b94df2c's leaves it out: DEEPSEEK2.for_revision("a7b94df2c"))
+DEEPSEEK2 = kvstate.ModelSpec.from_metadata(mla_metadata("deepseek2", 2, nextn=1, yarn=(4.0, 64, 0.0707)),
+                                            llama_revision="85d5703a3")
 # DSA: an MLA section and a lightning-indexer key section (NEOX, Hadamard), top_k 9 (and 8, 4)
 DSA = kvstate.ModelSpec.from_metadata(mla_metadata("deepseek32", 2, **INDEXER))
 DSA_TOP8 = kvstate.ModelSpec.from_metadata(mla_metadata("deepseek32", 2, **{**INDEXER, "attention.indexer.top_k": 8}))
@@ -647,6 +649,41 @@ class SectionsTest(unittest.TestCase):
         self.check(KDA, MUSE)                             # NoPE rows: nothing de-rotated
         self.check(DOTS, TARGET, subsets={"src": list(DOTS.layers_of("full"))})   # global layers only
         self.check(DEEPSEEK2, DOTS)
+
+    def test_the_states_readings_set_the_layouts(self):
+        # specs of the current revision, states of 85d5703a3 (and the other way round): the template's
+        # reading is the layout written, the source state's the RoPE undone
+        current = DEEPSEEK2.for_revision("a7b94df2c")
+        for side_spec, template_spec in ((current, DEEPSEEK2), (DEEPSEEK2, current)):
+            with self.subTest(template=template_spec.llama_revision):
+                source_state, _, _ = native_state(template_spec, self.s_tok["token_id"], self.rng)
+                template, _, _ = native_state(template_spec, self.t_tok["token_id"], self.rng)
+                spec = kvstate.parse_file(template.to_bytes(), side_spec).state.spec
+                self.assertEqual(spec, template_spec)
+                self.assertEqual(translate.state_side(translate.Side("tgt", side_spec, self.t_rec, self.t_tok),
+                                                      template).spec, template_spec)
+                hubs = random_hub({"src": kind_widths(side_spec), "tgt": kind_widths(side_spec)})
+                state, _ = translate.translate(
+                    source_state, translate.Side("src", side_spec, self.s_rec, self.s_tok),
+                    translate.Side("tgt", side_spec, self.t_rec, self.t_tok, norms=latent_norm_weights(side_spec)),
+                    hubs, t0=len(self.t_tok["token_id"]) - 1, template=template)
+                self.assertEqual(state.state.spec, template_spec)
+                parsed = kvstate.parse_file(state.to_bytes(), side_spec)
+                self.assertEqual(parsed.state.spec, template_spec)
+                stream = parsed.state.part("kv").stream()
+                self.assertEqual(sorted(stream.k), [0, 1, 2] if template_spec.nextn_cached else [0, 1])
+                if template_spec.nextn_cached:
+                    self.assertFalse(stream.k[2].any())
+        with self.assertRaisesRegex(ValueError, "another model's layout"):
+            translate.state_side(translate.Side("tgt", DSA, self.t_rec, self.t_tok), template)
+        # a native prefix of the other revision than the template's is refused
+        other, _, _ = native_state(DEEPSEEK2, self.t_tok["token_id"], self.rng)
+        with self.assertRaisesRegex(ValueError, "different llama.cpp revisions"):
+            translate.translate(source_state, translate.Side("src", current, self.s_rec, self.s_tok),
+                                translate.Side("tgt", current, self.t_rec, self.t_tok,
+                                               norms=latent_norm_weights(current)),
+                                hubs, t0=len(self.t_tok["token_id"]) - 1, template=template, native_state=other,
+                                native_prefix=2)
 
     def test_k_only_hybrid_target_resets_the_recurrent_rows(self):
         state, report = self.check(HYBRID, KDA)

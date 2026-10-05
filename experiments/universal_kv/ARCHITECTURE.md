@@ -1,4 +1,4 @@
-# Universal KV translator: architecture (2026-10-04)
+# Universal KV translator: architecture (2026-10-05)
 
 Goal: let a person switch a live conversation between open models on one machine (an
 EVO-X2-class box: Ryzen AI Max+ 395, 128 GB unified memory, Radeon 8060S, llama.cpp on
@@ -68,10 +68,11 @@ against a one-token native save of the target); the bridge's list is `TRANSLATAB
 | Dense GQA | `qwen3` | K/V of every layer for [0, T0), K rotated at the target positions | real model (Qwen3-4B-Instruct-2507), live switches |
 | Sliding window + global | `muse-glimmer` | global layers for [0, T0) (NoPE); sliding layers for their last n_swa + 1 positions | real model (Muse-Glimmer-30B), live switches |
 | Gated DeltaNet hybrid | `qwen35` | the attention layers (IMROPE, partial); one recurrent cell at T0 − 1 | real models (Qwen3.8-27B, Ornith-1.5-9B), live switches into the production Qwen3.8 build |
+| GQA family | `llama`, `mistral3`, `qwen3moe`, `hy_v3`, `phi3` (none of them LongRoPE), `gemma3`, `gemma4`, `gpt-oss`, `laguna`, `mimo2` | K/V of every layer for [0, T0) with per-layer KV heads and head sizes; a sliding cache's last n_swa + 1 positions; per-layer-kind RoPE (the sliding layers' own base, scale and rotary width; Laguna's plain RoPE on its sliding layers; the GGUF's `rope_freqs.weight` frequency factors of Llama, Mistral 3 and Gemma 4's full layers, Gemma 4's proportional RoPE); Gemma 4's shared KV layers hold nothing of their own | test-llama-archs and gguf-py Gemma 3/4 fixtures on both pins (codec byte-identical, RoPE bit-exact against the CPU cache rows, identity-hub translation restores the native logits); real Gemma-4 26B-A4B and 31B saves parse and write back byte for byte, and a translated-shape state of the 26B restores token for token with its MTP head (CPU) |
 | Other GQA hybrids | `qwen35moe`, `qwen3next`, `qwen4exp` (with its block indexer), `minimax-01`, `jamba`, `falcon-h1`, `granitehybrid`, `nemotron_h`, `nemotron_h_moe`, `plamo2`, `lfm2`, `lfm2moe` | the same | random test-llama-archs fixtures |
 | MLA | `deepseek2` (DeepSeek V2/V3, Kimi K2.x, GLM-4.7-Flash), `mistral4`, `hy_v4` | K-only rows [c_kv on its RMS shell, RoPE(k_pe)], no V; nextn layers as the zero rows a native save holds | tiny gguf-py and test-llama-archs fixtures |
 | DSA (MLA plus indexer keys) | `deepseek32`, `glm-dsa`, `dots3note`, `hy_v4` with an indexer | as MLA, plus indexer keys: zeros while the whole prompt fits in top_k, the hub's indexer ridge beyond; refused without a ridge | fixtures |
-| K-only hybrids (MLA + KDA) | `kimi-linear`, `kimi-k3`, `bailingmoe3` | MLA rows and one recurrent cell | test-llama-archs fixtures |
+| K-only hybrids (MLA + KDA) | `kimi-linear`, `kimi-k3`, `bailingmoe3` (M-RoPE on a7b94df2c when its GGUF has rope sections); `glm5-next` (a7b94df2c only: NoPE latents, k-pool indexer rows `[key \| gate \| pooled]`) | MLA rows and one recurrent cell; GLM5-Next's indexer keys and per-token gates as DSA's (zeros within top_k, the indexer ridge beyond) | test-llama-archs fixtures |
 | Pooled latent | `deepseek4`, target only | raw window of the last n_swa latents, CSA/HCA/LID pooled rows and compressor rings, synthesized; T0 rounded down to a multiple of 128 | test-llama-archs fixture |
 | Pure recurrent | `mamba`, `mamba2`, `rwkv6`, `rwkv6qwen2`, `rwkv7`, `arwkv7` | nothing: there is no per-token cache, so the bridge skips (`no-per-token-cache`) and the target prefills natively | the codec parses and writes them back byte for byte |
 
@@ -86,16 +87,73 @@ dots3note's sliding layers keep too few source cells for an identity test; it is
 a hub fitted with `fit_hub.py` on probe captures of random-weight models, which translates `qwen3`
 to and from `deepseek2`, `deepseek32` and `dots3note`: shapes, positions, the restore and
 decoding are checked, quality is not. For the hybrids the tests prove layouts and acceptance,
-not the cost of R0. No MLA, DSA, KDA, other hybrid or DeepSeek V4 model has been downloaded;
-real-model quality for those families is unmeasured.
+not the cost of R0. Real MLA (DeepSeek-V2-Lite-Chat, GLM-4.7-Flash), KDA-hybrid (Kimi-Linear,
+Ling-3.0-tiny), other hybrid (LFM2, granite-4.0-h, Falcon-H1, Jamba, Nemotron-3.5) and Gemma 4
+models are now local and smoke-tested at a7b94df2c (evidence/models/README.md), and DeepSeek-V4-Flash
+and Laguna are on disk but not loaded; none of them has been captured or translated yet, so
+real-model quality for those families is unmeasured (no DSA model fits this machine).
 
-Of the top 20, seven are translatable (Qwen3.8-27B measured; Qwen3.8-2.4T and Nex-N2-Pro as
-`qwen35moe`, Qwen3.8-Flash-Next as `qwen4exp`, GLM-5.3 as `glm-dsa`, Kimi K3 as `kimi-k3` and
-Kimi K2.7 Code as `deepseek2` on fixtures only) and DeepSeek V4 Pro is a target only (fixture
-only). MiMo-V2.6 Pro and Flash (`mimo2`), MiniMax-M3 (`minimax-m3`) and Hy3 (`hy_v3`) are in
-the pinned llama.cpp but have no state codec yet, and the other eight (GLM-5.3-Flash, DeepSeek
-V4.1 Flash, Motif 3, both K2 Horizon models, both Inkling models, Solar Open2) are not in the
-pinned llama.cpp. Locally, Gemma 3 and gpt-oss (sliding window + global) have no codec either.
+Of the top 20, eleven are translatable (Qwen3.8-27B measured; Qwen3.8-2.4T and Nex-N2-Pro as
+`qwen35moe`, Qwen3.8-Flash-Next as `qwen4exp`, GLM-5.3 as `glm-dsa`, Kimi K3 as `kimi-k3`, Kimi
+K2.7 Code as `deepseek2`, MiMo-V2.6 Pro and Flash as `mimo2`, Hy3 as `hy_v3` and GLM-5.3-Flash as
+`glm5-next`, a7b94df2c only, on fixtures only) and DeepSeek V4 Pro is a target only (fixture
+only). MiniMax-M3 (`minimax-m3`) is in llama.cpp but has no state codec yet (its
+`llama_kv_cache_msa`: a GQA cache plus a block-sparse indexer cache with K and V rows), and the
+other seven (DeepSeek V4.1 Flash, Motif 3, both K2 Horizon models, both Inkling models, Solar
+Open2) are not in either pinned llama.cpp. Locally, Gemma 3 and gpt-oss have codecs now too
+(fixtures; no local weights).
+
+A model can be ruled out by its GGUF beyond its architecture: LongRoPE (frequency factors
+`rope_factors_long`/`_short`, chosen by the context size: the long-context Phi-3/4 models, and
+Llama or Mistral 3 converted with a `longrope` scaling type) and embedding models (a vocabulary that appends EOS to
+every text, such as gte-Qwen2) are skipped by the bridge (`rope-factors`, `embedding-model`).
+`plamo2` caches are translated, but the engine does not read its PLaMo-2 vocabulary yet, so the
+bridge skips switches with it (`tokenizer`).
+
+### Both pinned runtimes
+
+The repository's runtime moved from llama.cpp 85d5703a3 to a7b94df2c (`runtime/` is a
+`scripts/build_runtime.py` build of a7b94df2c since October 5, 2026; the 85d5703a3 build is kept at
+`runtime-85d5703a3/`), while the production Qwen3.8 server still runs 85d5703a3. Every layout
+above is read and written on both pins
+([STATE_FORMAT_a7b94df.md](../linear_transfer/STATE_FORMAT_a7b94df.md)). They differ in three
+places: deepseek2/mistral4 nextn layers (kept by 85d5703a3's plain cache only), qwen4exp's indexer
+rows (V rows on 85d5703a3, `[key | pooled]` on a7b94df2c) and bailingmoe3 with rope sections
+(M-RoPE cells on a7b94df2c); GLM5-Next exists on a7b94df2c only. A state never names its pin, so
+kvstate reads it with the spec's revision, then the other one, and the parsed state's spec is the
+reading that fits; the translator takes the target layout from the template state's reading and
+the source RoPE from the source state's. A job may name each server's `build_info` (`/props`,
+which the bridge adds), and the engine's specs then take that pin (`engine.job_revision`); the
+daemon's memory guard sizes a translated state by the larger of the two layouts. The capture and
+state tools (`kv_probe.cpp`, `state_driver.cpp`, `vocab_tool.cpp`) build against either pin with
+`build_collector.py`, whose manifest records the pin; every experiment suite passes with either
+pin's binaries ([Tests on both pinned runtimes](../linear_transfer/README.md#tests-on-both-pinned-runtimes)).
+
+### Vocabularies and chat templates
+
+Translation aligns the two models by text, so the engine must spell each side's tokens exactly
+as llama.cpp prints them and render each conversation exactly as llama-server does:
+
+- **Vocabularies** (`engine.TOKENIZER_MODELS`): GPT-2 byte-level BPE (Qwen, Muse, DeepSeek, GLM,
+  Kimi, ...), Gemma 4's BPE (U+2581 for a space, `<0xNN>` byte tokens) and SentencePiece (Jamba).
+  A SentencePiece tokenizer with `add_space_prefix` puts a space before the text that starts a
+  prompt and after each special token; `engine.spelled_pieces` drops it from both sides' pieces
+  (and kv_probe's `tokenize` mode does the same), so the pieces join to the text. Every local
+  vocabulary (19 models, about 3 million ids) matches llama.cpp's own (`vocab_tool.cpp`,
+  `test_engine.RealVocabularyTest`) on both pins. Engines before the `vocabularies` feature read
+  GPT-2 BPE only; the bridge skips switches into or out of other vocabularies for them
+  (`tokenizer`).
+- **Templates**: `chat.py` follows llama.cpp's jinja (printing, `tojson` floats, ASCII-only
+  trimming, its filter set) and spans a segment inside the whitespace at its edges; a string
+  argument a template writes JSON-escaped renders exactly without a span. `template_check.py`'s
+  server mode compares it with `/apply-template` on 12 conversations × 8 template-option sets
+  (96 cases) per model, on the real servers or on *tokenizer twins* (tiny models carrying the
+  real tokenizer and template): parity 96/96 for all 19 local models on twins at both pins, and
+  56/56 on the real servers on the earlier battery.
+- **The source side**: the engine places the source's segments where the source's own template
+  renders them in the slot's history (`source_spans`), and only the rest by search
+  (`located_record`: the in-order occurrences that cover the most bytes); the report counts both
+  (`source_segments_rendered`, `source_segments_found`).
 
 ## 3. The hub (implemented: hub.py, fit_hub.py)
 
@@ -177,8 +235,9 @@ they are the attention sink every layer leans on.
 
 ```
 kvpark bridge switch --from A --to B     (or /kvpark switch B in Hermes, then /model B)
-  checks: architectures, media vs B's modalities, prompt length, DSA indexer keys,
-          DeepSeek V4 head decoders (src/kvpark/bridge/capabilities.py): else skip
+  checks: embedding models and LongRoPE, architectures, vocabularies vs the engine's features,
+          media vs B's modalities, prompt length, DSA indexer keys, DeepSeek V4 head
+          decoders (src/kvpark/bridge/capabilities.py): else skip
   B: /apply-template + /tokenize (what B will process, with the request's template options);
      layout template: a cached one-token native save (and its .resume on kvpark-patched
      servers, which tells the draft model's kind)
@@ -386,6 +445,13 @@ speculative state, no checkpoints.
   what follows. Acceptance 48% against 61% natively; the empty state alone costs about 5
   points (55% against 60% with the real state, same text). Translating the nextn layer as one
   more hub layer would recover that (not built).
+- **Shared** (Gemma 4's `gemma4-assistant` MTP head): its cache views the target's last sliding
+  and full layers and writes no cells of its own, so its draft blob is the 8-byte header
+  (`resume.classify_draft` kind `shared`) and a translated restore keeps the same 8 bytes; the
+  head then reads the restored target cache. Only `draft-mtp` runs it (`switch.DRAFT_TYPES`): a
+  server naming another speculative type with that blob is skipped. On the real 26B (CPU) a
+  translated-shape state continued token for token like the resident slot with the head
+  (acceptance as resident).
 - **Skipped** (`draft-unsupported`): full-attention DFlash drafts, plain and EAGLE3 draft models
   whose state looks like MTP's, hybrid drafts, and any draft on a DeepSeek V4 target.
 - Upstream servers neither save nor restore draft state: the draft rebuilds from the native
@@ -445,7 +511,7 @@ token's (a, s), so they cannot be rebuilt from the window, but they can be synth
 
 | Piece | Where |
 | --- | --- |
-| captures, state codec (every layout above, media slots, cuts), RoPE, chat rendering with llama-server's template context, probe and state driver | experiments/linear_transfer (kv_probe.cpp, state_driver.cpp, kvstate.py, chat.py, collect_v2.py, check_model_support.py) |
+| captures, state codec (every layout above, both pins, media slots, cuts), RoPE, chat rendering with llama-server's template context and jinja, template parity, llama.cpp's vocabularies, probe and state driver | experiments/linear_transfer (kv_probe.cpp, state_driver.cpp, vocab_tool.cpp, kvstate.py, chat.py, template_check.py, collect_v2.py, check_model_support.py) |
 | hub fit, onboarding, indexer ridges, DeepSeek V4 head kinds, evaluation; bundles (format 1 and 2) | experiments/universal_kv/hub.py, fit_hub.py, convert_hub.py, token_tables.py |
 | generic translation (any supported source → any supported target, layout from a target template state) | experiments/universal_kv/translate.py, backends/, state_writer.py |
 | DeepSeek V4 targets | experiments/universal_kv/dsv4_pool.py, dsv4_target.py |
@@ -454,7 +520,7 @@ token's (a, s), so they cannot be rebuilt from the window, but they can be synth
 | product: model registry, capability rules, `.resume` draft states, llama-server client, engine client, switch orchestration, CLI | src/kvpark/bridge (`kvpark bridge add / engine / engine-status / engine-stop / switch / undo / status`), docs/bridge.md |
 | evaluation: end-to-end ΔNLL for any pair; engine benchmarks; live multi-server tests | experiments/universal_kv/pair_eval.py, score_translate.py, bench_engine.py, live_bridge.py |
 
-## 13. Status and open problems (2026-10-04)
+## 13. Status and open problems (2026-10-05)
 
 Works today on an EVO-X2-class box, measured end to end on real models: Qwen3.8-27B →
 Muse-Glimmer-30B, → Ornith-1.5-9B and → Qwen3-4B are within 0.05 nats/token of native on
@@ -471,12 +537,13 @@ listed in section 2 are translated on fixtures. Open:
   loss-trained) maps are the next levers.
 - **Sources matter:** a small model's cache (Qwen3-4B) carries little of what a larger model
   needs (0–15% of the gap recovered); prefer the larger model as the source.
-- **Real models for the new families:** MLA, DSA, KDA hybrids, the other GQA hybrids and
-  DeepSeek V4 are validated on random-weight fixtures only. Quality (latent shell, indexer
-  ridge above top_k, R0 or a mean on those recurrent families, DeepSeek V4 head decoders) needs
-  downloads: e.g. DeepSeek-V2-Lite or Moonlight (~17 GB), Kimi-Linear-48B (~28–30 GB), small
-  LFM2, Granite or Falcon-H1 hybrids (1.3–9 GB), DeepSeek-V4-Flash IQ2 (~91 GB, both servers
-  stopped). No DSA model fits this machine.
+- **Real models for the new families:** MLA, DSA, KDA hybrids, the other GQA hybrids, the GQA
+  family (but Gemma 4's real saves) and DeepSeek V4 are validated on random-weight fixtures
+  only. The local models are downloaded and smoke-tested (DeepSeek-V2-Lite, GLM-4.7-Flash,
+  Kimi-Linear-48B, Ling-3.0-tiny, LFM2, granite, Falcon-H1, Jamba, Nemotron-3.5, Gemma 4 26B/31B;
+  DeepSeek-V4-Flash and Laguna not loaded, about 100 GB each); capturing them and onboarding them
+  into the hub is the next step. No DSA model fits this machine; MiniMax-M3's cache is not
+  modelled.
 - **DeepSeek V4:** target only, no drafts, numpy pooling (~21 s per 32K tokens at V4-Flash
   geometry); V4.1 waits for llama.cpp; as a source it needs a native prefill.
 - **Recurrent state:** the mean is calibrated for Qwen3.8 and Ornith; their `tools` groups come
@@ -487,10 +554,12 @@ listed in section 2 are translated on fixtures. Open:
 - **Images:** positions are exact, but a translated prefix in front of an image degraded the
   answer in 3 of 3 conversations. Native islands and better translation are the levers.
 - **Drafts:** MTP loses about 5 points of acceptance to its empty head cache; translating the
-  nextn layer is not built. Draft kinds other than DFlash/DSpark and MTP are skipped.
+  nextn layer is not built. Draft kinds other than DFlash/DSpark, MTP and the shared kind
+  (Gemma 4) are skipped.
 - **Engine portability:** CUDA, Apple MPS and macOS's peer check are untested; Windows runs the
   one-shot engine; float32 RoPE bit-identity relies on `addcmul` fusing the multiply-add, as it
-  does on this ROCm build. A ggml Vulkan engine (no torch dependency) is not built.
+  does on this ROCm build. The ggml Vulkan backend (`backends/ggml_backend.py`, no torch) runs the
+  same arithmetic on any Vulkan GPU.
 - **Template settings:** a target server's own template flags (`--reasoning-effort`,
   `--chat-template-kwargs`, ...) must be registered with the model, or switches into it end in
   `template-mismatch`; a tool-calling trace into Qwen3-4B was skipped the same way (its tool-call

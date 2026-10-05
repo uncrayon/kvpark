@@ -54,7 +54,7 @@ BUILD = REPO / "runtime-ggml" / "build"
 LIBRARY_NAMES = {"darwin": "libkvbridge.dylib", "win32": "kvbridge.dll"}
 CONFIGS = ("", "Release", "RelWithDebInfo")      # multi-config generators (MSVC) build into a subdirectory
 VERSION = 1                     # kvb_version() this module speaks
-ROPE_TYPES = ("norm", "neox", "imrope")
+ROPE_TYPES = ("norm", "neox", "imrope", "mrope")
 F32, F16, I32 = 0, 1, 2
 DTYPES = {"f32": F32, "f16": F16}
 OK, ERROR, OUT_OF_MEMORY, NOT_FINITE = 0, -1, -2, 1
@@ -201,22 +201,12 @@ def status(*, gpu=True):
 
 # -- RoPE tables ---------------------------------------------------------------------------------
 
-def _components(n_rot, sections):
-    """The position component (0 t, 1 h, 2 w, 3 e) of each rotated pair (ggml_mrope_cache_init, IMROPE)."""
+def _components(n_rot, sections, mode="imrope"):
+    """The position component (0 t, 1 h, 2 w, 3 e) of each rotated pair (kvstate.rope_components:
+    ggml_mrope_cache_init's interleaved IMROPE sectors or M-RoPE runs)."""
     if sections is None:
         return (0,) * (n_rot // 2)
-    total, out = sum(sections), []
-    for index in range(n_rot // 2):
-        sector = index % total
-        if sector % 3 == 1 and sector < 3 * sections[1]:
-            out.append(1)
-        elif sector % 3 == 2 and sector < 3 * sections[2]:
-            out.append(2)
-        elif sector % 3 == 0 and sector < 3 * sections[0]:
-            out.append(0)
-        else:
-            out.append(3)
-    return tuple(out)
+    return kvstate.rope_components(n_rot // 2, sections, interleaved=mode == "imrope")
 
 
 def rope_tables(rope, positions, *, inverse=False):
@@ -227,14 +217,15 @@ def rope_tables(rope, positions, *, inverse=False):
     f32 = np.float32
     positions = np.asarray(positions, dtype=np.int64)
     if positions.ndim == 1:
-        extrap = kvstate.rope_angles(positions, rope.n_dims, rope.base, rope.sections)
+        extrap = kvstate.rope_angles(positions, rope.n_dims, rope.base, rope.sections,
+                                     interleaved=rope.mode == "imrope")
     else:
         if rope.sections is None:
-            raise NotImplementedError("M-RoPE positions need an IMROPE rope")
+            raise NotImplementedError("M-RoPE positions need an IMROPE or M-RoPE rope")
         theta = positions.astype(f32)
         scale = kvstate.rope_theta_scale(rope.base, rope.n_dims)
         extrap = np.empty((len(theta), rope.n_dims // 2), dtype=f32)
-        for index, component in enumerate(_components(rope.n_dims, tuple(int(s) for s in rope.sections))):
+        for index, component in enumerate(_components(rope.n_dims, tuple(int(s) for s in rope.sections), rope.mode)):
             extrap[:, index] = theta[:, component]
             theta = (theta * scale).astype(f32)
     if rope.freq_factors is not None:

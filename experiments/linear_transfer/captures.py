@@ -17,16 +17,18 @@ SHA256 = re.compile(r"[0-9a-f]{64}")
 KEYS = ("k", "v", "q", "gate", "attn_out", "ik", "csa", "hca", "lid")
 # the DeepSeek V4 compress ratio of the layers holding each compressor key (report layers' "compress")
 COMPRESS = {"csa": 4, "lid": 4, "hca": 128}
-# "parallel": attention next to an SSM in the same layer (falcon-h1); "mlp": neither (nemotron-h)
+# "parallel": attention next to an SSM in the same layer (falcon-h1); "mlp": neither (nemotron-h);
+# "shared": attention over an earlier layer's cache, with none of its own (gemma4's shared KV layers)
 ATTENTION = ("full", "sliding", "parallel")
-LAYER_TYPES = ("full", "sliding", "recurrent", "parallel", "mlp")
+LAYER_TYPES = ("full", "sliding", "recurrent", "parallel", "mlp", "shared")
 TOKEN_ARRAYS = {"token_id": "<i4", "byte_end": "<i8", "special": "|u1"}
 # the architectures kv_probe captures (its arch_table rows with capture keys), and those whose
 # captures come from their saved states (collect_v2.py --mode states)
 ARCHITECTURES = ("qwen35", "muse-glimmer", "qwen3", "qwen3next", "qwen35moe", "qwen4exp", "plamo2", "minimax-01",
                  "jamba", "granitehybrid", "nemotron_h", "nemotron_h_moe", "falcon-h1", "lfm2", "lfm2moe", "deepseek2",
                  "mistral4", "deepseek32", "glm-dsa", "dots3note", "kimi-linear", "kimi-k3", "bailingmoe3", "hy_v4",
-                 "deepseek4")
+                 "deepseek4", "glm5-next", "llama", "mistral3", "phi3", "qwen3moe", "hy_v3", "gemma3", "laguna",
+                 "gpt-oss", "mimo2", "gemma4")
 
 
 def _load_npy(path, dtype, shape, *, mmap):
@@ -153,8 +155,10 @@ class Capture:
         self.byte_start[0] = 0
         self.byte_start[1:] = self.byte_end[:-1]
         self.byte_start[first] = 0
-        if np.any(self.byte_end <= self.byte_start):
-            raise ValueError("token byte_end offsets must increase strictly within each document")
+        # a token may spell nothing (byte_end repeats): kv_probe drops the space a SentencePiece
+        # tokenizer puts after a special token, which leaves a lone U+2581 piece empty
+        if np.any(self.byte_end < self.byte_start):
+            raise ValueError("token byte_end offsets must not decrease within each document")
         if np.any(self.token_id < 0) or np.any(self.special > 1):
             raise ValueError("token ids must be nonnegative and special flags 0/1")
 

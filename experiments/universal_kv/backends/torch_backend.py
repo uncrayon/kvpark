@@ -11,8 +11,9 @@ packed C-contiguous (float16 copies are uploaded as they are).
 
 RoPE is computed on the device from positions, never from precomputed tables (production
 contexts reach 262K positions). It mirrors kvstate's Rope (spec.rope(layer)): angles by the
-same float32 recurrence as ggml-cpu, freq_scale and the YaRN mix with kvstate's float32
-formulas, cos/sin in float64 rounded to float32, the magnitude, the forward rotation with the
+same float32 recurrence as ggml-cpu, frequency factors (llama3's, gemma4's proportional RoPE),
+freq_scale and the YaRN mix with kvstate's float32 formulas, cos/sin in float64 rounded to
+float32, the magnitude, the forward rotation with the
 CPU build's fused multiply-adds in float32 (torch.addcmul, which kvstate emulates in float64)
 and the inverse in float64, so keys agree with kvstate.cache_keys / pre_rope_keys to float32
 rounding (MPS, without float64, computes in float32). NoPE layers (Muse's global layers, the
@@ -38,7 +39,7 @@ from .base import Backend, hub_module, kvstate, latent_columns, stored_rows
 
 import handoff  # noqa: E402  (on sys.path through .base)
 
-ROPE_TYPES = ("norm", "neox", "imrope")
+ROPE_TYPES = ("norm", "neox", "imrope", "mrope")
 TORCH_DTYPES = {"f16": torch.float16, "f32": torch.float32}
 
 warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
@@ -63,32 +64,23 @@ def default_device():
 class Rope:
     """kvstate.Rope as the device evaluates it."""
 
-    neox: bool                  # NEOX/IMROPE pairs (i, i + n/2); else NORMAL pairs (2i, 2i + 1)
+    neox: bool                  # NEOX/IMROPE/M-RoPE pairs (i, i + n/2); else NORMAL pairs (2i, 2i + 1)
     n_rot: int
     offset: int                 # the pairs live in [offset, offset + n_rot) of the row
     theta_scale: float          # float32 powf(base, -2/n_rot), as kvstate.rope_theta_scale
-    components: tuple           # per pair: position component 0 t, 1 h, 2 w, 3 e (IMROPE sectors)
+    components: tuple           # per pair: position component 0 t, 1 h, 2 w, 3 e (IMROPE/M-RoPE sectors)
     freq_scale: float = 1.0
     mix: tuple = None           # YaRN: per pair float32 ramp * ext_factor; None without YaRN
     magnitude: float = 1.0      # float32 factor on cos/sin
+    factors: tuple = None       # per pair frequency factor the angle is divided by (rope_freqs.weight)
 
 
-def _components(n_rot, sections):
+def _components(n_rot, sections, mode="imrope"):
+    """kvstate.rope_components of a rope's pairs (ggml_mrope_cache_init: interleaved IMROPE sectors,
+    M-RoPE runs); every pair takes the token position without sections."""
     if sections is None:
         return (0,) * (n_rot // 2)
-    total, out = sum(sections), []
-    for index in range(n_rot // 2):
-        sector = index % total
-        # ggml_mrope_cache_init with is_imrope (interleaved sectors)
-        if sector % 3 == 1 and sector < 3 * sections[1]:
-            out.append(1)
-        elif sector % 3 == 2 and sector < 3 * sections[2]:
-            out.append(2)
-        elif sector % 3 == 0 and sector < 3 * sections[0]:
-            out.append(0)
-        else:
-            out.append(3)
-    return tuple(out)
+    return kvstate.rope_components(n_rot // 2, sections, interleaved=mode == "imrope")
 
 
 @functools.lru_cache(maxsize=None)
@@ -107,9 +99,10 @@ def device_rope(rope):
         ramp = (f32(1) - np.minimum(f32(1), np.maximum(f32(0), y))).astype(f32)
         mix = tuple(float(m) for m in (ramp * f32(rope.ext_factor)).astype(f32))
     sections = None if rope.sections is None else tuple(int(x) for x in rope.sections)
+    factors = None if rope.freq_factors is None else tuple(float(f32(x)) for x in rope.freq_factors)
     return Rope(rope.mode != "norm", int(rope.n_dims), int(rope.offset),
-                float(kvstate.rope_theta_scale(rope.base, rope.n_dims)), _components(rope.n_dims, sections),
-                float(f32(rope.freq_scale)), mix, float(rope.magnitude()))
+                float(kvstate.rope_theta_scale(rope.base, rope.n_dims)), _components(rope.n_dims, sections, rope.mode),
+                float(f32(rope.freq_scale)), mix, float(rope.magnitude()), factors)
 
 
 def layer_rope(spec, layer):
@@ -336,6 +329,9 @@ class TorchBackend(Backend):
             else:
                 extrap[:, index] = theta[:, 0 if text else component]
             theta = theta * scale               # float32, as ggml's theta *= theta_scale
+        if rope.factors is not None:
+            # ggml_rope_cache_init's theta / freq_factors[i], in float32 (gemma4's 1e30 leaves a pair unrotated)
+            extrap = extrap / torch.tensor(rope.factors, dtype=f32, device=self.device)
         angles = extrap * torch.tensor(rope.freq_scale, dtype=f32, device=self.device)
         if rope.mix is not None:
             mix = torch.tensor(rope.mix, dtype=f32, device=self.device)

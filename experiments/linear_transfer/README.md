@@ -65,9 +65,29 @@ python experiments/linear_transfer/build_collector.py \
 The build directory must be new. Keep the resulting executable and its
 `.build.json` manifest together. The manifest fingerprints the executable and
 llama/ggml libraries; collection refuses changed artifacts. The runtime
-libraries remain where they were built. If using a different runtime revision,
-pass `--runtime-revision` and validate compatibility yourself. Initial support
-is for the pinned Qwen35 and Muse Glimmer graph implementations.
+libraries remain where they were built. The manifest names the runtime's llama.cpp
+commit (`runtime_source_revision`) beside the build's own build info (`runtime_build_info`,
+`b<number>-<commit>`). The commit comes from the build info when that names a known pin
+(`scripts/build_runtime.py` sets it: a7b94df2c), and a `--runtime-revision` naming the
+other pin is refused. The defaults, `runtime/source` and `runtime/build`, are the repository's
+runtime, a `scripts/build_runtime.py` build of a7b94df2c (`b11398-a7b94df2c`) since October 5,
+2026. A runtime built before that names kvpark's own commit (the 85d5703a3 build that was
+`runtime/` until then, kept intact at `runtime-85d5703a3/`, reports `b26-0115c80`), which cannot
+be checked: pass `--runtime-revision` (for that one, `85d5703a3b1b47243213a39059a6e3076c92733a`)
+with `--llama-source runtime-85d5703a3/source --llama-build runtime-85d5703a3/build`, which the
+manifest records as given. `kvstate.llama_revision_of` reads the revision back. Initial support is for the pinned
+Qwen35 and Muse Glimmer graph implementations; both pins are supported (see [Tests on both
+pinned runtimes](#tests-on-both-pinned-runtimes)).
+
+A build made before the move links its libraries from `runtime/build/bin` by absolute path,
+which now holds a7b94df2c's: its manifest no longer matches, so the collection scripts refuse it
+rather than run it on the wrong pin. In this checkout that is `evidence/linear-transfer/`
+`collector-build`, `collector-build-v1check-a1`, `collector-v2`, `collector-v3`,
+`kv-probe-build-a1`, `-a2`, `-p2-earlystop`, `-s1`, `-s2` and `kv-probe-review-r1` (kept as the
+record of the runs that used them; `kv-probe-build-u1`, `kv-probe-build-v1gpu` and
+`chat-apply-build-u1` link their own runtimes and still work). To repeat such a run at
+85d5703a3, build into a new directory with the 85d5703a3 options above; to follow this walkthrough
+here, pick a new `--output` instead of `evidence/linear-transfer/collector-build`.
 
 Create UTF-8 JSONL corpus files with one independent raw document per line:
 
@@ -326,11 +346,12 @@ v2 adds new files; the v1 scripts above still work with the v1 collector.
 
 | File | Role |
 | --- | --- |
-| `kv_probe.cpp` (`kvpark-kv-probe`) | One pass per model with modes `tokenize` (vocabulary only), `collect` (K, V and optionally Q, gate and attention output for chosen layers), `patch-score` (overwrite K/V at given positions, then score NLL, KL and top-1 against native), `save-state` (prefill, then write `llama_state_seq_save_file` files at chosen token counts) and `seed-score` (restore a state file, decode the rest, score like `patch-score`). `--cache-type f32\|f16`, `--flash-attn off\|on` and `--swa-full on\|off` select the cache layout; the defaults are the v2 settings. Supported GGUF architectures come from a table in the source: `qwen35` (Qwen3.5/3.8, Ornith), `muse-glimmer`, the dense `qwen3`, the GQA hybrids `qwen3next`, `qwen35moe`, `qwen4exp`, `plamo2`, `minimax-01`, `jamba`, `granitehybrid`, `nemotron_h`, `nemotron_h_moe`, `falcon-h1`, `lfm2`, `lfm2moe`, the MLA/DSA family `deepseek2`, `mistral4`, `deepseek32`, `glm-dsa`, `dots3note`, `kimi-linear` (an MLA K row is captured as its latent plus the pre-RoPE `k_pe`, DSA indexer keys as key `ik`) and `deepseek4` (keys `k`, `csa`, `hca`, `lid`); `kimi-k3`, `bailingmoe3` and `hy_v4` name no pre-RoPE key in their graphs and get captures from f32 state saves (`collect_v2.py --mode states`) |
+| `kv_probe.cpp` (`kvpark-kv-probe`) | One pass per model with modes `tokenize` (vocabulary only), `collect` (K, V and optionally Q, gate and attention output for chosen layers), `patch-score` (overwrite K/V at given positions, then score NLL, KL and top-1 against native), `save-state` (prefill, then write `llama_state_seq_save_file` files at chosen token counts) and `seed-score` (restore a state file, decode the rest, score like `patch-score`). `--cache-type f32\|f16`, `--flash-attn off\|on` and `--swa-full on\|off` select the cache layout; the defaults are the v2 settings. Supported GGUF architectures come from a table in the source: `qwen35` (Qwen3.5/3.8, Ornith), `muse-glimmer`, the dense `qwen3`, the GQA hybrids `qwen3next`, `qwen35moe`, `qwen4exp`, `plamo2`, `minimax-01`, `jamba`, `granitehybrid`, `nemotron_h`, `nemotron_h_moe`, `falcon-h1`, `lfm2`, `lfm2moe`, the MLA/DSA family `deepseek2`, `mistral4`, `deepseek32`, `glm-dsa`, `dots3note`, `kimi-linear` (an MLA K row is captured as its latent plus the pre-RoPE `k_pe`, DSA indexer keys as key `ik`) and `deepseek4` (keys `k`, `csa`, `hca`, `lid`); `kimi-k3`, `bailingmoe3` and `hy_v4` name no pre-RoPE key in their graphs and get captures from f32 state saves (`collect_v2.py --mode states`). `tokenize` checks that the pieces join to the text; for a SentencePiece vocabulary with `add_space_prefix` (Jamba) it drops the space the tokenizer puts before the text that starts the input and after each special token, as the bridge engine's `spelled_pieces` does (a lone `▁` token there spells nothing, so `byte_end` may repeat) |
 | `kvstate.py` | Parses and writes llama.cpp sequence states (slot files and `llama_state_seq_get_data` blobs) for Muse's iSWA cache, Qwen3.5's hybrid memory, a dense model's plain KV cache (`qwen3`), the MLA, DSA and K-only hybrid layouts listed under [MLA, DSA and K-only hybrid states](#mla-dsa-and-k-only-hybrid-states), every recurrent family under [Recurrent families and media slots](#recurrent-families-and-media-slots), including slot files that hold images or audio, and DeepSeek V4's pooled caches under [DeepSeek V4 pooled caches](#deepseek-v4-pooled-caches) (f16, f32 and q8_0); builds Muse, dense, MLA and DSA slot files from per-layer K/V (K only for MLA and indexer rows); cuts states at a token index (`truncate_state`); RoPE (YaRN and frequency factors included) and de-rotation helpers matching the CPU runtime |
 | `state_driver.cpp` (`kvpark-state-driver`) | Loads any GGUF on the CPU and drives the sequence-state API with token ids: `save` (decode, `llama_state_seq_save_file`, optionally decode a continuation and dump its logits), `restore-decode` (load a state into a fresh context, decode a continuation, dump float32 logits) and `capture` (dump named graph tensors through the eval callback; with `--state` it also saves that run's state, whose cache rows are the captured graph's). `--parallel N` (`-np`), `--seq S` (the slot every mode uses), `--rs-seq N` (rollback snapshots), `--cache-type f16\|f32\|q8_0` and `save --partial NEW_BLOB` (the PARTIAL_ONLY blob a server checkpoint keeps). No architecture table |
 | `fixtures_media.py` | Media fixtures: a stdlib PNG writer, the 5120-wide tiny Qwen3.5 the local Qwen3.8 mmproj can feed, 64-wide qwen3/muse-glimmer models with vision tokens, a random tiny `qwen3vl_merger` projector, and a throwaway `llama-server` wrapper (slot save/restore, `/completion` with images) |
-| `chat_apply.cpp` (`kvpark-chat-apply`), `template_check.py` | llama.cpp's own chat-template application (`common_chat_templates_apply`, as `llama-server --jinja`) and its comparison with `chat.py` renders, as text and as probe tokens |
+| `chat_apply.cpp` (`kvpark-chat-apply`), `template_check.py` | llama.cpp's own chat-template application (`common_chat_templates_apply`, as `llama-server --jinja`) and its comparison with `chat.py` renders, as text and as probe tokens; `template_check.py` also compares against a live server's `/apply-template` (server mode, see [Chat templates and vocabularies](#chat-templates-and-vocabularies)) |
+| `vocab_tool.cpp` (`kvpark-vocab`) | llama.cpp's own vocabulary, loaded `vocab_only`: `info`, `pieces OUT.jsonl` (every id's `llama_token_to_piece(special=true)`), `tokenize IN.jsonl OUT.jsonl`; the reference `experiments/universal_kv/test_engine.py` RealVocabularyTest compares the engine's vocabularies with (`KVPARK_VOCAB_TOOL`) |
 | `check_model_support.py` | One-document end-to-end check of a model: tokenize, collect, save-state, seed-score (native, saved and rebuilt states) and `kvstate` round trip and de-rotation |
 | `fetch_dataset.py`, `build_corpus.py`, [`corpus_v2.md`](corpus_v2.md) | Pinned SmolTalk2 subsets turned into the chat-format calibration corpus |
 | `chat.py` | Renders conversations with each GGUF's own chat template and records the byte span of every message segment |
@@ -362,14 +383,16 @@ The probe, `kvstate` and `captures` also support the dense GGUF architecture `qw
 whole head, one plain KV section in its slot files); Ornith-1.5-9B runs through the `qwen35`
 path (32 trunk layers after its nextn block, 8 attention layers, IMROPE 64 of 256). Build
 the probe against the Vulkan runtime, and the template reference against a runtime with
-`libllama-common` (the 85d5703a3 `llama-server` build):
+`libllama-common` (both were 85d5703a3 builds, with the headers of the 85d5703a3 source that is
+`runtime-85d5703a3/source` now; at a7b94df2c use `runtime-next/src` with `runtime-next/build-vulkan`
+and `runtime/build`):
 
 ```bash
-experiments/linear_transfer/.venv/bin/python experiments/linear_transfer/build_collector.py --llama-build evidence/linear-transfer/runtime-vulkan-t1 --target kvpark-kv-probe --output evidence/linear-transfer/kv-probe-build-u1
+experiments/linear_transfer/.venv/bin/python experiments/linear_transfer/build_collector.py --llama-source runtime-85d5703a3/source --llama-build evidence/linear-transfer/runtime-vulkan-t1 --runtime-revision 85d5703a3b1b47243213a39059a6e3076c92733a --target kvpark-kv-probe --output evidence/linear-transfer/kv-probe-build-u1
 ```
 
 ```bash
-experiments/linear_transfer/.venv/bin/python experiments/linear_transfer/build_collector.py --llama-build evidence/linear-transfer/muse-server-85d5703a3 --target kvpark-chat-apply --output evidence/linear-transfer/chat-apply-build-u1
+experiments/linear_transfer/.venv/bin/python experiments/linear_transfer/build_collector.py --llama-source runtime-85d5703a3/source --llama-build evidence/linear-transfer/muse-server-85d5703a3 --runtime-revision 85d5703a3b1b47243213a39059a6e3076c92733a --target kvpark-chat-apply --output evidence/linear-transfer/chat-apply-build-u1
 ```
 
 Render a corpus with a model's template, compare it with llama.cpp's application, and check
@@ -507,13 +530,16 @@ the KV view's padding to 256 cells does not count (measured: the driver's view i
 cells wide) and neither, by the same mask, do other sequences' cells in a unified cache
 (inferred from the source; the driver runs one sequence).
 
-Build a CPU test build of the pinned runtime out of tree (no download; the UI, server and
-tools stay off) with the CPU flags of `runtime/build`, then the state driver against it:
+Build a CPU test build of a pinned runtime out of tree (no download; the UI, server and
+tools stay off) with the CPU flags of the product build, then the state driver against it. These
+states were first studied at 85d5703a3, with the 85d5703a3 source that was `runtime/` then
+(`runtime-85d5703a3/source` now); `runtime/source` builds the same at a7b94df2c (see [Tests on both
+pinned runtimes](#tests-on-both-pinned-runtimes) for both):
 
 ```bash
-cmake -S runtime/source -B /tmp/kvpark-build-tests -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_COMMON=ON -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_MTMD=OFF -DLLAMA_OPENSSL=OFF -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_BMI2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_AVX512=OFF -DGGML_OPENMP=ON -DGGML_BACKEND_DL=OFF -DGGML_VULKAN=OFF -DGGML_HIP=OFF -DGGML_CUDA=OFF
+cmake -S runtime-85d5703a3/source -B /tmp/kvpark-build-tests -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_COMMON=ON -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_MTMD=OFF -DLLAMA_OPENSSL=OFF -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_BMI2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_AVX512=OFF -DGGML_OPENMP=ON -DGGML_BACKEND_DL=OFF -DGGML_VULKAN=OFF -DGGML_HIP=OFF -DGGML_CUDA=OFF
 cmake --build /tmp/kvpark-build-tests -j 24 --target test-llama-archs llama ggml llama-common
-cmake -S experiments/linear_transfer -B /tmp/kvpark-state-driver -DLLAMA_SOURCE=$PWD/runtime/source -DLLAMA_LIBRARY_DIR=/tmp/kvpark-build-tests/bin -DCMAKE_BUILD_TYPE=Release
+cmake -S experiments/linear_transfer -B /tmp/kvpark-state-driver -DLLAMA_SOURCE=$PWD/runtime-85d5703a3/source -DLLAMA_LIBRARY_DIR=/tmp/kvpark-build-tests/bin -DCMAKE_BUILD_TYPE=Release
 cmake --build /tmp/kvpark-state-driver --target kvpark-state-driver
 ```
 
@@ -636,8 +662,9 @@ id, which is the sha256 of the uploaded file, and per-entry sizes; never pixels 
   `truncate_state(state, cut)` keeps are those before `MediaTokens.pos_next(cut)`: after an
   M-RoPE image the two numbers differ.
 
-Measured on throwaway CPU servers (`runtime/build/bin/llama-server`, ports 18540-18549, a
-random 128 × 96 PNG, `--image-max-tokens 16`):
+Measured on throwaway CPU servers (the 85d5703a3 `llama-server` that was `runtime/build` then,
+`runtime-85d5703a3/build/bin/llama-server` now; ports 18540-18549, a random 128 × 96 PNG,
+`--image-max-tokens 16`):
 
 - The 5120-wide tiny Qwen3.5 with the local Qwen3.8 mmproj saves one image chunk of 4 × 3 = 12
   cells with n_pos 4 and the PNG's sha256 as id; the 12 cells sit at position 15 with `ext`
@@ -727,3 +754,277 @@ KVPARK_STATE_DRIVER=/tmp/kvpark-state-driver/kvpark-state-driver KVPARK_LLAMA_AR
 ```bash
 KVPARK_LLAMA_SERVER=$PWD/runtime/build/bin/llama-server KVPARK_QWEN_MMPROJ=/srv/models/qwen3.8-27b-q8/mmproj-Qwen3.8-27B-F16.gguf experiments/linear_transfer/.venv/bin/python -m unittest discover -s experiments/linear_transfer -p 'test_media_state.py'
 ```
+
+(`runtime/build` is a7b94df2c; `KVPARK_LLAMA_SERVER=$PWD/runtime-85d5703a3/build/bin/llama-server`
+runs the same tests on 85d5703a3.)
+
+### GQA family, Gemma 4 and GLM5-Next
+
+`kvstate.GQA_ARCHITECTURES` are the plain-attention models that take the server's RoPE settings
+(unlike `qwen3`, `qwen35` and Muse, whose specs refuse runtime overrides):
+
+| Memory | Architectures |
+| --- | --- |
+| `kv` (one cache) | `llama`, `mistral3`, `qwen3moe`, `hy_v3` (Hy3), `phi3` (Phi-3/4; llama.cpp disables the window its GGUFs declare), and `gemma3`/`laguna` without a sliding window |
+| `iswa` (`base`, `swa`) | `gemma3` (period 6), `gemma4` (flags), `gpt-oss` (period 2), `laguna` (period 4, the full layer first), `mimo2` (flags) |
+
+Each layer has its own KV heads and head sizes (`key_length_swa`/`value_length_swa` on sliding
+layers: the real Gemma-4 26B-A4B has 8 KV heads of 256 on its sliding layers and 2 of 512 on the
+full ones; MiMo's K is wider than its V). A transposed V cache of differing widths is padded in
+memory, but each layer's section still holds its own width. `GQA_CONVENTIONS` gives each
+architecture's sliding pattern, the sliding layers' RoPE base and scale (never the context's),
+their rotary width (`ModelSpec.n_rot_swa`), whether they take the context's YaRN (laguna's run
+plain RoPE), and frequency factors (`rope_freqs.weight`, read by `from_gguf`:
+`ROPE_FREQ_FACTOR_ARCHITECTURES`): llama3's on every layer, and gemma4's proportional RoPE on its
+full layers, factor 1 on the first quarter of the pairs and 1e30 (unrotated) on the rest (cut to
+the first n_rot / 2, as `ggml_rope_ext` reads them, when a GGUF rotates less than the whole head).
+gemma4's shared KV layers (`attention.shared_kv_layers`, Gemma 4 E2B/E4B) attend to an earlier
+layer's cache and sit in no section (layer kind `shared`). Phi GGUFs with `rope_factors_long/short`
+and no `rope_freqs.weight` are refused (llama.cpp picks one by the context size). These tensors
+are not in the metadata, so a spec of one of `ROPE_FACTOR_TENSOR_ARCHITECTURES` (the
+`rope_freqs.weight` ones and phi3) built by `from_metadata` alone refuses `rope()` until it is
+given `rope_freq_factors=` (`kvstate.gguf_rope_freq_factors(path, spec)` reads them from whichever
+file of a split GGUF holds them; `()` when the GGUF has none); a phi3 spec never rotates with
+unknown LongRoPE factors. (The bridge's engine builds its specs from metadata, so
+`kvpark.bridge.capabilities` skips llama, mistral3, gemma4 and phi3, `ROPE_FACTOR_GQA`, until
+`engine.py` passes these factors.) mistral3 reads its YaRN betas and log multiplier from the GGUF
+(`YARN_GGUF_ARCHITECTURES`). Nextn layers are refused except for mimo2 and hy_v3, whose trunk
+caches filter them out on both pins.
+
+`glm5-next` (GLM-5.3-Flash, a7b94df2c only: `ARCHITECTURE_SINCE`) is memory `hybrid_idx` like
+qwen4exp: NoPE MLA latent rows without k_pe on its attention layers, KDA rows, and K-only indexer
+rows `[key | gate | pooled]`. The gate is per-token data (the pool's weight logit), so
+`pre_rope_keys` returns `[key | gate]` and `cache_keys` adds the zero pooled slot a restore
+re-pools (`ModelSpec.indexer_key_slots`); the hub's indexer ridge predicts both.
+
+Gemma 4's MTP head (`gemma4-assistant`) keeps no cache of its own: its iSWA cache views the
+target's last sliding and full layers, and a cache sharing another context's cells writes
+nothing, so the `.resume` draft blob is 8 bytes (io magic, sequence id). `kvpark.bridge.resume`
+classifies it as `shared` and gives a translated restore the same 8 bytes.
+
+kv_probe captures them (`Kcur_normed` or build_qkv's `Kcur`; gemma4's V is `Vcur_normed`, a bare
+RMS norm; MiMo names its 2-D projections, and with a fused `attn_qkv`, as the MiMo-V2.5
+conversions write it, the probe reads Q, K and V as columns of the projection `wqkv`
+`[Q | K | V]`, patches included); hy_v3 and glm5-next name no pre-RoPE key and serve tokenize,
+save-state and seed-score only. The probe labels sliding layers as the runtime it is built
+against does: `build_collector.py` passes the pin to CMake (`KVPARK_LLAMA_REVISION`), and an
+85d5703a3 probe, whose gemma3, gpt-oss and laguna loaders read a period only, refuses flags that
+disagree with it, as kvstate does; a period of 0 makes every layer slide. A `collect` document with `"save_at": [its token
+count]` also gets the sequence state of the capture run itself, and `check_model_support.py`
+checks the captures against it (`capture_state` in `summary.json`): on Vulkan a capture run and a
+plain run of Gemma-4 differ by more than rounding (the eval callback splits the graph), so only the
+same run's cache can equal its captures.
+
+Fixtures: `tiny_fixture.create_gemma_fixture` (gguf-py Gemma 3 and Gemma 4, both pins: per-layer
+heads, proportional RoPE, shared KV layers, V-less full layers) and test-llama-archs' llama,
+mistral3, qwen3moe, hy_v3, phi3, gemma3, gpt-oss, laguna, mimo2 and glm5-next models
+(85d5703a3's writes no gemma3, laguna, mimo2 or glm5-next model; those tests skip there), plus
+copies with YaRN, linear scaling, partial rotation and other sliding bases. Checked:
+
+- `test_layouts.GqaFamilyTests`: byte-identical codecs (f16/f32, flash attention on/off, and the
+  PARTIAL_ONLY blobs server checkpoints keep), RoPE bit for bit against the CPU build's cache rows
+  (runtime YaRN included), re-rotated, moved (+37 positions) and built states restoring like
+  native ones, truncated states equal to native prefix saves byte for byte. The tiny Gemma models
+  run their FFN GELU through a float16 table on the CPU, so a one-ulp key change can move their
+  logits by ~3e-4 of the scale (`GELU_TOLERANCE`); a wrong RoPE base misses by far more.
+- `test_layouts.RecurrentFamilyTests` covers glm5-next's codec, row sizes, R0 and truncation.
+- `test_kv_probe_integration.KvProbeGqaTests`: captures against the saved cache (K de-rotated,
+  V exact), the layer table with gemma4's shared layers; a fused-QKV copy of the mimo2 model
+  (`tiny_fixture.fuse_qkv`) captures Q, K and V bit for bit like the split one, and patch-score
+  with its own K/V rows scores exactly like the native run (CPU and Vulkan); gemma3 pattern flags
+  and a period of 0 against each pin's saved states.
+- `experiments/universal_kv/test_families.py`: each model translated into itself through an
+  identity hub (amplified test-llama-archs models, the tiny Gemma ones) restores to its native
+  logits, with prompts longer than the sliding windows, so a translated sliding section keeps only
+  the last n_swa + 1 cells; gemma4 with a 16-token window also takes part in the fitted
+  cross-family hub (as a target its sliding layers hold the last 17 cells; as a source its global
+  layers are encoded).
+
+On the real models (`evidence/universal-kv/s1b-gemma4`, the a7b94df2c Vulkan build): slot saves of
+the Gemma-4 26B-A4B (258 MB, 2,346 tokens) and 31B (1.03 GB) parse and write back byte for
+byte, with and without the gemma4-assistant MTP head (its draft blob: 8 bytes); restoring the
+re-serialized save, or a state shaped like a translated one (the sliding layers' last n_swa + 1
+cells from two saves, no checkpoints, the translated 8-byte draft), continues with the copied
+note intact and, for the latter, reuses every cell. On the CPU build (`real-cpu/`) the 26B-A4B
+with its MTP head continues from that translated shape token for token like the resident slot
+(24 tokens, the same draft acceptance); without MTP both it and a restore of the server's own
+save leave the resident run at a near-tie 16 tokens in (MoE routing amplifies the rounding of a
+different cell order), while kvstate's byte-identical rewrite scores exactly like the native save. `check_model_support.py` with the Vulkan probe:
+the capture run's own state holds V exactly and K within 1.3 f16 ulps of the captured keys
+re-rotated (GPU RoPE rounding); with `--device cpu` the separate save-state run matches too
+(both models: V exact, K within 0.71 ulp) and the rebuilt state scores exactly as the saved one.
+
+### Chat templates and vocabularies
+
+The bridge engine renders a conversation with the target's own chat template and requires the
+target server's tokens to spell that rendering byte for byte, so `chat.py` follows llama.cpp's
+jinja engine (`common/jinja`, a7b94df2c) where it differs from jinja2:
+
+- printed values: `None` and mappings print nothing, a list prints its items back to back;
+  `tojson` writes floats as llama.cpp does (a tool argument 1.0 prints as `1`);
+- strings: `trim`, `strip`/`lstrip`/`rstrip` remove ASCII whitespace only (a `chars` argument is
+  a byte set), `upper`/`lower`/`capitalize`/`title` change ASCII letters only, `split()` splits on
+  one space, `length` counts UTF-8 bytes, `~` and `+` with a string follow llama.cpp's `as_string`
+  (None or undefined next to a string is empty), `format` fills `{}`;
+- filters: `default` treats None as missing, `string`, `join`, `reverse`, `safe` (plain text, never
+  HTML-escaped), `select`/`reject`; those llama.cpp lacks (`sum`, `round`, `escape`, `center`, ...)
+  are refused, as the server refuses them; Laguna's `{% generation %}` tag renders its body.
+
+Known remaining differences: `dict | dictsort` printed directly (llama.cpp prints nothing; no
+local template does it), llama.cpp's per-part capitalisation of strings joined from template and
+input parts, and integers beyond int64. Where the pins differ (on 85d5703a3 a mapping is not
+`sequence`/`iterable`, and `select`/`reject` on non-objects is an error) `chat.py` follows
+a7b94df2c; no local template depends on it.
+
+In a running chat (`chat.render(..., live=True)`, what the engine uses) a segment keeps the
+whitespace at its edges and is spanned without it (a whitespace-only segment gets no span), and
+a string argument a template writes JSON-escaped renders exactly but has no span; it is listed in
+`Rendered.escaped`. Corpus mode (`live=False`) still requires stripped texts and verbatim
+segments.
+
+`template_check.py` compares `chat.py` with llama.cpp in two ways:
+
+- corpus mode, `--chat-apply BIN --conversations JSONL [--probe PROBE]`: against
+  `kvpark-chat-apply` (llama.cpp's `common_chat_templates_apply`) and the probe's tokens;
+- server mode, `--server-binary LLAMA_SERVER` (a throwaway CPU server on ports 18660-18669, or
+  the ten from `KVPARK_TWIN_PORT`, that loads a *tokenizer twin*: a tiny model carrying every
+  `tokenizer.*` key of the GGUF, so the template, BOS/EOS text and vocabulary are the real ones
+  and no weights are loaded) or `--url URL`
+  (a running server of the model): `/apply-template` against `chat.render` in each of
+  `chat.server_contexts`, in the engine's order. The default conversations are `BATTERY`, 12
+  conversations (system prompts, earlier reasoning, tool calls and answers, every JSON argument
+  type, non-ASCII text, whitespace at message edges, NBSP and U+3000, escaped and float/null
+  arguments, a Hermes agent transcript) under the 8 `OPTION_SETS` (reasoning effort, thinking,
+  preserve_reasoning): 96 cases per model; `--conversations JSONL` compares other conversations.
+  The report gives `parity`, the counts, `by_conversation` and the escaped segments per case.
+
+```bash
+experiments/linear_transfer/.venv/bin/python experiments/linear_transfer/template_check.py --model /srv/models/qwen3-4b-instruct/Qwen3-4B-Instruct-2507-Q8_0.gguf --server-binary runtime/build/bin/llama-server --output /tmp/parity-qwen3-4b.json
+```
+
+All 19 local models have parity, 96/96, on twins at both pins (`runtime-next/build-cpu`, a7b94df2c,
+which `runtime/build` now builds too, and `runtime-85d5703a3/build`, 85d5703a3), and 56/56 on the
+real servers of the smoke run
+(evidence/models/README.md). `test_chat.LlamaServerParityTests` runs the same comparison on
+twins, plus a set of expressions where jinja2 and llama.cpp differ, against
+`KVPARK_LLAMA_SERVER` (any llama-server; CPU is enough).
+
+The engine reads three kinds of vocabulary (`experiments/universal_kv/engine.py`
+`TOKENIZER_MODELS`): GPT-2 byte-level BPE, Gemma 4's BPE (U+2581 for a space, `<0xNN>` byte
+tokens) and SentencePiece (Jamba), each id decoded as llama.cpp's `token_to_piece` prints it.
+A SentencePiece tokenizer with `add_space_prefix` puts a space before the text that starts a
+prompt and before each text after a special token; `engine.spelled_pieces` and kv_probe's
+`tokenize` both drop it, so the pieces join to the text. `vocab_tool.cpp` (`kvpark-vocab`) is
+llama.cpp's own vocabulary for comparison; `test_engine.RealVocabularyTest`
+(`KVPARK_VOCAB_TOOL`) compares every local vocabulary whole (0 differences over about 3 million
+ids) and spells llama.cpp's tokenizations of the BATTERY renderings back, on both pins:
+
+```bash
+python3 experiments/linear_transfer/build_collector.py --llama-source runtime-next/src --llama-build runtime-next/build-cpu --target kvpark-vocab --output runtime-kvtools/kvpark-vocab --jobs 16
+(cd experiments/universal_kv && KVPARK_VOCAB_TOOL=$PWD/../../runtime-kvtools/kvpark-vocab/kvpark-vocab ../linear_transfer/.venv/bin/python -m unittest test_engine.RealVocabularyTest)
+```
+
+## Tests on both pinned runtimes
+
+kvpark moved from llama.cpp 85d5703a3 to a7b94df2c (October 2026); the production Qwen3.8
+server still runs 85d5703a3, so `kvstate` reads and writes both pins' states.
+[STATE_FORMAT_a7b94df.md](STATE_FORMAT_a7b94df.md) lists what changed. The state layouts
+differ in three places: deepseek2/mistral4 nextn layers, which only 85d5703a3's plain cache keeps;
+qwen4exp's indexer cache, K-only on a7b94df2c with `[key | pooled]` rows when its QSA layers pool
+blocks, plus V rows on 85d5703a3; and bailingmoe3, whose cells carry the M-RoPE extension on
+a7b94df2c when its GGUF has rope sections. `ModelSpec.llama_revision` (default a7b94df2c, or
+from `from_gguf(..., llama_revision=...)`, which also takes a commit or llama-server's
+`/props` `build_info`) picks the layouts. The parsers read a state with the spec's revision,
+then the other one, and the parsed state's spec is the reading that fits. `translate.py` writes
+the target template's reading. Old-pin states parse and re-serialize byte for byte.
+
+Build the probe and the state driver against the new pin out of tree (the CPU build with tests,
+`runtime-next/build-cpu`, also provides `test-llama-archs`; the value collector and a Vulkan probe
+build the same way, from `runtime-next/build-cpu` and `runtime-next/build-vulkan`):
+
+```bash
+python3 experiments/linear_transfer/build_collector.py --llama-source runtime-next/src --llama-build runtime-next/build-cpu --target kvpark-kv-probe --output runtime-kvtools/kvpark-kv-probe --jobs 16
+python3 experiments/linear_transfer/build_collector.py --llama-source runtime-next/src --llama-build runtime-next/build-cpu --target kvpark-state-driver --output runtime-kvtools/kvpark-state-driver --jobs 16
+python3 experiments/linear_transfer/build_collector.py --llama-source runtime-next/src --llama-build runtime-next/build-cpu --target kvpark-collect-values --output runtime-kvtools/kvpark-collect-values --jobs 16
+python3 experiments/linear_transfer/build_collector.py --llama-source runtime-next/src --llama-build runtime-next/build-vulkan --target kvpark-kv-probe --output runtime-kvtools/kvpark-kv-probe-vulkan --jobs 16
+python3 experiments/linear_transfer/build_collector.py --llama-source runtime-next/src --llama-build runtime-next/build-cpu --target kvpark-vocab --output runtime-kvtools/kvpark-vocab --jobs 16
+```
+
+(`runtime/source` and `runtime/build`, the repository's runtime at a7b94df2c since October 5,
+2026, give the same tools; `runtime-next/build-cpu` is built with the tests, so it also provides
+`test-llama-archs`.)
+
+Run every experiment suite with the new binaries (from the repository root):
+
+```bash
+export KVPARK_STATE_DRIVER=$PWD/runtime-kvtools/kvpark-state-driver/kvpark-state-driver KVPARK_KV_PROBE=$PWD/runtime-kvtools/kvpark-kv-probe/kvpark-kv-probe KVPARK_LLAMA_ARCHS=$PWD/runtime-next/build-cpu/bin/test-llama-archs
+(cd experiments/linear_transfer && .venv/bin/python -m unittest discover -q -p 'test_*.py')
+(cd experiments/universal_kv && ../linear_transfer/.venv/bin/python -m unittest discover -q -p 'test_*.py')
+(cd experiments/universal_kv && ~/venvs/rocm/bin/python -m unittest discover -q -p 'test_*.py')
+```
+
+(`KVPARK_COLLECTOR=$PWD/runtime-kvtools/kvpark-collect-values/kvpark-collect-values`,
+`KVPARK_KV_PROBE_VULKAN=$PWD/runtime-kvtools/kvpark-kv-probe-vulkan/kvpark-kv-probe` and
+`KVPARK_VOCAB_TOOL=$PWD/runtime-kvtools/kvpark-vocab/kvpark-vocab` add the collector, Vulkan probe
+and vocabulary checks; `KVPARK_LLAMA_SERVER=$PWD/runtime/build/bin/llama-server` the llama-server
+ones, whose throwaway servers take ports 18540-18549, 18574-18578 and 18660-18669 unless
+`KVPARK_MEDIA_PORT`, `KVPARK_TEMPLATE_PORT` and `KVPARK_TWIN_PORT` move them), and with the
+85d5703a3 binaries. Those need an 85d5703a3
+source: `runtime-85d5703a3/source` (the 85d5703a3 runtime that was `runtime/` until October 5,
+2026, kept intact), or an export of the commit from a llama.cpp checkout that has it (here
+`runtime-next/checkout`; the slot-resume patch touches the server only, so the test build and the
+tools need none). Build `test-llama-archs` as the CPU test build above, then the driver, the
+probe and the vocabulary tool with an explicit revision (the build info names no pin):
+
+```bash
+mkdir -p /tmp/kvpark-85d5703a3/source
+git -C runtime-next/checkout archive 85d5703a3b1b47243213a39059a6e3076c92733a | tar -x -C /tmp/kvpark-85d5703a3/source
+cmake -S /tmp/kvpark-85d5703a3/source -B /tmp/kvpark-85d5703a3/build-tests -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_COMMON=ON -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_MTMD=OFF -DLLAMA_OPENSSL=OFF -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_BMI2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_AVX512=OFF -DGGML_OPENMP=ON -DGGML_BACKEND_DL=OFF -DGGML_VULKAN=OFF -DGGML_HIP=OFF -DGGML_CUDA=OFF
+cmake --build /tmp/kvpark-85d5703a3/build-tests -j 24 --target test-llama-archs llama ggml llama-common
+for target in kvpark-state-driver kvpark-kv-probe kvpark-vocab; do python3 experiments/linear_transfer/build_collector.py --llama-source /tmp/kvpark-85d5703a3/source --llama-build /tmp/kvpark-85d5703a3/build-tests --runtime-revision 85d5703a3b1b47243213a39059a6e3076c92733a --target $target --output /tmp/kvpark-85d5703a3/$target --jobs 16; done
+export KVPARK_STATE_DRIVER=/tmp/kvpark-85d5703a3/kvpark-state-driver/kvpark-state-driver KVPARK_KV_PROBE=/tmp/kvpark-85d5703a3/kvpark-kv-probe/kvpark-kv-probe KVPARK_LLAMA_ARCHS=/tmp/kvpark-85d5703a3/build-tests/bin/test-llama-archs KVPARK_VOCAB_TOOL=/tmp/kvpark-85d5703a3/kvpark-vocab/kvpark-vocab KVPARK_LLAMA_SERVER=$PWD/runtime-85d5703a3/build/bin/llama-server
+(cd experiments/linear_transfer && .venv/bin/python -m unittest discover -q -p 'test_*.py')
+(cd experiments/universal_kv && ../linear_transfer/.venv/bin/python -m unittest discover -q -p 'test_*.py')
+(cd experiments/universal_kv && ~/venvs/rocm/bin/python -m unittest discover -q -p 'test_*.py')
+```
+
+The tests take the driver's revision from the layout kvstate reads in a save of a deepseek2
+fixture with a nextn block (`tiny_fixture.driver_revision`, which refuses a manifest naming the
+other revision), and check the pin-specific layouts against it. Every test-llama-archs model is written by
+`tiny_fixture.llama_archs_model`, with the settings both pins' binaries share: weights from
+N(0, 0.01) (a7b94df2c's default is 0.1, `-d`) and an indexer `top_k` of 8 (a7b94df2c writes
+131072, where every cell is selected and no test reaches past top_k). The other fixture changes
+of a7b94df2c stay: qwen4exp's compress ratio 4 (k-pool rows), bailingmoe3's rope sections
+`[8, 12, 12, 0]` (M-RoPE), negative Mamba A. `test_layouts` adds a copy of either pin's
+bailingmoe3 model with sections `[4, 6, 3, 5]`, which leave pairs to the fourth component and
+wrap around their sum: a7b94df2c's k_pe rows match kvstate's M-RoPE (and miss NEOX), and the
+85d5703a3 saves, NORM without cell extensions, read as 85d5703a3 with a spec of either revision. With these fixtures every tolerance holds unchanged on
+both pins (the DeepSeek V4 oracle's 1e-6 and the bit-exact Mamba R0 restore included; with
+a7b94df2c's defaults, N(0, 0.1) weights and top_k 131072, both missed by rounding-level amounts and
+zeroed lightning-indexer rows no longer moved the logits). Expectations that differ by pin and are
+selected by the driver's revision:
+
+- deepseek2-nextn sections (the nextn zero layer on 85d5703a3 only), qwen4exp's indexer rows
+  (zero V rows on 85d5703a3, `[key | pooled]` with a pooled key in each complete block's last
+  row on a7b94df2c);
+- the hybrids whose logits barely hear attention (`test_families`): qwen3next, qwen35moe and
+  qwen4exp on 85d5703a3, only qwen4exp on a7b94df2c.
+
+Measured on October 4, 2026: with the a7b94df2c tools built from this tree (plus the value
+collector and the Vulkan probe), linear_transfer runs 436 tests OK (9 skipped: chat template,
+GGUF metadata and llama-server checks); with 85d5703a3 tools (pre-existing builds, and builds
+of this tree's sources from the recipe above) 436 OK (24 skipped, the collector and Vulkan
+checks and the architectures 85d5703a3's test-llama-archs writes no model of included).
+universal_kv runs 207 OK on either pin (15 skipped on a7b94df2c, 16 on 85d5703a3; 5 and 6 with
+the ROCm torch Python). The media slot tests (`test_media_state.MediaSlotTests`, with the Qwen3.8 projector)
+pass against both the 85d5703a3 `llama-server` (`runtime-85d5703a3/build/bin/llama-server`) and
+`runtime-next/build-cpu/bin/llama-server` (a7b94df2c, like `runtime/build/bin/llama-server`).
+
+Measured on October 5, 2026, with every variable above set (the state driver, probe,
+`test-llama-archs`, value collector, Vulkan probe and vocabulary tool of each pin, and
+`KVPARK_LLAMA_SERVER` = `runtime/build` or `runtime-85d5703a3/build`): linear_transfer runs 441
+tests OK in either venv (5 skipped on a7b94df2c, 6 on 85d5703a3: `KVPARK_CHAT_APPLY`,
+`KVPARK_GGUF_METADATA_TESTS` and `KVPARK_QWEN_MMPROJ` opt-ins, and on 85d5703a3 the mimo2 model its
+test-llama-archs does not write); universal_kv runs 208 OK (12 and 13 skipped in the
+linear_transfer venv, which has no torch; 2 and 3 with the ROCm torch Python; 85d5703a3 also
+skips GLM5-Next).

@@ -92,6 +92,10 @@ def main(argv=None):
         t0 = next(c["t0"] for c in doc["conditions"] if c["name"] == f"sanity_{args.tail}")
         native_path = run.state("target", document_id, t0)
         template = kvstate.read_file(native_path, target_spec)
+        # the run's states may come from either pinned runtime: what follows uses their own reading
+        # (translate adopts the template's and the source state's; the direct mapper and the window
+        # take the template's)
+        reading = template.state.spec
         source = translate.Side(args.source_name, source_spec, run.records("source")[document_id],
                                 run.tokens("source", document_id), gguf=args.source_model)
         target = translate.Side(args.target_name, target_spec, run.records("target")[document_id],
@@ -106,14 +110,14 @@ def main(argv=None):
         info = {"t0": t0}
         state, report = translate.translate(source_state, source, target, hubs, t0=t0, template=template,
                                             fill=args.fill, table=tables.get(table_path),
-                                            swa_cells=target_spec.n_swa or None, **recurrent)
+                                            swa_cells=reading.n_swa or None, **recurrent)
         kvstate.write_new(out / "hub.state", state.to_bytes())
         conditions.append({"name": "hub", "state_file": str(out / "hub.state")})
         info["hub"] = report
         if mapper is not None:
             started = time.perf_counter()
             result = handoff.build_handoff(source_state, source.record, source.tokens, target.record, target.tokens,
-                                           mapper, t0=t0, muse_spec=target_spec, content_policy="mapped",
+                                           mapper, t0=t0, muse_spec=reading, content_policy="mapped",
                                            fill_policy=args.fill, table=tables.get(table_path))
             kvstate.write_new(out / "direct.state", result.state.to_bytes())
             conditions.append({"name": "direct", "state_file": str(out / "direct.state")})

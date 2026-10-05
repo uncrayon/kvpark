@@ -20,6 +20,12 @@
 // There is no architecture table: whatever llama.cpp loads, this drives. A JSON report goes to
 // stdout. Logits are float32 .npy [n_next, n_vocab]; captures are float32 .npy files with the
 // ggml shape reversed (numpy order) plus manifest.json naming each node's op, type and shape.
+//
+// It builds unchanged against both pinned runtimes, 85d5703a3 and a7b94df2c (where llama_batch_init
+// and llama_decode are a compatibility path over llama_batch_ext / llama_process), so the layouts of
+// either pin's states can be checked; build_collector.py's manifest names the runtime, and
+// tiny_fixture.driver_revision reads it (else from a save). A restore that llama.cpp refuses fails
+// restore-decode on both; a7b94df2c also zeroes the cells it had written before failing.
 
 #include "llama.h"
 #include "ggml-backend.h"

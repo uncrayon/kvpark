@@ -1,14 +1,16 @@
 """Tiny models of the MLA/DSA family and the K-only hybrids, llama.cpp drivers and exact hubs for
 the end-to-end tests in test_families.py.
 
-Models come from tiny_fixture.create_mla_fixture (gguf-py: byte vocabulary, dense, random
-weights) and from llama.cpp's test-llama-archs (random MoE models without a vocabulary:
-token ids only), and amplified copies of either (Models.amplified: latents on the RMS shell and
-attention loud enough in the logits for a restore to show it). The kvpark state driver
+Models come from tiny_fixture.create_mla_fixture and create_gemma_fixture (gguf-py: byte
+vocabulary, dense, random weights) and from llama.cpp's test-llama-archs (random MoE models
+without a vocabulary: token ids only), and amplified copies of them (Models.amplified: latents on
+the RMS shell and attention loud enough in the logits for a restore to show it). The kvpark state driver
 (linear_transfer/state_driver.cpp) saves and restores their states and decodes after a restore;
 kvpark-kv-probe captures hub views of the gguf-py ones.
 Every helper here is driven by environment variables (DRIVER, LLAMA_ARCHS, PROBE) and the tests
-skip without them.
+skip without them. The binaries may come from either pinned runtime (85d5703a3 or a7b94df2c): the
+specs take the driver's revision (tiny_fixture.driver_revision), and the test-llama-archs models are
+written with the settings both pins share (tiny_fixture.llama_archs_model).
 
 An *identity hub* holds one model whose encoder and decoder are exact identities per layer
 (z is the concatenation of the model's own pre-RoPE K rows, or value rows), so translating a
@@ -33,7 +35,8 @@ sys.path.insert(0, str(HERE.parent / "linear_transfer"))
 import gguf_tensors  # noqa: E402
 import hub as hub_module  # noqa: E402
 import kvstate  # noqa: E402
-from tiny_fixture import YARN_V2, copy_with_metadata, create_mla_fixture  # noqa: E402
+from tiny_fixture import YARN_V2, copy_with_metadata, create_gemma_fixture, create_mla_fixture, driver_revision, \
+    llama_archs_model  # noqa: E402
 
 DRIVER = os.environ.get("KVPARK_STATE_DRIVER")
 _RUNS = itertools.count()
@@ -50,10 +53,17 @@ TINY = {
     "glm-dsa": ("glm-dsa", {"layers": 4, "indexer_types": [1, 0, 1, 0]}),
     "dots3note": ("dots3note", {"layers": 4}),
 }
+# gguf-py Gemma models (byte vocabulary): name -> (architecture, create_gemma_fixture options)
+GEMMA = {"gemma4": ("gemma4", {}), "gemma4-shared": ("gemma4", {"layers": 8, "shared_kv_layers": 2}),
+         "gemma3-tiny": ("gemma3", {}), "gemma4-w16": ("gemma4", {"sliding_window": 16})}
 # test-llama-archs models (random weights, vocabulary of 128 ids, no tokenizer): the K-only MLA hybrids
 # and hy_v4 (576/512 rows, MoE), and the hybrids with GQA attention next to recurrent layers
 ARCHS = ("kimi-linear", "kimi-k3", "bailingmoe3", "hy_v4", "qwen3next", "qwen35moe", "qwen4exp", "minimax-01", "jamba",
          "falcon-h1", "granitehybrid", "nemotron_h", "nemotron_h_moe", "plamo2", "lfm2", "lfm2moe")
+# test-llama-archs models of the GQA family (kvstate.GQA_ARCHITECTURES; 85d5703a3's test-llama-archs writes
+# no gemma3, laguna or mimo2) and GLM5-Next (a7b94df2c only; NoPE MLA + KDA + a k-pool indexer)
+GQA_ARCHS = ("llama", "mistral3", "qwen3moe", "hy_v3", "phi3", "gemma3", "gpt-oss", "laguna", "mimo2")
+LATER_ARCHS = ("glm5-next",)
 # The test-llama-archs weights keep MLA latents far inside the RMS shell (mean square << eps, where
 # real models sit far outside it) and leave attention a whisper in the logits (zeroing every
 # attention row moves them by ~1e-3 of their scale). Models.amplified copies a model with the c_kv
@@ -67,6 +77,7 @@ class Models:
     def __init__(self, root):
         self.root = Path(root)
         self.paths, self.vocab = {}, {}
+        self._revision = None
 
     def path(self, name):
         if name not in self.paths:
@@ -75,23 +86,42 @@ class Models:
                 path = self.root / f"{name}.gguf"
                 create_mla_fixture(path, architecture, **options)
                 self.paths[name], self.vocab[name] = path, 256
-            elif name.startswith("archs-") and name[6:] in ARCHS:
+            elif name in GEMMA:
+                architecture, options = GEMMA[name]
+                path = self.root / f"{name}.gguf"
+                create_gemma_fixture(path, architecture, **options)
+                self.paths[name], self.vocab[name] = path, 256
+            elif name.startswith("archs-") and name[6:] in ARCHS + GQA_ARCHS + LATER_ARCHS:
                 if not LLAMA_ARCHS:
                     raise unittest.SkipTest("set KVPARK_LLAMA_ARCHS for the test-llama-archs fixtures")
-                out = self.root / "archs"
-                out.mkdir(exist_ok=True)
-                result = subprocess.run([LLAMA_ARCHS, "-a", name[6:], "-s", "7", "-o", str(out)], capture_output=True,
-                                        text=True, timeout=600)
-                if result.returncode != 0:
-                    raise RuntimeError(f"test-llama-archs {name[6:]}: {result.stderr[-400:]}")
-                # <arch>-moe.gguf or <arch>-dense.gguf, whichever the arch has
-                self.paths[name], self.vocab[name] = sorted(out.glob(f"{name[6:]}-*.gguf"))[0], 128
+                try:
+                    # <arch>-moe.gguf or <arch>-dense.gguf, whichever the arch has
+                    path = llama_archs_model(LLAMA_ARCHS, name[6:], self.root / "archs")
+                except RuntimeError:
+                    raise unittest.SkipTest(f"this test-llama-archs writes no {name[6:]} model") from None
+                if name == "archs-phi3":
+                    # kvstate refuses rope_factors_long/short (picked by the context size); Phi-3 GGUFs
+                    # without longrope carry neither
+                    plain = self.root / "phi3-plain.gguf"
+                    if not plain.exists():
+                        copy_with_metadata(path, plain, drop_tensors=["rope_factors_long.weight",
+                                                                      "rope_factors_short.weight"])
+                    path = plain
+                self.paths[name], self.vocab[name] = path, 128
             else:
                 raise KeyError(name)
         return self.paths[name]
 
+    @property
+    def revision(self):
+        """The llama.cpp revision DRIVER runs on (the default revision without a driver)."""
+        if self._revision is None:
+            self._revision = driver_revision(DRIVER, self.root / "revision") if DRIVER else kvstate.LLAMA_REVISION
+        return self._revision
+
     def spec(self, name, runtime=None):
-        return kvstate.ModelSpec.from_gguf(self.path(name), runtime=runtime)
+        """The model's spec on the driver's revision (the layouts its saves have)."""
+        return kvstate.ModelSpec.from_gguf(self.path(name), runtime=runtime, llama_revision=self.revision)
 
     def amplified(self, name):
         """The name of a copy of model `name` with LATENT_GAIN and OUTPUT_GAIN applied (written on first use)."""

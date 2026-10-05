@@ -336,9 +336,15 @@ def calibration_conversations(paths, *, concat_chars, exclude):
     return out
 
 
+def probe_spec(args, gguf):
+    """The model's spec at the revision of args.probe's runtime (its build manifest): the layouts and RoPE
+    of the states it saves, which are read strictly with it (kvstate.parse_state)."""
+    return kvstate.ModelSpec.from_gguf(gguf, llama_revision=kvstate.llama_revision_of(Path(args.probe)))
+
+
 def calibrate(args):
     artifacts = prepare_output(args)
-    spec = kvstate.ModelSpec.from_gguf(args.model)
+    spec = probe_spec(args, args.model)
     exclude = set()
     for item in args.exclude or ():
         exclude |= {c["id"] for c in chat.read_conversations(Path(item))}
@@ -367,7 +373,7 @@ def calibrate(args):
         for doc, cuts in chunk:
             for cut in cuts:
                 path = state_path(states, doc["record"]["document_id"], cut)
-                state = kvstate.read_file(path, spec)
+                state = kvstate.read_file(path, spec, strict=True)
                 accumulator.add(state, group=doc["group"], depth=cut)
                 bins.add(state, group=f"depth-{max(b for b in DEPTH_BINS if b <= cut)}", depth=cut)
                 del state
@@ -450,14 +456,14 @@ def build_conditions(doc, t0s, states, built, strategies, mean, *, translated=No
 
     translated: {t0: StateFile} of translated states (combined case); default: the native saves."""
     did = doc["record"]["document_id"]
-    prefix = kvstate.read_file(state_path(states, prefix_id(did), doc["H"]), doc["spec"])
+    prefix = kvstate.read_file(state_path(states, prefix_id(did), doc["H"]), doc["spec"], strict=True)
     conditions, diagnostics, timings = [], {}, []
     sanity = sanity_tails(t0s)
     out = Path(built) / did
     out.mkdir(parents=True, exist_ok=True)
     for tail, t0 in sorted(t0s.items()):
         native_path = state_path(states, did, t0)
-        native = kvstate.read_file(native_path, doc["spec"])
+        native = kvstate.read_file(native_path, doc["spec"], strict=True)
         check_rewrite(native_path, native, t0)
         base = translated[t0] if translated is not None else native
         if tail in sanity:
@@ -477,7 +483,7 @@ def build_conditions(doc, t0s, states, built, strategies, mean, *, translated=No
 
 def run(args):
     artifacts = prepare_output(args)
-    spec = kvstate.ModelSpec.from_gguf(args.model)
+    spec = probe_spec(args, args.model)
     mean = recurrent_init.RecurrentMean.load(args.mean) if args.mean else None
     strategies = strategy_list(args.strategies)
     tails = [int(t) for t in args.tails.split(",")]
@@ -545,7 +551,7 @@ def run(args):
 def combined(args):
     artifacts = prepare_output(args)
     (s_name, s_gguf), (t_name, t_gguf) = (item.split("=", 1) for item in (args.source, args.target))
-    s_spec, t_spec = kvstate.ModelSpec.from_gguf(s_gguf), kvstate.ModelSpec.from_gguf(t_gguf)
+    s_spec, t_spec = probe_spec(args, s_gguf), probe_spec(args, t_gguf)
     mean = recurrent_init.RecurrentMean.load(args.mean) if args.mean else None
     strategies = strategy_list(args.strategies)
     tails = [int(t) for t in args.tails.split(",")]
@@ -583,13 +589,14 @@ def combined(args):
         for doc in chunk:
             did, source = doc["record"]["document_id"], doc["source"]
             source_state = kvstate.read_file(state_path(directory / "states-s", source["record"]["document_id"],
-                                                        source["P"]), s_spec)
-            prefix = kvstate.read_file(state_path(directory / "states", prefix_id(did), doc["H"]), t_spec)
+                                                        source["P"]), s_spec, strict=True)
+            prefix = kvstate.read_file(state_path(directory / "states", prefix_id(did), doc["H"]), t_spec,
+                                       strict=True)
             source_side = translate.Side(s_name, s_spec, source["record"], source["tokens"], gguf=s_gguf)
             target_side = translate.Side(t_name, t_spec, doc["record"], doc["tokens"], gguf=t_gguf)
             translated, reports = {}, {}
             for tail, t0 in doc["t0s"].items():
-                template = kvstate.read_file(state_path(directory / "states", did, t0), t_spec)
+                template = kvstate.read_file(state_path(directory / "states", did, t0), t_spec, strict=True)
                 translated[t0], report = translate.translate(source_state, source_side, target_side, hub, t0=t0,
                                                              template=template, native_state=prefix,
                                                              native_prefix=doc["H"], backend=backend)

@@ -3,13 +3,16 @@
 Probe runs (each into a new directory under --output):
   tokenize    vocabulary only; its token ids must equal those of every later run
   collect     k/v of every attention layer (Kcur_normed and Vcur, the MLA row [c_kv | k_pe] and its
-              c_kv view, ...) and a DSA model's indexer keys (ik), same cache layout as below
+              c_kv view, ...) and a DSA model's indexer keys (ik), same cache layout as below, and the
+              sequence state of that same run at the document's end (probes that save one)
   save-state  a sequence state after --seed-tokens tokens (default: the largest multiple of
               --batch before the first scored token, so the seeded run repeats the native ubatches)
   seed-score  native vs the saved state (on one device this must give KL exactly 0) and vs a
               "rebuilt" state whose K/V were replaced by the collected values (K re-rotated with
               kvstate.cache_keys, V cast to the cache type); recurrent sections stay native
-kvstate checks on the saved file: parse_file/to_bytes byte round trip, section layout and
+kvstate checks on the saved files (the collect run's own state, "capture_state": a GPU's second
+run can differ by more than rounding, e.g. by a MoE routing flip; and the save-state run's,
+"state"): parse_file/to_bytes byte round trip, section layout and
 positions, V == collected V (cast to the cache type; an MLA layer's V is the c_kv view of its K
 row, kvstate.value_rows), and kvstate.pre_rope_keys(stored K) vs the collected pre-RoPE K (and
 indexer keys) in units of the cache type's spacing at each rotated pair's norm (Hadamard-rotated
@@ -140,10 +143,12 @@ def check_rings(spec, part, arrays, model, n):
 
 def check_state(spec, data, tokens, arrays, dtype, model=None):
     """kvstate checks of one saved state against the collected arrays (a DeepSeek V4 model's rings also
-    need its GGUF, `model`, for the APE)."""
+    need its GGUF, `model`, for the APE). The checks use the state's reading (parsed.state.spec: spec's
+    model on the llama.cpp revision whose layout the bytes have)."""
     parsed = kvstate.parse_file(data, spec)
+    spec = parsed.state.spec
     n = len(parsed.tokens)
-    out = {"round_trip_bytes_equal": parsed.to_bytes() == data, "n_tokens": n,
+    out = {"round_trip_bytes_equal": parsed.to_bytes() == data, "n_tokens": n, "llama_revision": spec.llama_revision,
            "tokens_equal": bool(np.array_equal(parsed.tokens, tokens[:n])), "sections": [], "layers": {}}
     parsed.check_positions()
     np_dtype = np.float16 if dtype == "f16" else np.float32
@@ -206,7 +211,8 @@ def check_state(spec, data, tokens, arrays, dtype, model=None):
 
 def rebuild(spec, parsed, arrays, dtype):
     """The parsed state with every KV layer's K/V (and indexer keys) replaced by collected values (K via
-    cache_keys); MLA layers store no V, nextn layers keep their zero rows."""
+    cache_keys, in the state's reading); MLA layers store no V, nextn layers keep their zero rows."""
+    spec = parsed.state.spec
     np_dtype = np.float16 if dtype == "f16" else np.float32
     for part, layout in zip(parsed.state.parts, spec.layouts(parsed.state.flags)):
         if not isinstance(part, kvstate.KVCache):
@@ -247,10 +253,12 @@ def main(argv=None):
     if args.output.exists() or args.output.is_symlink():
         raise FileExistsError(f"output already exists: {args.output}")
     probe, model = args.probe.resolve(), args.model.resolve()
-    _, _, artifacts = verify_runtime(probe)
+    _, identity, artifacts = verify_runtime(probe)
     environment = collect_v2.probe_environment(artifacts)
     collect_v2.memory_check(model, args.skip_memory_check)
-    spec = kvstate.ModelSpec.from_gguf(model)
+    # the layouts of the probe's runtime (its manifest's revision; a state settles it anyway)
+    spec = kvstate.ModelSpec.from_gguf(model, llama_revision=kvstate.llama_revision_of(
+        identity["runtime_source_revision"]))
     records = collect_v2.read_documents(args.docs, "tokenize")
     args.output.mkdir(parents=True)
     output = args.output.resolve()
@@ -281,10 +289,11 @@ def main(argv=None):
     if "ik" in wanted or spec.memory == "dsv4":
         (output / "capture-spec.json").write_text(json.dumps({key: "all" for key in wanted}), encoding="utf-8")
         capture_options = ["--capture-spec", output / "capture-spec.json"]
-    report, timings["collect"] = run_probe(probe, environment, "collect", model, [base], output / "collect",
-                                           layout + capture_options, args.timeout)
+    report, timings["collect"] = run_probe(probe, environment, "collect", model, [dict(base, save_at=[n])],
+                                           output / "collect", layout + capture_options, args.timeout)
     device = report.get("device")
     arrays = {(c["key"], c["layer"]): np.load(output / "collect" / c["file"]) for c in report["captures"]}
+    captured_state = (report["documents"][0].get("states") or [None])[0]
     attention = wanted["k"]
     if sorted(arrays) != sorted((key, il) for key, layers in wanted.items() for il in layers):
         raise ValueError("collect did not capture k/v (and indexer keys) of exactly the layers of the spec")
@@ -302,7 +311,12 @@ def main(argv=None):
     entry = report["documents"][0]["states"][0]
     state_path = output / "save-state" / entry["file"]
     data = state_path.read_bytes()
+    capture_checks = None
+    if captured_state is not None:
+        captured = (output / "collect" / captured_state["file"]).read_bytes()
+        _, capture_checks = check_state(spec, captured, token_ids, arrays, args.cache_type, model)
     parsed, state_checks = check_state(spec, data, token_ids, arrays, args.cache_type, model)
+    spec = parsed.state.spec
     state_checks.update(bytes=len(data), pos_min=entry["pos_min"], pos_max=entry["pos_max"])
     rebuilt_path = output / "rebuilt.state"
     kvstate.write_file(rebuilt_path, rebuild(spec, parsed, arrays, args.cache_type))
@@ -338,7 +352,7 @@ def main(argv=None):
                  "kv_lora": sorted({spec.kv_lora[il] for il in attention}) if spec.kv_lora else None,
                  "indexer_layers": wanted.get("ik"),
                  "rope_type": spec.rope_type, "n_rot": spec.n_rot, "rope_freq_base": spec.rope_freq_base,
-                 "rope_sections": list(spec.rope_sections)},
+                 "rope_sections": list(spec.rope_sections), "llama_revision": spec.llama_revision},
         "probe": str(probe), "device": device,
         "settings": {"cache_type": args.cache_type, "flash_attn": args.flash_attn, "batch": args.batch,
                      "ctx": ctx, "threads": args.threads, "max_scored": args.max_scored},
@@ -347,6 +361,7 @@ def main(argv=None):
                      "n_scored": document["n_scored"]},
         "tokenize_matches_collect": bool(np.array_equal(token_ids, np.load(output / "collect" / "token_id.npy"))),
         "tokenize_matches_wrapper": bool(np.array_equal(token_ids, ids)),
+        "capture_state": capture_checks,
         "state": state_checks,
         "seed_score": conditions,
         "seconds": {key: round(value, 2) for key, value in timings.items()},
@@ -354,6 +369,7 @@ def main(argv=None):
     (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({"output": str(output), "architecture": spec.architecture, "document": summary["document"],
                       "state_round_trip": state_checks["round_trip_bytes_equal"], "worst": state_checks["worst"],
+                      "capture_state_worst": capture_checks["worst"] if capture_checks else None,
                       "seed_kl_mean": conditions["seed"]["kl_mean"], "seed_identical": conditions["seed"]["scores_identical_to_native"],
                       "rebuilt_kl_mean": conditions["rebuilt"]["kl_mean"], "rebuilt_kl_max": conditions["rebuilt"]["kl_max"],
                       "seconds": summary["seconds"]}))

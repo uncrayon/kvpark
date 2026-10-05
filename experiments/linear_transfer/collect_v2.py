@@ -361,8 +361,11 @@ def capture_from_states(saved, spec, output):
     holding each document's state at its end (f32 cache, flash attention off): per trunk attention
     layer k = the cached K rows de-rotated (kvstate.pre_rope_keys), v = the stored V (an MLA layer's
     c_kv view, kvstate.value_rows) and, for a model with an indexer section, ik = the de-rotated
-    indexer keys. The values
-    are the cache's own, up to the de-rotation's rounding. Returns the report."""
+    indexer keys (kvstate.pre_rope_keys: the key, and GLM5-Next's per-token gate beside it,
+    ModelSpec.indexer_key_slots). The values are the cache's own, up to the de-rotation's rounding.
+    `spec` must be the revision of the runtime that saved the states (the probe's manifest,
+    kvstate.llama_revision_of): they are read strictly with it, since another revision's reading
+    would lay out or de-rotate them otherwise (bailingmoe3 with rope sections). Returns the report."""
     import kvstate
     saved, output = Path(saved), Path(output)
     report = json.loads((saved / "report.json").read_text(encoding="utf-8"))
@@ -383,7 +386,8 @@ def capture_from_states(saved, spec, output):
     output.mkdir()
     arrays, captures = {}, []
     for key, layer in wanted:
-        heads, dim = (1, spec.indexer.head_size) if key == "ik" else spec.head_shape(layer, key)
+        heads, dim = ((1, spec.indexer.head_size * spec.indexer_key_slots) if key == "ik"
+                      else spec.head_shape(layer, key))
         name = f"{key}-{layer}.npy"
         arrays[key, layer] = np.lib.format.open_memmap(output / name, mode="w+", dtype="<f4",
                                                        shape=(rows, heads, dim))
@@ -395,7 +399,7 @@ def capture_from_states(saved, spec, output):
         state_entry = [s for s in document["states"] if s["n_tokens"] == n]
         if len(state_entry) != 1:
             raise ValueError(f"document {document['document_id']} has no state at its end")
-        state = kvstate.read_file(saved / state_entry[0]["file"], spec)
+        state = kvstate.read_file(saved / state_entry[0]["file"], spec, strict=True)
         for part, layout in zip(state.state.parts, spec.layouts(state.state.flags)):
             if layout.kind != "kv":
                 continue
@@ -421,7 +425,7 @@ def capture_from_states(saved, spec, output):
     layers = [dict(item) for item in report["layers"]]
     if spec.indexer is not None:
         for il in spec.indexer.layers:
-            layers[il]["indexer"] = spec.indexer.head_size
+            layers[il]["indexer"] = spec.indexer.head_size * spec.indexer_key_slots
     out = {"format_version": 2, "mode": "collect", "architecture": report["architecture"],
            "file_type": report["file_type"], "n_layer": report["n_layer"], "layers": layers, "settings": settings,
            "captures": captures, "documents": documents, "rows": rows, "source": "save-state"}
@@ -444,7 +448,9 @@ def run_states(probe, artifacts, model, records, output, *, ctx, batch, threads,
                        check=True, env=probe_environment(artifacts))
         report = json.loads((saved / "report.json").read_text(encoding="utf-8"))
         check_settings(report.get("settings"), expected_settings("states", ctx=ctx, batch=batch, threads=threads))
-        capture_from_states(saved, kvstate.ModelSpec.from_gguf(model), output)
+        # the states are the probe's runtime's: its manifest names the revision whose layouts they hold
+        spec = kvstate.ModelSpec.from_gguf(model, llama_revision=kvstate.llama_revision_of(Path(probe)))
+        capture_from_states(saved, spec, output)
     capture = Capture(output)
     capture.check_documents(records)
     capture.check_finite()

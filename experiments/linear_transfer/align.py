@@ -183,7 +183,9 @@ def align(src_docs, src_capture_set, tgt_docs, tgt_capture_set):
             seg_start = np.zeros(len(end), dtype=np.int64)
             if len(ids):
                 seg_start = starts[np.searchsorted(starts, start, side="right").clip(1) - 1]
-            local = np.flatnonzero(inside)
+            # a token that spells nothing (kv_probe's emptied SentencePiece space) repeats the key of the
+            # one before it: it pairs with nothing (unmatched), which keeps the keys unique
+            local = np.flatnonzero(inside & (end > start))
             keys.append((local, segment[local] * stride + end[local] - seg_start[local]))
         (src_local, src_keys), (tgt_local, tgt_keys) = keys
         _, src_match, tgt_match = np.intersect1d(src_keys, tgt_keys, assume_unique=True,

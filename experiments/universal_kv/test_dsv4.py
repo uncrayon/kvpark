@@ -31,7 +31,7 @@ head 64, n_rot 32) and its copy with an MTP layer (tiny_fixture.create_dsv4_mtp_
   CapabilityTests  kvpark.bridge.capabilities: target only, every head kind, no draft.
 
 Needs KVPARK_STATE_DRIVER (a kvpark-state-driver with --parallel/--seq/--partial and q8_0) and
-KVPARK_LLAMA_ARCHS (test-llama-archs), HubFitTests KVPARK_KV_PROBE (a kvpark-kv-probe with the
+KVPARK_LLAMA_ARCHS (test-llama-archs of either pin; tiny_fixture.llama_archs_model), HubFitTests KVPARK_KV_PROBE (a kvpark-kv-probe with the
 deepseek4 row), and EngineBridgeTests' switch a python3 with psutil (kvpark.bridge's registry); tests
 skip cleanly without them (CapabilityTests and HeadFitTests run anyway).
 """
@@ -68,7 +68,7 @@ sys.path.insert(0, str(HERE.parents[1] / "src"))
 import chat  # noqa: E402
 import kvstate  # noqa: E402
 from test_kv_probe_integration import copy_with_byte_vocabulary  # noqa: E402
-from tiny_fixture import copy_with_metadata, create_dsv4_mtp_fixture, create_fixture  # noqa: E402
+from tiny_fixture import copy_with_metadata, create_dsv4_mtp_fixture, create_fixture, llama_archs_model  # noqa: E402
 from kvpark.bridge import capabilities, resume  # noqa: E402
 
 DRIVER = os.environ.get("KVPARK_STATE_DRIVER")
@@ -122,13 +122,10 @@ class Fixtures:
 
     def __init__(self, root):
         self.root = Path(root)
-        out = self.root / "archs"
-        out.mkdir()
-        result = subprocess.run([LLAMA_ARCHS, "-a", "deepseek4", "-s", "7", "-o", str(out)], capture_output=True,
-                                text=True, timeout=600)
-        if result.returncode != 0:
-            raise RuntimeError(f"test-llama-archs deepseek4: {result.stderr[-400:]}")
-        self.models = {"dsv4": out / "deepseek4-moe.gguf", "dsv4-mtp": self.root / "deepseek4-mtp.gguf"}
+        # with the settings both pins' test-llama-archs share (weights N(0, 0.01), indexer top_k 8): the
+        # tolerances below were measured on them
+        self.models = {"dsv4": llama_archs_model(LLAMA_ARCHS, "deepseek4", self.root / "archs"),
+                       "dsv4-mtp": self.root / "deepseek4-mtp.gguf"}
         create_dsv4_mtp_fixture(self.models["dsv4"], self.models["dsv4-mtp"])
         self.count = 0
 

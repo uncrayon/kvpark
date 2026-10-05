@@ -160,7 +160,9 @@ def joint_spans(views):
                 bad.append(view.name)
             ids, starts, _ = table
             seg_start = starts[np.searchsorted(starts, start, side="right").clip(1) - 1] if len(ids) else 0 * start
-            local = np.flatnonzero(inside)
+            # a token that spells nothing (kv_probe's emptied SentencePiece space) would repeat the key of the
+            # one before it: no span (align.align does the same)
+            local = np.flatnonzero(inside & (end > start))
             sides.append((span, local, segment[local] * stride + end[local] - seg_start[local]))
         if bad:
             rejected.append({"document_id": document_id, "reason": "special token inside a segment", "models": bad})

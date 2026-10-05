@@ -143,11 +143,15 @@ class Jobs:
         rendered = chat.render(conversation, profile["chat_template"], bos_token=profile["bos_token"],
                                add_generation_prompt=True, live=True).text.encode("utf-8")
         tokens = self.run.tokens(ROLE[self.target], doc["document_id"])
+        # the job carries the pieces as the server's /tokenize prints them; the text is spelled by the
+        # pieces as the engine reads them (engine.spelled_pieces: a SentencePiece tokenizer's space prefix)
         pieces = engine.token_bytes(self.gguf[self.target], tokens["token_id"])
-        ends = np.cumsum([len(p) for p in pieces])
-        lead = len(pieces[0]) if pieces[0] == profile["bos_token"].encode() and not rendered.startswith(pieces[0]) else 0
+        spelled = engine.token_bytes(self.gguf[self.target], tokens["token_id"], spelled=True)
+        ends = np.cumsum([len(p) for p in spelled])
+        bos = spelled[0] == profile["bos_token"].encode() and not rendered.startswith(spelled[0])
+        lead = len(spelled[0]) if bos else 0
         n = int(np.searchsorted(ends, len(rendered) + lead, side="right"))
-        if b"".join(pieces[:n])[lead:] != rendered:
+        if b"".join(spelled[:n])[lead:] != rendered:
             raise ValueError(f"{doc['document_id'][:12]}: the run's tokens do not spell the target prompt")
         output = self.outputs / f"bench-{os.getpid()}-{time.monotonic_ns()}.bin"
         return {"hub": str(hub), "tail": tail, "fill": "mean", "device": device, "cache_dir": str(self.args.cache_dir),
@@ -353,12 +357,14 @@ def accuracy(args):
     job_device = {**job, "target": {**job["target"], "output": job["target"]["output"] + "." + device_backend.name}}
     report_device = engine.run(job_device, hub=hub, backend=device_backend)
     stored_device = kvstate.read_file(job_device["target"]["output"], jobs.spec[jobs.target])
+    # the engine writes the layout template's reading (either pin's): the stored states are compared in it
+    reading = stored_numpy.state.spec
     out = {"mode": "accuracy", "direction": args.direction, "document": doc["document_id"][:12],
            "t0": report_numpy["t0"], "backend": device_backend.describe(), "stored": {}, "decoded": {}}
     for a, b in zip(stored_device.state.parts, stored_numpy.state.parts):
         if isinstance(a, kvstate.RecurrentState):
-            out["stored"][a.name] = {"bytes_equal": kvstate._write_recurrent(jobs.spec[jobs.target], a)
-                                     == kvstate._write_recurrent(jobs.spec[jobs.target], b)}
+            out["stored"][a.name] = {"bytes_equal": kvstate._write_recurrent(reading, a)
+                                     == kvstate._write_recurrent(reading, b)}
             continue
         sa, sb = a.stream(), b.stream()
         assert np.array_equal(sa.positions, sb.positions)
@@ -394,7 +400,7 @@ def _plan(jobs, job, source_state, hub, t0):
     profile = engine.profile(target_gguf, engine._PROFILE_CACHE[0])
     rendered = chat.render(conversation, profile["chat_template"], bos_token=profile["bos_token"],
                            add_generation_prompt=True, live=True)
-    ids, pieces = engine.target_pieces(job["target"]["tokens"])
+    ids, pieces = engine.target_pieces(job["target"]["tokens"], target_gguf)
     joined, text = b"".join(pieces), rendered.text.encode()
     shift = len(joined) - len(text)
     record = {"document_id": document_id, "text": joined.decode("utf-8"),
@@ -402,8 +408,11 @@ def _plan(jobs, job, source_state, hub, t0):
               "segment_keys": rendered.segment_keys, "split": "test", "final_message_segments": []}
     tokens = engine.token_arrays(target_gguf, ids, pieces)
     source_ids = np.asarray(source_state.tokens)
-    source_pieces = engine.token_bytes(source_gguf, source_ids)
-    source_record = engine.located_record(conversation, document_id, b"".join(source_pieces))
+    source_pieces = engine.token_bytes(source_gguf, source_ids, spelled=True)
+    # as engine.run: segments where the source's own template renders them, the rest located in order
+    known = engine.source_spans(conversation, engine.profile(source_gguf, engine._PROFILE_CACHE[0]),
+                                conversation.get("template_options"), source_ids, source_pieces, source_gguf)
+    source_record = engine.located_record(conversation, document_id, b"".join(source_pieces), known=known)
     source_tokens = engine.token_arrays(source_gguf, source_ids, source_pieces)
     template = kvstate.read_file(job["target"]["template_state"], jobs.spec[jobs.target])
     layers = {kind: translate.source_layers(hub, kind, jobs.source) for kind in translate.KINDS}

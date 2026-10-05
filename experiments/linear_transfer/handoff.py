@@ -136,9 +136,12 @@ def normalize_tokens(tokens, what):
     n = len(arrays["token_id"])
     if n == 0 or any(len(value) != n for value in arrays.values()):
         raise ValueError(f"{what} token arrays must be nonempty and of equal length")
+    # a token may spell nothing (byte_end repeats; captures.Capture): kv_probe empties the space a
+    # SentencePiece tokenizer puts after a special token
     ends = arrays["byte_end"]
-    if ends[0] <= 0 or np.any(np.diff(ends) <= 0) or np.any(arrays["token_id"] < 0) or np.any(arrays["special"] > 1):
-        raise ValueError(f"{what} tokens need strictly increasing positive byte ends, ids >= 0, special 0/1")
+    if (ends[0] < 0 or ends[-1] <= 0 or np.any(np.diff(ends) < 0) or np.any(arrays["token_id"] < 0)
+            or np.any(arrays["special"] > 1)):
+        raise ValueError(f"{what} tokens need nondecreasing byte ends that reach past 0, ids >= 0, special 0/1")
     return arrays
 
 
@@ -811,8 +814,10 @@ def command_build(args):
     muse_tokens = _tokens(args, "muse", args.muse_model, muse_record)
     handoff_at = handoff_position(muse_record, muse_tokens)
     t0 = args.t0 if args.t0 is not None else handoff_at - args.tail
-    qwen_state = kvstate.read_file(args.qwen_state, qwen_spec) if args.qwen_state else None
-    oracle_state = kvstate.read_file(args.oracle_state, muse_spec) if args.oracle_state else None
+    # read strictly with the specs the build goes on to use (kvstate.parse_state: another revision's
+    # reading would lay the rows out otherwise; Qwen3.5 and Muse states are the same on both pins)
+    qwen_state = kvstate.read_file(args.qwen_state, qwen_spec, strict=True) if args.qwen_state else None
+    oracle_state = kvstate.read_file(args.oracle_state, muse_spec, strict=True) if args.oracle_state else None
     result = build_handoff(qwen_state, qwen_record, qwen_tokens, muse_record, muse_tokens, args.mapper, t0=t0,
                            muse_spec=muse_spec, swa_cells=args.swa_cells, content_policy=args.content,
                            fill_policy=args.fill, oracle_state=oracle_state, table=args.table,
@@ -820,7 +825,7 @@ def command_build(args):
                            renorm_table_k=not args.no_renorm_table_k, chunk_rows=args.chunk_rows,
                            native_prefix=args.native_prefix)
     data = result.state.to_bytes()
-    kvstate.parse_file(data, muse_spec)
+    kvstate.parse_file(data, muse_spec, strict=True)
     write_new(output, data)
     if args.resume_sidecar:
         write_new(output.with_name(output.name + ".resume"), kvstate.ResumeFile().to_bytes())

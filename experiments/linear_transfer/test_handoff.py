@@ -525,8 +525,13 @@ class SyntheticHandoffTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "do not cover"):
             handoff.build_handoff(None, self.qwen_record, self.qwen_tokens, self.muse_record, cut, None,
                                   t0=self.t0, content_policy="oracle", fill_policy="oracle", oracle_state=native)
-        with self.assertRaisesRegex(ValueError, "strictly increasing"):
+        with self.assertRaisesRegex(ValueError, "nondecreasing byte ends"):
             handoff.normalize_tokens(dict(self.muse_tokens, byte_end=self.muse_tokens["byte_end"][::-1]), "Muse")
+        with self.assertRaisesRegex(ValueError, "nondecreasing byte ends"):
+            handoff.normalize_tokens({"token_id": [1], "byte_end": [0], "special": [0]}, "Muse")
+        # a token that spells nothing repeats the byte end before it (an emptied SentencePiece space)
+        empty = handoff.normalize_tokens({"token_id": [1, 2, 3], "byte_end": [3, 3, 5], "special": [1, 0, 0]}, "Jamba")
+        np.testing.assert_array_equal(empty["byte_end"], [3, 3, 5])
         inside = dict(self.muse_record, text=self.muse_record["text"])
         tokens = dict(self.muse_tokens, special=self.muse_tokens["special"].copy())
         start = self.muse_record["segments"][0][1]

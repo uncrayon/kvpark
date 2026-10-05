@@ -141,7 +141,7 @@ class SpecTests(unittest.TestCase):
 
     def test_unsupported_models_and_flags_are_refused(self):
         with self.assertRaisesRegex(StateFormatError, "unsupported architecture"):
-            kvstate.ModelSpec.from_metadata({**muse_metadata(), "general.architecture": "llama"})
+            kvstate.ModelSpec.from_metadata({**muse_metadata(), "general.architecture": "gpt2"})
         with self.assertRaisesRegex(StateFormatError, "RoPE scaling"):
             kvstate.ModelSpec.from_metadata({**muse_metadata(), "muse-glimmer.rope.scaling.type": "yarn",
                                              "muse-glimmer.rope.scaling.factor": 4.0})
@@ -730,16 +730,43 @@ class MlaSpecTests(unittest.TestCase):
         self.assertEqual(kvstate.ModelSpec.from_metadata(qwen3_metadata(), runtime=unset),
                          kvstate.ModelSpec.from_metadata(qwen3_metadata()))
 
-    def test_nextn_layers_stay_in_the_plain_cache(self):
-        # GLM-4.7-Flash style: deepseek2 with one nextn block; the cache keeps it (zero rows)
-        spec = kvstate.ModelSpec.from_metadata(mla_metadata("deepseek2", 3, nextn=1))
-        self.assertEqual((spec.layer_types, spec.n_layer_trunk), (("full",) * 3 + ("nextn",), 3))
-        self.assertEqual(spec.sections(0), [("kv", "kv", (0, 1, 2, 3))])
-        self.assertEqual((kvstate.nextn_layers(spec), spec.layers_of("full")), ((3,), (0, 1, 2)))
-        # deepseek32 filters nextn layers out of both DSA sections
+    def test_nextn_layers_of_the_plain_cache_per_revision(self):
+        # GLM-4.7-Flash style: deepseek2 with one nextn block. 85d5703a3's plain cache keeps it (zero
+        # rows); a7b94df2c filters it out of every plain-KV and iSWA trunk cache
+        meta = mla_metadata("deepseek2", 3, nextn=1)
+        spec = kvstate.ModelSpec.from_metadata(meta)
+        old = kvstate.ModelSpec.from_metadata(meta, llama_revision="85d5703a3")
+        for each in (spec, old):
+            self.assertEqual((each.layer_types, each.n_layer_trunk), (("full",) * 3 + ("nextn",), 3))
+            self.assertEqual((kvstate.nextn_layers(each), each.layers_of("full")), ((3,), (0, 1, 2)))
+        self.assertEqual((spec.llama_revision, spec.nextn_cached, spec.sections(0)),
+                         (kvstate.LLAMA_REVISION, False, [("kv", "kv", (0, 1, 2))]))
+        self.assertEqual((old.nextn_cached, old.sections(0)), (True, [("kv", "kv", (0, 1, 2, 3))]))
+        self.assertEqual((spec.for_revision("85d5703a3"), old.for_revision("a7b94df2c")), (old, spec))
+        self.assertEqual([each.llama_revision for each in spec.layout_variants()], ["a7b94df2c", "85d5703a3"])
+        # a revision from a commit or llama-server's build_info; unknown ones are refused
+        for name in ("85d5703a3b1b47243213a39059a6e3076c92733a", "85d5703", "b10815-85d5703a3"):
+            self.assertEqual(kvstate.ModelSpec.from_metadata(meta, llama_revision=name), old)
+        self.assertEqual(kvstate.llama_revision_of("version: 0.5.0-dev (build 11398, commit a7b94df2c)"), "a7b94df2c")
+        # a version line with a slash is text; an existing tool's path is read through its manifest only
+        # (a missing manifest names no revision, whatever hex runs the path has), as is any path object
+        self.assertEqual(kvstate.llama_revision_of("version: 11398 (a7b94df2c) built with x86_64/linux"), "a7b94df2c")
+        for name in ("b34-b14e742", "next", None, 7, "/nonexistent/kvpark-state-driver", Path("/nonexistent/85d5703a3")):
+            self.assertIsNone(kvstate.llama_revision_of(name))
+        with tempfile.TemporaryDirectory() as directory:
+            tool = Path(directory) / "a7b94df2c-tool"
+            tool.write_bytes(b"")
+            self.assertIsNone(kvstate.llama_revision_of(str(tool)))
+            Path(str(tool) + ".build.json").write_text('{"runtime_source_revision": "85d5703a3b1b"}')
+            self.assertEqual((kvstate.llama_revision_of(str(tool)), kvstate.llama_revision_of(tool)),
+                             ("85d5703a3", "85d5703a3"))
+        with self.assertRaisesRegex(StateFormatError, "unknown llama.cpp revision"):
+            kvstate.ModelSpec.from_metadata(meta, llama_revision="b34-b14e742")
+        # deepseek32 filters nextn layers out of both DSA sections on both revisions: one layout
         spec = kvstate.ModelSpec.from_metadata({**dsa_metadata("deepseek32", 3), "deepseek32.block_count": 4,
                                                 "deepseek32.nextn_predict_layers": 1})
         self.assertEqual(spec.sections(0), [("kv", "kv", (0, 1, 2)), ("indexer", "kv", (0, 1, 2))])
+        self.assertEqual(spec.layout_variants(), [spec])
         with self.assertRaisesRegex(StateFormatError, "hy_v4 with nextn"):
             kvstate.ModelSpec.from_metadata(mla_metadata("hy_v4", 2, nextn=1))
 
@@ -802,6 +829,65 @@ class MlaSpecTests(unittest.TestCase):
         self.assertEqual(spec.layer_types, ("full", "recurrent", "full", "nextn"))
         self.assertEqual(spec.sections(0), [("attn", "kv", (0, 2, 3)), ("recurrent", "recurrent", (1,))])
         self.assertEqual((spec.n_layer_trunk, spec.rope(2).offset), (3, 32))
+        self.assertEqual(spec.layout_variants(), [spec])
+
+    def test_bailingmoe3_m_rope_with_sections(self):
+        # Ling 3.0 VL files carry [t, h, w] rope sections: a7b94df2c runs them with M-RoPE (NEOX pairs,
+        # sections in runs, cells with an ext), 85d5703a3 (and any revision without sections) with NORM
+        meta = {**kda_metadata("bailingmoe3", (1, 0, 1, 1)), "bailingmoe3.rope.dimension_sections": [2, 3, 3, 0]}
+        spec = kvstate.ModelSpec.from_metadata(meta)
+        old = spec.for_revision("85d5703a3")
+        self.assertEqual((spec.rope_type, spec.rope_sections, old.rope_type, old.rope_sections),
+                         ("mrope", (2, 3, 3, 0), "norm", (2, 3, 3, 0)))
+        self.assertEqual(([lay.ext for lay in spec.layouts(0)], [lay.ext for lay in old.layouts(0)]),
+                         ([True, False], [False, False]))
+        self.assertEqual(kvstate.ModelSpec.from_metadata(meta, llama_revision="85d5703a3"), old)
+        # get_key_or_arr(..., 4): one value fills all four sections, other array lengths are refused
+        scalar = kvstate.ModelSpec.from_metadata({**meta, "bailingmoe3.rope.dimension_sections": 2})
+        self.assertEqual((scalar.rope_type, scalar.rope_sections), ("mrope", (2, 2, 2, 2)))
+        with self.assertRaisesRegex(StateFormatError, "3 values, not 4"):
+            kvstate.ModelSpec.from_metadata({**meta, "bailingmoe3.rope.dimension_sections": [2, 3, 3]})
+        plain = kvstate.ModelSpec.from_metadata(kda_metadata("bailingmoe3", (1, 0, 1, 1)))
+        self.assertEqual((plain.rope_type, plain.layout_variants()), ("norm", [plain]))
+        rope = spec.rope(2)
+        self.assertEqual((rope.mode, rope.offset, rope.sections), ("mrope", 32, (2, 3, 3, 0)))
+        with self.assertRaisesRegex(StateFormatError, "needs norm RoPE"):
+            dataclasses.replace(old, rope_type="mrope")
+        # sections in runs (t t h h h w w w), modulo their sum; a pair past the w run would take the
+        # fourth component, 0 for text
+        self.assertEqual(kvstate.rope_components(8, (2, 3, 3, 0), interleaved=False), (0, 0, 1, 1, 1, 2, 2, 2))
+        self.assertEqual(kvstate.rope_components(6, (1, 1, 1, 1), interleaved=False), (0, 1, 2, 3, 0, 1))
+        # IMROPE interleaves them instead
+        self.assertEqual(kvstate.rope_components(6, (2, 1, 1, 0), interleaved=False), (0, 0, 1, 2, 0, 0))
+        self.assertEqual(kvstate.rope_components(6, (2, 1, 1, 0)), (0, 1, 2, 0, 0, 1))
+        x = np.random.default_rng(2).normal(size=(3, 1, 48)).astype(np.float32)
+        positions = np.asarray([0, 5, 300])
+        # with every pair inside [t, h, w], text M-RoPE is NEOX over the k_pe tail
+        neox = kvstate.Rope("neox", 16, 10000.0, offset=32)
+        np.testing.assert_array_equal(kvstate.cache_keys(spec, 2, x, positions), neox.apply(x, positions))
+        self.assertFalse(np.array_equal(kvstate.cache_keys(old, 2, x, positions), neox.apply(x, positions)))
+        np.testing.assert_allclose(kvstate.pre_rope_keys(spec, 2, kvstate.cache_keys(spec, 2, x, positions), positions),
+                                   x, atol=1e-5)
+        # a state of either revision parses with either spec, as its own revision
+        rng = np.random.default_rng(5)
+        for writer, reader in ((spec, old), (old, spec)):
+            attn = writer.layout("attn")
+            k = {il: rng.normal(size=(4,) + writer.kv_shape(il, "k")).astype(np.float32) for il in attn.layers}
+            stream = kvstate.build_kv_stream(writer, attn.layers, np.arange(4), k, None, tokens_at=np.arange(4) + 7)
+            r, s = opaque_rows(writer, (1,), rng)
+            parts = [kvstate.KVCache("attn", attn.layers, [stream]),
+                     kvstate.RecurrentState("recurrent", (1,), np.asarray([3], np.int32), ((),), 4, r, s)]
+            data = kvstate.StateFile(np.arange(4) + 7, kvstate.SequenceState(writer, 0, parts)).to_bytes()
+            parsed = kvstate.parse_file(data, reader)
+            self.assertEqual((parsed.state.spec, parsed.to_bytes()), (writer, data))
+            self.assertEqual(parsed.state.part("attn").stream().ext is not None, writer is spec)
+            # strict: only the spec's own reading, for code that goes on using that spec's RoPE
+            self.assertEqual(kvstate.parse_file(data, writer, strict=True).state.spec, writer)
+            with self.assertRaises(StateFormatError):
+                kvstate.parse_file(data, reader, strict=True)
+            with self.assertRaises(StateFormatError):
+                kvstate.parse_state(data[12 + 4 * 4:], reader, strict=True)
+            self.assertEqual(kvstate.parse_state(data[12 + 4 * 4:], reader).spec, writer)
 
     def test_value_length_plays_no_part_in_mla_specs(self):
         # an MLA cache stores no V; the kimi-linear and bailingmoe3 converters leave the base
@@ -846,7 +932,9 @@ class MlaStateTests(unittest.TestCase):
         return parsed, data
 
     def test_k_only_section_has_no_v_blocks_and_keeps_v_trans(self):
-        spec = kvstate.ModelSpec.from_metadata(mla_metadata("deepseek2", 2, nextn=1))
+        # 85d5703a3, whose plain cache keeps the nextn layer
+        spec = kvstate.ModelSpec.from_metadata(mla_metadata("deepseek2", 2, nextn=1), llama_revision="85d5703a3")
+        current = spec.for_revision(kvstate.LLAMA_REVISION)
         layout = spec.layout("kv")
         for dtype, v_trans in (("f16", False), ("f32", True)):
             with self.subTest(dtype=dtype, v_trans=v_trans):
@@ -862,6 +950,14 @@ class MlaStateTests(unittest.TestCase):
                 st = parsed.state.part("kv").stream()
                 self.assertEqual((st.v_trans, st.v, sorted(st.k)), (v_trans, {}, [0, 1, 2]))
                 np.testing.assert_array_equal(kvstate.value_rows(spec, st, 1), st.k[1][..., :32])
+                # a spec of the current revision reads the 85d5703a3 state as such, byte for byte, and
+                # the current layout of the same rows has no nextn layer
+                reread = kvstate.parse_file(data, current)
+                self.assertEqual((reread.state.spec, reread.to_bytes()), (spec, data))
+                trunk = kvstate.build_kv_stream(current, (0, 1), np.arange(5), k, None, dtype=dtype, v_trans=v_trans)
+                filtered, now = self.round_trip(current, [kvstate.KVCache("kv", (0, 1), [trunk])], np.arange(5))
+                self.assertEqual((len(now), filtered.state.spec), (len(data) - 12 - 5 * 48 * item, current))
+                self.assertEqual(kvstate.parse_file(now, spec).state.spec, current)
         with self.assertRaisesRegex(StateFormatError, "K-only"):
             kvstate.build_kv_stream(spec, (0,), np.arange(2), {0: np.zeros((2, 1, 48))}, {0: np.zeros((2, 1, 32))})
         st.v[0] = st.k[0][..., :32]
@@ -1137,8 +1233,8 @@ HYBRIDS = {
 
 
 def random_state(spec, n, rng, *, dtype="f16", v_trans=False, flags=kvstate.FLAGS_NONE, tokens=None):
-    """A SequenceState of `n` text tokens for any spec: random K/V (zero indexer V, as native) and
-    random recurrent rows (PLE rows included) at n - 1."""
+    """A SequenceState of `n` text tokens for any spec: random K/V (no V for K-only layers, zero indexer
+    V, as native) and random recurrent rows (PLE rows included) at n - 1."""
     tokens = rng.integers(0, 1000, n) if tokens is None else tokens
     parts = []
     for layout in spec.layouts(flags):
@@ -1155,7 +1251,7 @@ def random_state(spec, n, rng, *, dtype="f16", v_trans=False, flags=kvstate.FLAG
         k = {il: rng.normal(size=(len(positions),) + spec.kv_shape(il, "k", layout.role)).astype(np.float32)
              for il in layout.layers}
         v = {il: rng.normal(size=(len(positions),) + spec.kv_shape(il, "v", layout.role)).astype(np.float32)
-             for il in layout.layers if layout.role == "attention"}
+             for il in layout.layers if layout.role == "attention" and spec.kv_shape(il, "v") is not None}
         stream = kvstate.build_kv_stream(spec, layout.layers, positions, k, v, dtype=dtype, v_trans=v_trans,
                                          tokens_at=np.asarray(tokens)[positions], role=layout.role)
         parts.append(kvstate.KVCache(layout.name, layout.layers, [stream]))
@@ -1197,9 +1293,12 @@ class HybridSpecTests(unittest.TestCase):
 
     def test_qwen4exp_indexer_ple_and_cell_ext(self):
         spec = kvstate.ModelSpec.from_metadata(hybrid_metadata("qwen4exp", **QWEN4EXP))
-        self.assertEqual((spec.indexer.layers, spec.indexer.head_size, spec.indexer.rope_type, spec.indexer.value_size),
-                         ((3,), 8, "none", 16))
-        self.assertEqual((spec.kv_shape(3, "k", "indexer"), spec.kv_shape(3, "v", "indexer")), ((1, 8), (1, 16)))
+        self.assertEqual((spec.indexer.layers, spec.indexer.head_size, spec.indexer.rope_type, spec.indexer.value_size,
+                          spec.indexer.kpool), ((3,), 8, "none", 16, 0))
+        # 85d5703a3 stores never written V rows of the model's V width; a7b94df2c caches K only
+        self.assertEqual((spec.kv_shape(3, "k", "indexer"), spec.kv_shape(3, "v", "indexer")), ((1, 8), None))
+        old = spec.for_revision("85d5703a3")
+        self.assertEqual((old.kv_shape(3, "k", "indexer"), old.kv_shape(3, "v", "indexer")), ((1, 8), (1, 16)))
         self.assertIsNone(spec.rope(3, "indexer"))
         # (ngram - 1) * heads > 0, kernel 4: P = 3 * 3 * hc 2 * n_embd 32 floats on layer 0
         self.assertEqual((spec.recurrent_p_bytes, spec.ple_layers), (4 * 3 * 3 * 2 * 32, (0,)))
@@ -1211,6 +1310,39 @@ class HybridSpecTests(unittest.TestCase):
         rng = np.random.default_rng(3)
         x = rng.normal(size=(5, 1, 8)).astype(np.float32)
         np.testing.assert_array_equal(kvstate.cache_keys(spec, 3, x, np.arange(5), role="indexer"), x)
+
+    def test_qwen4exp_k_pool_rows(self):
+        # QSA layers pooling blocks of compress_ratio cells: a7b94df2c caches [key | pooled] per cell
+        # (kpool_row 2), 85d5703a3 the key and a V row
+        meta = hybrid_metadata("qwen4exp", **{**QWEN4EXP, "attention.compress_ratios": [4] * 4})
+        spec = kvstate.ModelSpec.from_metadata(meta)
+        old = kvstate.ModelSpec.from_metadata(meta, llama_revision="85d5703a3")
+        self.assertEqual((spec.indexer.kpool, spec.indexer.kpool_row, spec.indexer_row_slots, old.indexer_row_slots),
+                         (4, 2, 2, 1))
+        self.assertEqual((spec.kv_shape(3, "k", "indexer"), spec.kv_shape(3, "v", "indexer")), ((1, 16), None))
+        self.assertEqual((old.kv_shape(3, "k", "indexer"), old.kv_shape(3, "v", "indexer")), ((1, 8), (1, 16)))
+        self.assertEqual([each.llama_revision for each in spec.layout_variants()], ["a7b94df2c", "85d5703a3"])
+        # the pooled slots are written zero (a restore re-pools them) and dropped when read back
+        rng = np.random.default_rng(4)
+        x = rng.normal(size=(5, 1, 8)).astype(np.float32)
+        rows = kvstate.cache_keys(spec, 3, x, np.arange(5), role="indexer")
+        self.assertEqual(rows.shape, (5, 1, 16))
+        np.testing.assert_array_equal(rows[..., :8], x)
+        self.assertFalse(rows[..., 8:].any())
+        stored = rows.copy()
+        stored[..., 8:] = 1.0
+        np.testing.assert_array_equal(kvstate.pre_rope_keys(spec, 3, stored, np.arange(5), role="indexer"), x)
+        np.testing.assert_array_equal(kvstate.cache_keys(old, 3, x, np.arange(5), role="indexer"), x)
+        # both revisions' states of the model parse with either spec, each as its own revision
+        for writer, reader in ((spec, old), (old, spec)):
+            state, tokens = random_state(writer, 9, rng)
+            data = kvstate.StateFile(kvstate.token_words(tokens, server_packed=True), state).to_bytes()
+            parsed = kvstate.parse_file(data, reader)
+            self.assertEqual((parsed.state.spec, parsed.to_bytes()), (writer, data))
+        for ratios in ([4, 2, 0, 0], [1] * 4):
+            with self.assertRaisesRegex(StateFormatError, "compress ratio"):
+                kvstate.ModelSpec.from_metadata(hybrid_metadata("qwen4exp", **{
+                    **QWEN4EXP, "attention.compress_ratios": ratios}))
 
     def test_refusals_and_runtime_rope(self):
         # default-filter hybrids would keep nextn layers in the main attention cache: not modelled;
@@ -1292,8 +1424,8 @@ class HybridSpecTests(unittest.TestCase):
                     rows = [rows for part in reset if isinstance(part, kvstate.RecurrentState)
                             for rows in (*part.r.values(), *part.s.values(), *part.p.values())]
                     self.assertTrue(rows and not any(any(r.data) for r in rows))
-        # the qwen4exp indexer V rows are never written: a builder leaves them zero
-        spec = kvstate.ModelSpec.from_metadata(hybrid_metadata("qwen4exp", **QWEN4EXP))
+        # 85d5703a3's qwen4exp indexer V rows are never written: a builder leaves them zero
+        spec = kvstate.ModelSpec.from_metadata(hybrid_metadata("qwen4exp", **QWEN4EXP), llama_revision="85d5703a3")
         stream = kvstate.build_kv_stream(spec, (3,), np.arange(4), {3: rng.normal(size=(4, 1, 8))}, None,
                                          role="indexer", tokens_at=np.arange(4))
         self.assertEqual((stream.v[3].shape, bool(stream.v[3].any())), ((4, 1, 16), False))
@@ -1493,6 +1625,312 @@ class Dsv4StateTests(unittest.TestCase):
         ring.kv[3] = ring.kv[3].astype(np.float16)
         with self.assertRaisesRegex(StateFormatError, "must be float32"):
             good.to_bytes()
+
+
+
+# -- GQA family (plain and iSWA caches that take the context's RoPE) ------------------------------
+
+# the real Gemma-4 26B-A4B (catalog.json): 30 layers, every 6th full (2 KV heads of 512, proportional
+# RoPE: 64 of 256 pairs), the rest sliding over 1024 (8 KV heads of 256)
+GEMMA4_FACTORS = (1.0,) * 64 + (float(np.float32(1e30)),) * 192
+
+
+def gqa_metadata(architecture, **extra):
+    """Synthetic metadata of a GQA_ARCHITECTURES model; `extra` overrides keys (no prefix)."""
+    p = architecture + "."
+    meta = {"general.architecture": architecture, p + "block_count": 4, p + "embedding_length": 64,
+            p + "context_length": 4096, p + "attention.head_count": 4, p + "attention.head_count_kv": 2,
+            p + "attention.key_length": 16, p + "attention.value_length": 16, p + "rope.freq_base": 1e6}
+    meta.update({p + key: value for key, value in extra.items()})
+    return meta
+
+
+def gemma4_26b_metadata(**extra):
+    sliding = [il % 6 < 5 for il in range(30)]
+    return gqa_metadata("gemma4", **{
+        "block_count": 30, "embedding_length": 2816, "attention.head_count": 16,
+        "attention.head_count_kv": [8 if s else 2 for s in sliding], "attention.key_length": 512,
+        "attention.value_length": 512, "attention.key_length_swa": 256, "attention.value_length_swa": 256,
+        "attention.sliding_window": 1024, "attention.sliding_window_pattern": sliding, "rope.dimension_count": 512,
+        "rope.dimension_count_swa": 256, "rope.freq_base": 1e6, "rope.freq_base_swa": 1e4,
+        "attention.shared_kv_layers": 0, "embedding_length_per_layer_input": 0, **extra})
+
+
+def laguna_s_metadata(**extra):
+    """Laguna-S-2.1's header (its first split file): 48 layers, full at il % 4 == 0 (no pattern key)."""
+    return gqa_metadata("laguna", **{
+        "block_count": 48, "embedding_length": 3072, "attention.head_count": [48, 72, 72, 72] * 12,
+        "attention.head_count_kv": 8, "attention.key_length": 128, "attention.value_length": 128,
+        "rope.scaling.type": "yarn", "rope.scaling.factor": 32.0, "rope.scaling.original_context_length": 8192,
+        "rope.freq_base": 500000.0, "rope.freq_base_swa": 10000.0, "attention.sliding_window": 512,
+        "rope.dimension_count": 64, "rope.dimension_count_swa": 128, "context_length": 262144, **extra})
+
+
+class GqaSpecTests(unittest.TestCase):
+    def test_gemma4_layers_heads_and_proportional_rope(self):
+        meta = gemma4_26b_metadata()
+        spec = kvstate.ModelSpec.from_metadata(meta, rope_freq_factors=GEMMA4_FACTORS)
+        self.assertEqual((spec.memory, spec.n_swa, spec.n_rot, spec.n_rot_swa), ("iswa", 1024, 512, 256))
+        self.assertEqual(spec.layers_of("full"), tuple(range(5, 30, 6)))
+        self.assertEqual(spec.sections(0), [("base", "kv", tuple(range(5, 30, 6))),
+                                            ("swa", "kv", tuple(il for il in range(30) if il % 6 < 5))])
+        self.assertEqual(spec.sections(kvstate.FLAGS_PARTIAL_ONLY), [("swa", "kv", spec.layers_of("sliding"))])
+        self.assertEqual((spec.kv_shape(5, "k"), spec.kv_shape(5, "v"), spec.kv_shape(0, "k")), ((2, 512), (2, 512),
+                                                                                              (8, 256)))
+        full, sliding = spec.rope(5), spec.rope(0)
+        self.assertEqual((full.mode, full.n_dims, full.base, full.freq_factors), ("neox", 512, 1e6, GEMMA4_FACTORS))
+        self.assertEqual((sliding.n_dims, sliding.base, sliding.freq_scale, sliding.freq_factors), (256, 1e4, 1.0, None))
+        self.assertFalse(spec.cell_ext)
+        # the 1e30 pairs are not rotated (to float32 rounding), the first 64 are
+        x = np.random.default_rng(1).normal(size=(3, 2, 512)).astype(np.float32)
+        y = full.apply(x, np.asarray([0, 1000, 200000]))
+        np.testing.assert_array_equal(y[..., 64:256], x[..., 64:256])
+        np.testing.assert_array_equal(y[..., 320:], x[..., 320:])
+        self.assertFalse(np.allclose(y[1:, :, :64], x[1:, :, :64]))
+        # the factors are a tensor: unknown until from_gguf reads them, required for gemma4
+        unknown = kvstate.ModelSpec.from_metadata(meta)
+        with self.assertRaisesRegex(StateFormatError, "frequency factors are unknown"):
+            unknown.rope(0)
+        with self.assertRaisesRegex(StateFormatError, "needs its rope_freqs.weight"):
+            kvstate.ModelSpec.from_metadata(meta, rope_freq_factors=())
+        with self.assertRaisesRegex(StateFormatError, "one per rotated pair"):
+            kvstate.ModelSpec.from_metadata(meta, rope_freq_factors=(1.0,) * 128)
+        # the context's YaRN reaches both kinds; the sliding layers keep their own base and scale
+        yarn = kvstate.ModelSpec.from_metadata(meta, rope_freq_factors=GEMMA4_FACTORS, runtime={
+            "rope_scaling_type": "yarn", "rope_freq_scale": 0.25, "yarn_orig_ctx": 65536, "rope_freq_base": 2e6})
+        self.assertEqual((yarn.rope(5).freq_scale, yarn.rope(5).base, yarn.rope(5).ext_factor), (0.25, 2e6, 1.0))
+        self.assertEqual((yarn.rope(0).freq_scale, yarn.rope(0).base, yarn.rope(0).ext_factor), (1.0, 1e4, 1.0))
+        # its loader reads the pattern as flags only (gemma4.cpp:5)
+        with self.assertRaisesRegex(StateFormatError, "sliding_window_pattern array"):
+            kvstate.ModelSpec.from_metadata(gemma4_26b_metadata(**{"attention.sliding_window_pattern": 6}))
+
+    def test_rope_freq_factors_from_gguf_files(self):
+        # gguf_rope_freq_factors: rope_freqs.weight from the file of a split GGUF that holds it, cut to
+        # n_rot / 2 (ggml_rope_ext reads no more; gemma4's tensor has one per pair of the whole head)
+        from tiny_fixture import copy_with_metadata, create_gemma_fixture
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tensors = create_gemma_fixture(root / "g.gguf", "gemma4")
+            whole = kvstate.ModelSpec.from_gguf(root / "g.gguf")
+            factors = tuple(float(x) for x in tensors["rope_freqs.weight"])
+            self.assertEqual((whole.n_rot, whole.rope_freq_factors), (32, factors))
+            for number, dropped in ((1, ["rope_freqs.weight"]), (2, [n for n in tensors if n != "rope_freqs.weight"])):
+                copy_with_metadata(root / "g.gguf", root / f"s-{number:05d}-of-00002.gguf", drop_tensors=dropped,
+                                   values={"split.count": 2, "split.no": number - 1})
+            split = kvstate.ModelSpec.from_gguf(root / "s-00001-of-00002.gguf")
+            self.assertEqual(split.rope_freq_factors, factors)
+            copy_with_metadata(root / "g.gguf", root / "half.gguf", values={"gemma4.rope.dimension_count": 16})
+            half = kvstate.ModelSpec.from_gguf(root / "half.gguf")
+            self.assertEqual((half.n_rot, half.rope_freq_factors, half.rope(2).n_dims), (16, factors[:8], 16))
+            self.assertEqual(kvstate.gguf_rope_freq_factors(root / "half.gguf", half), factors[:8])
+            # gemma3 takes none: nothing to read
+            create_gemma_fixture(root / "g3.gguf", "gemma3")
+            gemma3 = kvstate.ModelSpec.from_gguf(root / "g3.gguf")
+            self.assertIsNone(kvstate.gguf_rope_freq_factors(root / "g3.gguf", gemma3))
+        # phi3: rope_factors_long/short (LongRoPE, refused by from_gguf) are tensors too, so a spec from metadata
+        # alone cannot rotate until it is told the GGUF has none (); phi3 never reads rope_freqs.weight
+        phi3 = kvstate.ModelSpec.from_metadata(gqa_metadata("phi3"))
+        with self.assertRaisesRegex(StateFormatError, "frequency factors are unknown"):
+            phi3.rope(0)
+        plain = kvstate.ModelSpec.from_metadata(gqa_metadata("phi3"), rope_freq_factors=())
+        self.assertIsNone(plain.rope(0).freq_factors)
+        with self.assertRaisesRegex(StateFormatError, "frequency factors"):
+            kvstate.ModelSpec.from_metadata(gqa_metadata("phi3"), rope_freq_factors=(1.0,) * 8)
+
+    def test_gemma4_shared_kv_layers_keep_no_cache(self):
+        # Gemma 4 E2B/E4B: the last attention.shared_kv_layers layers attend to an earlier layer's cache
+        meta = gemma4_26b_metadata(**{"block_count": 12, "attention.head_count_kv": 2,
+                                      "attention.sliding_window_pattern": [il % 6 < 5 for il in range(12)],
+                                      "attention.shared_kv_layers": 4})
+        spec = kvstate.ModelSpec.from_metadata(meta, rope_freq_factors=GEMMA4_FACTORS)
+        self.assertEqual(spec.layer_types, ("sliding",) * 5 + ("full",) + ("sliding",) * 2 + ("shared",) * 4)
+        self.assertEqual(spec.sections(0), [("base", "kv", (5,)), ("swa", "kv", (0, 1, 2, 3, 4, 6, 7))])
+        self.assertEqual(spec.attention_layers, (0, 1, 2, 3, 4, 5, 6, 7))
+        with self.assertRaisesRegex(ValueError, "no attention cache"):
+            spec.rope(9)
+        with self.assertRaisesRegex(StateFormatError, "fewer than two"):
+            kvstate.ModelSpec.from_metadata({**meta, "gemma4.attention.shared_kv_layers": 11},
+                                            rope_freq_factors=GEMMA4_FACTORS)
+
+    def test_laguna_plain_rope_on_sliding_layers(self):
+        spec = kvstate.ModelSpec.from_metadata(laguna_s_metadata())
+        self.assertEqual(spec.layer_types[:8], ("full", "sliding", "sliding", "sliding") * 2)
+        self.assertEqual((spec.memory, spec.n_swa, spec.n_rot, spec.n_rot_swa), ("iswa", 512, 64, 128))
+        self.assertEqual({spec.kv_shape(il, "k") for il in range(48)}, {(8, 128)})
+        full, sliding = spec.rope(0), spec.rope(1)
+        self.assertEqual((full.n_dims, full.base, full.freq_scale, full.ext_factor, full.n_ctx_orig),
+                         (64, 500000.0, 1 / 32, 1.0, 8192))
+        self.assertAlmostEqual(full.attn_factor, 1.0, places=6)
+        self.assertEqual((sliding.n_dims, sliding.base, sliding.freq_scale, sliding.ext_factor, sliding.attn_factor),
+                         (128, 1e4, 1.0, 0.0, 1.0))
+        # without a sliding window (Laguna M.1) every layer is full, in one plain cache
+        plain = kvstate.ModelSpec.from_metadata(laguna_s_metadata(**{"attention.sliding_window": 0}))
+        self.assertEqual((plain.memory, set(plain.layer_types), plain.n_rot_swa), ("kv", {"full"}, 0))
+        # a pattern in the GGUF wins (flags, or a period; the full layer leads each period)
+        period = kvstate.ModelSpec.from_metadata(laguna_s_metadata(**{"attention.sliding_window_pattern": 3}))
+        self.assertEqual(period.layer_types[:6], ("full", "sliding", "sliding") * 2)
+
+    def test_gpt_oss_gemma3_and_sliding_patterns(self):
+        # gpt-oss: every other layer slides (even ones), rotates whole heads of n_rot, YaRN on both kinds;
+        # its sliding layers keep the GGUF's base and scale
+        meta = gqa_metadata("gpt-oss", **{"attention.key_length": 64, "attention.value_length": 64,
+                                          "rope.dimension_count": 64, "attention.sliding_window": 128,
+                                          "rope.scaling.type": "yarn", "rope.scaling.factor": 32.0,
+                                          "rope.scaling.original_context_length": 4096, "rope.freq_base": 150000.0})
+        spec = kvstate.ModelSpec.from_metadata(meta, runtime={"rope_freq_scale": 0.125, "rope_freq_base": 1e5})
+        self.assertEqual(spec.layer_types, ("sliding", "full") * 2)
+        self.assertEqual((spec.rope(1).freq_scale, spec.rope(1).base), (0.125, 1e5))
+        self.assertEqual((spec.rope(0).freq_scale, spec.rope(0).base, spec.rope(0).ext_factor), (1 / 32, 150000.0, 1.0))
+        with self.assertRaisesRegex(StateFormatError, "rotates whole heads"):
+            kvstate.ModelSpec.from_metadata({**meta, "gpt-oss.rope.dimension_count": 32})
+        with self.assertRaisesRegex(StateFormatError, "positive attention.sliding_window"):
+            kvstate.ModelSpec.from_metadata({**meta, "gpt-oss.attention.sliding_window": 0})
+        # gemma3: a window makes iSWA memory (period 6 by default, the last of each period full), none a plain cache
+        gemma3 = kvstate.ModelSpec.from_metadata(gqa_metadata("gemma3", **{"block_count": 12, "attention.sliding_window": 512,
+                                                                         "rope.freq_base_swa": 1e4}))
+        self.assertEqual(gemma3.layer_types[:6], ("sliding",) * 5 + ("full",))
+        self.assertEqual((gemma3.rope_freq_base_swa, gemma3.rope_freq_scale_swa), (1e4, 1.0))
+        plain = kvstate.ModelSpec.from_metadata(gqa_metadata("gemma3"))
+        self.assertEqual((plain.memory, plain.n_swa, plain.rope(0).base), ("kv", 0, 1e6))
+        flags = kvstate.ModelSpec.from_metadata(gqa_metadata("gemma3", **{"attention.sliding_window": 8,
+                                                                         "attention.sliding_window_pattern":
+                                                                             [True, False, True, True]}))
+        self.assertEqual(flags.layer_types, ("sliding", "full", "sliding", "sliding"))
+        # 85d5703a3 reads a period only: flags keep its default one (refused when the layers differ)
+        with self.assertRaisesRegex(StateFormatError, "85d5703a3 ignores"):
+            kvstate.ModelSpec.from_metadata(gqa_metadata("gemma3", **{"attention.sliding_window": 8,
+                                                                     "attention.sliding_window_pattern":
+                                                                         [True, False, True, True]}),
+                                            llama_revision="85d5703a3")
+        old = kvstate.ModelSpec.from_metadata({**meta, "gpt-oss.attention.sliding_window_pattern": [True, False] * 2},
+                                              llama_revision="85d5703a3")
+        self.assertEqual(old.layer_types, ("sliding", "full") * 2)
+        with self.assertRaisesRegex(StateFormatError, "no sliding layer"):
+            kvstate.ModelSpec.from_metadata(gqa_metadata("gemma3", **{"attention.sliding_window": 8,
+                                                                     "attention.sliding_window_pattern": 1}))
+        # phi3 ignores the window its GGUFs declare (phi3.cpp:13-24)
+        phi3 = kvstate.ModelSpec.from_metadata(gqa_metadata("phi3", **{"attention.sliding_window": 2047}))
+        self.assertEqual((phi3.memory, phi3.n_swa), ("kv", 0))
+        # mimo2: K and V widths differ; its nextn (MTP) layers sit in no section of the trunk
+        mimo = kvstate.ModelSpec.from_metadata(gqa_metadata("mimo2", **{
+            "block_count": 5, "nextn_predict_layers": 1, "attention.key_length": 24, "attention.value_length": 16,
+            "rope.dimension_count": 8, "attention.sliding_window": 128,
+            "attention.sliding_window_pattern": [False, True, True, True, False]}))
+        self.assertEqual((mimo.layer_types, mimo.kv_shape(1, "k"), mimo.kv_shape(1, "v"), mimo.n_rot_swa),
+                         (("full", "sliding", "sliding", "sliding"), (2, 24), (2, 16), 8))
+
+    def test_llama_mistral3_and_refusals(self):
+        llama = kvstate.ModelSpec.from_metadata(gqa_metadata("llama"), rope_freq_factors=(1.0, 2.0) * 4)
+        self.assertEqual((llama.memory, llama.rope_type, llama.rope(3).freq_factors), ("kv", "norm", (1.0, 2.0) * 4))
+        with self.assertRaisesRegex(StateFormatError, "frequency factors are unknown"):
+            kvstate.ModelSpec.from_metadata(gqa_metadata("llama")).rope(0)
+        self.assertIsNone(kvstate.ModelSpec.from_metadata(gqa_metadata("llama"), rope_freq_factors=()).rope(0).freq_factors)
+        with self.assertRaisesRegex(StateFormatError, "rotates whole heads"):
+            kvstate.ModelSpec.from_metadata(gqa_metadata("llama", **{"rope.dimension_count": 8}))
+        with self.assertRaisesRegex(StateFormatError, "nextn"):
+            kvstate.ModelSpec.from_metadata(gqa_metadata("llama", block_count=5, nextn_predict_layers=1))
+        with self.assertRaisesRegex(StateFormatError, "frequency factors"):
+            kvstate.ModelSpec.from_metadata(gqa_metadata("qwen3moe"), rope_freq_factors=(1.0,) * 8)
+        # hy_v3's nextn layers are filtered out of the trunk cache on both revisions
+        hy = kvstate.ModelSpec.from_metadata(gqa_metadata("hy_v3", block_count=5, nextn_predict_layers=1))
+        self.assertEqual((hy.layer_types, hy.sections(0)), (("full",) * 4, [("kv", "kv", (0, 1, 2, 3))]))
+        # mistral3 reads the YaRN betas and the log multiplier (as it is) from the GGUF
+        meta = gqa_metadata("mistral3", **{"rope.scaling.type": "yarn", "rope.scaling.factor": 16.0,
+                                           "rope.scaling.original_context_length": 16384,
+                                           "rope.scaling.yarn_beta_fast": 4.0, "rope.scaling.yarn_beta_slow": 0.5,
+                                           "rope.scaling.yarn_log_multiplier": 0.75})
+        rope = kvstate.rope_runtime(meta)
+        f32 = np.float32
+        mscale = lambda m: f32(f32(f32(f32(0.1) * f32(m)) * kvstate._logf(f32(16))) + f32(1))   # noqa: E731
+        expected = f32(f32(mscale(1) / mscale(0.75)) * f32(f32(1) / f32(f32(1) + f32(f32(0.1) * kvstate._logf(f32(16))))))
+        self.assertEqual((rope["beta_fast"], rope["beta_slow"], rope["attn_factor"]), (4.0, 0.5, float(expected)))
+        self.assertEqual(kvstate.rope_runtime(meta, runtime={"yarn_beta_fast": 8.0})["beta_fast"], 8.0)
+        # other loaders keep 32/1 and read no log multiplier from these keys
+        other = {k.replace("mistral3", "llama"): v for k, v in meta.items()}
+        other["general.architecture"] = "llama"
+        self.assertEqual((kvstate.rope_runtime(other)["beta_fast"], kvstate.rope_runtime(other)["yarn_log_mul"]),
+                         (32.0, 0.0))
+
+    def test_states_round_trip_for_every_gqa_layout(self):
+        rng = np.random.default_rng(41)
+        specs = {"gemma4": kvstate.ModelSpec.from_metadata(gemma4_26b_metadata(**{
+                     "block_count": 6, "attention.head_count_kv": [2, 2, 2, 2, 2, 1], "attention.key_length": 32,
+                     "attention.value_length": 32, "attention.key_length_swa": 16, "attention.value_length_swa": 16,
+                     "rope.dimension_count": 32, "rope.dimension_count_swa": 16, "attention.sliding_window": 8,
+                     "attention.sliding_window_pattern": [il % 6 < 5 for il in range(6)]}),
+                     rope_freq_factors=(1.0,) * 4 + (1e30,) * 12),
+                 "laguna": kvstate.ModelSpec.from_metadata(laguna_s_metadata(**{
+                     "block_count": 8, "attention.head_count": 4, "attention.head_count_kv": 2,
+                     "attention.key_length": 16, "attention.value_length": 16, "rope.dimension_count": 8,
+                     "rope.dimension_count_swa": 16, "attention.sliding_window": 8})),
+                 "llama": kvstate.ModelSpec.from_metadata(gqa_metadata("llama"), rope_freq_factors=())}
+        for name, spec in specs.items():
+            for dtype, v_trans in (("f16", False), ("f32", True)):
+                with self.subTest(model=name, dtype=dtype, v_trans=v_trans):
+                    state, tokens = random_state(spec, 11, rng, dtype=dtype, v_trans=v_trans)
+                    data = kvstate.StateFile(kvstate.token_words(tokens, server_packed=True), state).to_bytes()
+                    parsed = kvstate.parse_file(data, spec)
+                    self.assertEqual(parsed.to_bytes(), data)
+                    self.assertEqual(spec.layout_variants(), [spec])
+                    partial, _ = random_state(spec, 11, rng, flags=kvstate.FLAGS_PARTIAL_ONLY, tokens=tokens)
+                    blob = kvstate.StateBlob(0, partial).to_bytes()
+                    self.assertEqual(kvstate.parse_blob(blob, spec, flags=kvstate.FLAGS_PARTIAL_ONLY).to_bytes(), blob)
+                    # every key through pre_rope_keys and cache_keys stays within float32 rounding
+                    for part in parsed.state.parts:
+                        stream = part.stream()
+                        for il in part.layers:
+                            rows = stream.k[il].astype(np.float32)
+                            back = kvstate.cache_keys(spec, il, kvstate.pre_rope_keys(spec, il, rows, stream.positions),
+                                                      stream.positions)
+                            np.testing.assert_allclose(back, rows, rtol=0, atol=3e-6 * np.abs(rows).max())
+
+
+def glm5_next_metadata(**extra):
+    """GLM5-Next metadata shaped like test-llama-archs' fixture: layer 0 a NoPE MLA layer (latent 512, no
+    k_pe), layer 1 KDA; a k-pool indexer of 128."""
+    p = "glm5-next."
+    meta = {"general.architecture": "glm5-next", p + "block_count": 2, p + "embedding_length": 128,
+            p + "context_length": 256, p + "attention.head_count": 1, p + "attention.head_count_kv": [1, 0],
+            p + "attention.key_length": 512, p + "attention.value_length": 512, p + "rope.dimension_count": 0,
+            p + "attention.key_length_mla": 192, p + "attention.value_length_mla": 128,
+            p + "attention.kv_lora_rank": 512, p + "ssm.conv_kernel": 4, p + "kda.head_dim": 128,
+            p + "attention.indexer.head_count": 64, p + "attention.indexer.key_length": 128,
+            p + "attention.indexer.top_k": 8, p + "attention.indexer.kpool": 4}
+    meta.update({p + key: value for key, value in extra.items()})
+    return meta
+
+
+class Glm5NextSpecTests(unittest.TestCase):
+    def test_layout_and_k_pool_rows(self):
+        spec = kvstate.ModelSpec.from_metadata(glm5_next_metadata())
+        self.assertEqual((spec.layer_types, spec.memory, spec.rope_type, spec.kv_lora), (("full", "recurrent"),
+                                                                                         "hybrid_idx", "none", (512, 0)))
+        self.assertEqual(spec.sections(0), [("attn", "kv", (0,)), ("recurrent", "recurrent", (1,)),
+                                            ("indexer", "kv", (0,))])
+        # NoPE latent rows without k_pe; [key | gate | pooled] indexer rows, K only
+        self.assertEqual((spec.kv_shape(0, "k"), spec.kv_shape(0, "v")), ((1, 512), None))
+        self.assertEqual((spec.kv_shape(0, "k", "indexer"), spec.kv_shape(0, "v", "indexer")), ((1, 384), None))
+        self.assertEqual((spec.indexer_row_slots, spec.indexer_key_slots, spec.rope(0)), (3, 2, None))
+        self.assertEqual(spec.recurrent_row_bytes, (4 * 3 * 3 * 1 * 128, 4 * 128 * 128))
+        # key and gate are per-token data; only the pooled slot is written zero (a restore re-pools it)
+        rows = np.random.default_rng(3).normal(size=(5, 1, 256)).astype(np.float32)
+        stored = kvstate.cache_keys(spec, 0, rows, np.arange(5), role="indexer")
+        np.testing.assert_array_equal(stored[..., :256], rows)
+        self.assertFalse(stored[..., 256:].any())
+        np.testing.assert_array_equal(kvstate.pre_rope_keys(spec, 0, stored, np.arange(5), role="indexer"), rows)
+        # GLM5-Next exists on a7b94df2c only: one reading, and no 85d5703a3 spec
+        self.assertEqual(spec.layout_variants(), [spec])
+        with self.assertRaisesRegex(StateFormatError, "has no glm5-next"):
+            spec.for_revision("85d5703a3")
+        state, tokens = random_state(spec, 9, np.random.default_rng(4))
+        data = kvstate.StateFile(kvstate.token_words(tokens), state).to_bytes()
+        self.assertEqual(kvstate.parse_file(data, spec).to_bytes(), data)
+        # indexer types pick the indexer layers; a k-pool of one cell is refused
+        typed = kvstate.ModelSpec.from_metadata(glm5_next_metadata(**{
+            "block_count": 4, "attention.head_count_kv": [1, 0, 1, 0], "attention.indexer.types": [0, 0, 1, 0]}))
+        self.assertEqual(typed.indexer.layers, (2,))
+        with self.assertRaisesRegex(StateFormatError, "k-pool"):
+            kvstate.ModelSpec.from_metadata(glm5_next_metadata(**{"attention.indexer.kpool": 1}))
 
 
 if __name__ == "__main__":

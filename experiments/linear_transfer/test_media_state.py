@@ -2,13 +2,15 @@
 MediaTokens, MediaChunk), truncate_state, and handoff's position index next to media cells.
 
 The unit tests build token words and mtmd chunk blobs by hand, field for field as
-server_tokens::serialize (tools/server/server-common.cpp:278-316, 553-573) and
-mtmd_input_chunk_save (tools/mtmd/mtmd.cpp:29-136, 262-411) write them.
+server_tokens::serialize (tools/server/server-common.cpp:295-333, 570-590 at a7b94df2c; the same
+code on 85d5703a3) and mtmd_input_chunk_save (tools/mtmd/mtmd.cpp:29-136, 262-411) write them.
 
 MediaSlotTests drive a throwaway llama-server on 127.0.0.1 (ports 18540-18549, or from
 KVPARK_MEDIA_PORT) with real images and slot saves; they need KVPARK_LLAMA_SERVER=/path/to/a
-kvpark-patched llama-server with mtmd (runtime/build/bin/llama-server). The tiny dense (qwen3)
-and iSWA (muse-glimmer) fixtures run with a random qwen3vl_merger projector (NORMAL image
+kvpark-patched llama-server with mtmd of either pin (runtime/build/bin/llama-server or
+runtime-next/build-cpu/bin/llama-server at a7b94df2c, runtime-85d5703a3/build/bin/llama-server at
+85d5703a3). The tiny dense (qwen3) and iSWA
+(muse-glimmer) fixtures run with a random qwen3vl_merger projector (NORMAL image
 positions); KVPARK_QWEN_MMPROJ=/path/to/a 5120-wide qwen3vl_merger mmproj (the local Qwen3.8's)
 adds the tiny Qwen3.5 hybrid with M-RoPE image positions. Nothing is downloaded.
 """

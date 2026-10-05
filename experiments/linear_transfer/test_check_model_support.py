@@ -107,8 +107,9 @@ class FixtureRunTests(unittest.TestCase):
                     self.assertEqual(summary["seed_score"][name]["restored_pos_max"], seed - 1)
 
     def test_mla_and_dsa_fixtures_on_the_cpu_are_exact(self):
-        # K-only rows, the nextn zero layer, DSA indexer keys (top_k 8: the document is longer, so the
-        # rebuilt keys decide which cells attention reads) and DSA-iSWA sections
+        # K-only rows, the nextn layer (zero rows on 85d5703a3, none on a7b94df2c), DSA indexer keys
+        # (top_k 8: the document is longer, so the rebuilt keys decide which cells attention reads)
+        # and DSA-iSWA sections
         from test_kv_probe_integration import probe_supports
         with tempfile.TemporaryDirectory() as directory:
             create_mla_fixture(Path(directory) / "m.gguf", "deepseek2")
@@ -127,7 +128,13 @@ class FixtureRunTests(unittest.TestCase):
                 self.assertLessEqual(state["worst"]["k_derot_max_ulps"], 1)
                 self.assertLessEqual(state["worst"].get("ik_derot_max_ulps", 0), 1.5)
                 if architecture == "deepseek2":
-                    self.assertEqual(state["layers"]["2"], {"nextn_zero": True})
+                    # only 85d5703a3's plain cache keeps the nextn layer (zero rows); a7b94df2c filters it out
+                    kept = state["llama_revision"] == "85d5703a3"
+                    self.assertEqual(state["layers"].get("2"), {"nextn_zero": True} if kept else None)
+                    self.assertEqual(state["sections"][0]["layers"], [0, 1, 2] if kept else [0, 1])
+                    self.assertEqual(summary["spec"]["llama_revision"], state["llama_revision"])
+                    if kvstate.llama_revision_of(PROBE) is not None:
+                        self.assertEqual(state["llama_revision"], kvstate.llama_revision_of(PROBE))
                 for name in ("seed", "rebuilt"):
                     self.assertTrue(summary["seed_score"][name]["scores_identical_to_native"], name)
 

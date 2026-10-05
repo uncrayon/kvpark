@@ -10,10 +10,10 @@
                             and amplified test-llama-archs models: hy_v4, the KDA hybrids
                             (kimi-linear, kimi-k3, bailingmoe3) and the GQA hybrids, whose
                             translated attention rows restore to the native logits next to the
-                            native recurrent rows (R0 aside; the logits of the qwen3next,
-                            qwen35moe and qwen4exp fixtures barely hear attention even
-                            amplified, so only their states are checked), qwen4exp's block indexer
-                            above top_k (the ridge); kvstate's RoPE against the rows llama.cpp
+                            native recurrent rows (R0 aside; the logits of the qwen4exp
+                            fixture, and on 85d5703a3 those of qwen3next and qwen35moe, barely
+                            hear attention even amplified, so only their states are checked),
+                            qwen4exp's block indexer above top_k (the ridge); kvstate's RoPE against the rows llama.cpp
                             stores, for every model whose first layer is attention;
   CrossFamilyTests          a hub fitted (fit_hub.py) on kv_probe captures of a qwen3 fixture
                             and MLA/DSA fixtures translates between the families: shapes,
@@ -99,6 +99,54 @@ def reference_state(spec, native, t0, norms, *, ridge=None):
     return kvstate.StateFile(native.token_words, kvstate.SequenceState(spec, native.state.flags, parts))
 
 
+def _resliced(state_file, positions_of):
+    """state_file with each sliding KV section holding the cells at positions_of(stream): its own rows
+    where it has a cell there, zero rows elsewhere."""
+    spec = state_file.state.spec
+    parts = []
+    for part, layout in zip(state_file.state.parts, spec.layouts(state_file.state.flags)):
+        if layout.kind != "kv" or not layout.sliding:
+            parts.append(part)
+            continue
+        streams = []
+        for stream in part.streams:
+            if stream is None:
+                streams.append(None)
+                continue
+            if stream.ext is not None:
+                raise ValueError("cells with an ext (IMROPE, PLE) are not resliced")
+            positions = np.asarray(positions_of(stream), dtype=np.int32)
+            index = {int(p): i for i, p in enumerate(stream.positions)}
+            rows = [(at, index[int(p)]) for at, p in enumerate(positions) if int(p) in index]
+
+            def moved(table):
+                out = {}
+                for layer, values in table.items():
+                    out[layer] = np.zeros((len(positions),) + values.shape[1:], values.dtype)
+                    for at, cell in rows:
+                        out[layer][at] = values[cell]
+                return out
+            streams.append(kvstate.KVStream(positions, (stream.seq_ids[0],) * len(positions), None, stream.v_trans,
+                                            moved(stream.k), moved(stream.v), dict(stream.k_types),
+                                            dict(stream.v_types)))
+        parts.append(kvstate.KVCache(part.name, part.layers, streams))
+    return kvstate.StateFile(state_file.token_words, kvstate.SequenceState(spec, state_file.state.flags, parts))
+
+
+def sliding_history(native, n):
+    """A native state of [0, n) whose sliding sections hold every position: their own cells, and zero rows
+    where a cell left the window. The identity hub reads every layer at every source position; the zero
+    rows reach only target cells outside the window (a translated sliding section keeps the last n_swa + 1,
+    one more than a native save may hold, and no query reads the first of them)."""
+    return _resliced(native, lambda stream: np.arange(n))
+
+
+def sliding_window(state_file, start, end):
+    """state_file with every sliding section holding [start, end): zero rows where it had no cell (a cell
+    that left the window, translated from sliding_history's zero rows)."""
+    return _resliced(state_file, lambda stream: np.arange(start, end))
+
+
 def assert_states_equal(case, got, expected):
     """Two state files hold the same tokens, sections, cells and values (+0 and -0 alike: the identity
     hub's products turn a stored -0 into +0) and identical recurrent rows."""
@@ -147,7 +195,7 @@ class IdentityTranslationTests(unittest.TestCase):
         native = kvstate.read_file(native_path, spec)
         record, tokens = ff.byte_side(prompt)
         side = translate.Side(name, spec, record, tokens, gguf=self.models.path(name))
-        state, report = translate.translate(native, side, side, ff.identity_hub(name, spec), t0=n,
+        state, report = translate.translate(sliding_history(native, n), side, side, ff.identity_hub(name, spec), t0=n,
                                             template=kvstate.read_file(template, spec), server_tokens=False,
                                             indexer_ridge=ridge, backend=backend)
         path = driver.fresh(f"{name}-translated").with_suffix(".state")
@@ -155,6 +203,8 @@ class IdentityTranslationTests(unittest.TestCase):
         logits, restored = driver.restore(name, path, next_ids)
         self.assertEqual(restored["next_pos"], n)
         expected = reference_state(spec, native, n, translate.latent_norms(side), ridge=ridge)
+        if spec.n_swa:
+            expected = sliding_window(expected, max(0, n - spec.n_swa - 1), n)
         if out is not None:
             out.update(driver=driver, native=native, native_path=native_path, next_ids=next_ids)
         return native_logits, logits, report, state, expected, spec
@@ -182,7 +232,12 @@ class IdentityTranslationTests(unittest.TestCase):
                         # float32: the shell (|RMS(c_kv / g) - 1| ~ eps / mean square) and the RoPE round trip
                         np.testing.assert_allclose(logits, native, rtol=0, atol=5e-6 * max(1.0, np.abs(native).max()))
                     if name == "deepseek2-nextn":
-                        self.assertFalse(state.state.part("kv").stream().k[2].any())
+                        # the nextn layer: zero rows in 85d5703a3's plain cache, left out of a7b94df2c's
+                        stream = state.state.part("kv").stream()
+                        if spec.nextn_cached:
+                            self.assertFalse(stream.k[2].any())
+                        self.assertEqual((sorted(stream.k), spec.llama_revision),
+                                         ([0, 1, 2] if spec.nextn_cached else [0, 1], self.models.revision))
 
     def test_dsa_indexer_keys_below_and_above_top_k(self):
         for name in ("deepseek32", "glm-dsa"):
@@ -278,7 +333,8 @@ class IdentityTranslationTests(unittest.TestCase):
     def test_hybrids_and_hy_v4(self):
         # the K-only MLA hybrids (KDA), hy_v4 (MLA with a [nope | rope] indexer) and the hybrids with GQA
         # attention next to GatedDeltaNet, Mamba, short-conv or lightning layers (iSWA attention for lfm2,
-        # an indexer with V rows and PLE rows for qwen4exp, layers in both caches for falcon-h1), amplified
+        # an indexer (V rows on 85d5703a3, [key | pooled] rows on a7b94df2c) and PLE rows for qwen4exp, layers
+        # in both caches for falcon-h1), amplified
         # (ff.Models.amplified): latents on the RMS shell, so the identity translation is exact up to
         # rounding, and attention loud enough in the logits for the restore check below to fail on bad rows
         if not ff.LLAMA_ARCHS:
@@ -321,24 +377,94 @@ class IdentityTranslationTests(unittest.TestCase):
                     moved = np.abs(self.restored_logits(run["driver"], name, zeroed, run["next_ids"]) - native).max()
                     if moved < 100 * tolerance:
                         insensitive.add(arch)
-        # even amplified, attention barely reaches the logits of these three fixtures (moves of 3e-8 to 2.4e-7
-        # at a logit scale of 1.4e-3 to 4.9e-3): their attention rows are checked against kvstate's own
-        # construction only (and their RoPE against kv_probe captures, test_kv_probe_integration)
-        self.assertEqual(insensitive, {"qwen3next", "qwen35moe", "qwen4exp"})
+        # even amplified, attention barely reaches the logits of these fixtures on 85d5703a3 (moves of 3e-8 to
+        # 2.4e-7 at a logit scale of 1.4e-3 to 4.9e-3): their attention rows are checked against kvstate's own
+        # construction only (and their RoPE against kv_probe captures, test_kv_probe_integration). With
+        # a7b94df2c (its test-llama-archs writes ssm_a negative, and GatedDeltaNet normalizes q/k as
+        # x * rsqrt(sum x^2 + eps): STATE_FORMAT_a7b94df.md) the qwen3next and qwen35moe logits were measured
+        # to hear attention, so the restore checks their rows as well
+        expected = {"qwen3next", "qwen35moe", "qwen4exp"} if self.models.revision == "85d5703a3" else {"qwen4exp"}
+        self.assertEqual(insensitive, expected)
+
+    def test_gqa_models_restore_to_their_native_logits(self):
+        # plain and sliding-window GQA caches (per-layer KV heads and head sizes, gemma4's proportional RoPE
+        # and shared KV layers, laguna's plain RoPE on its sliding layers, llama's frequency factors) and
+        # GLM5-Next (NoPE MLA latents, KDA, [key | gate | pooled] indexer rows): a model translated into itself
+        # through the identity hub writes exactly kvstate's construction of the native state and restores to
+        # the native logits. The test-llama-archs models are amplified (their attention is a whisper in the
+        # logits otherwise); the tiny Gemma models hear attention as they are, through a GELU that rounds its
+        # input to float16 on the CPU, so a re-rotated key moves their logits by up to ~3e-4 of the scale
+        # (linear_transfer/test_layouts.py GELU_TOLERANCE). A sliding-window model's prompt is longer than its
+        # window, so its translated sliding section keeps the last n_swa + 1 cells only (what llama-server needs
+        # to reuse a restored iSWA cache) and still restores to the native logits.
+        names = list(ff.GEMMA)
+        if ff.LLAMA_ARCHS:
+            names += ["archs-" + arch for arch in ff.GQA_ARCHS + ff.LATER_ARCHS]
+        checked, insensitive = [], set()
+        for base in names:
+            try:
+                name = base if base in ff.GEMMA else self.models.amplified(base)
+                self.models.spec(name)
+            except (unittest.SkipTest, kvstate.StateFormatError):
+                continue                        # not written by this test-llama-archs, or not on this revision
+            checked.append(base)
+            for cache, fa in (("f32", "off"), ("f16", "on")):
+                with self.subTest(model=base, cache=cache, flash_attn=fa):
+                    model_spec = self.models.spec(name)
+                    n = 5 if model_spec.indexer is not None else model_spec.n_swa + 9 if model_spec.n_swa else 30
+                    run = {}
+                    native, logits, report, state, expected, spec = self.translate_into_itself(name, n, cache=cache,
+                                                                                               fa=fa, out=run)
+                    assert_states_equal(self, state, expected)              # exactly kvstate's construction
+                    self.assertTrue(np.isfinite(logits).all())
+                    restored = logits
+                    if any(isinstance(part, kvstate.RecurrentState) for part in state.state.parts):
+                        # the translated attention rows next to the native recurrent rows: R0 aside
+                        parts = [ours if isinstance(ours, kvstate.KVCache) else theirs
+                                 for ours, theirs in zip(state.state.parts, run["native"].state.parts)]
+                        restored = self.restored_logits(run["driver"], name, kvstate.StateFile(
+                            state.token_words, kvstate.SequenceState(spec, state.state.flags, parts)), run["next_ids"])
+                    if spec.memory == "iswa":
+                        sliding = state.state.part("swa").stream()
+                        self.assertEqual(sliding.positions.tolist(), list(range(max(0, n - spec.n_swa - 1), n)))
+                    tolerance = (2e-3 if base in ff.GEMMA and cache == "f32" else 1e-5) * np.abs(native).max()
+                    np.testing.assert_allclose(restored, native, rtol=0, atol=tolerance)
+                    # every attention row zeroed: the logits must move, else the check could not fail
+                    zeroed = kvstate.read_file(run["native_path"], spec)
+                    for part, layout in zip(zeroed.state.parts, spec.layouts(zeroed.state.flags)):
+                        if layout.kind == "kv" and layout.role == "attention":
+                            stream = part.stream()
+                            stream.k = {layer: np.zeros_like(rows) for layer, rows in stream.k.items()}
+                            stream.v = {layer: np.zeros_like(rows) for layer, rows in stream.v.items()}
+                    moved = np.abs(self.restored_logits(run["driver"], name, zeroed, run["next_ids"]) - native).max()
+                    if moved < 100 * tolerance:
+                        insensitive.add(base)
+        self.assertIn("gemma4", checked)
+        # the Gemma models and the amplified test-llama-archs ones hear their attention rows
+        self.assertEqual(insensitive, set())
 
     def test_pooled_indexer_ridge(self):
         # qwen4exp's block indexer caches raw per-token keys (no RoPE; pooled into blocks when read) and zero
-        # V rows: above top_k it needs the ridge (fitted on its own states, like the DSA models')
+        # V rows (85d5703a3) or the pooled keys, written zero and re-pooled on restore (a7b94df2c); GLM5-Next's
+        # rows hold a per-token pool gate beside the key ([key | gate | pooled]), which its ridge predicts with
+        # the key: above top_k they need the ridge (fitted on their own states' keys, like the DSA models')
         if not ff.LLAMA_ARCHS:
             self.skipTest("set KVPARK_LLAMA_ARCHS for the test-llama-archs models")
-        name = "archs-qwen4exp"
-        with self.assertRaisesRegex(translate.IndexerKeysUnavailable, "no indexer keys"):
-            self.translate_into_itself(name, 30)
-        native, logits, report, state, expected, spec = self.translate_into_itself(name, 30, ridge=self.ridge(name))
-        self.assertEqual(report["indexer"], "ridge")
-        assert_states_equal(self, state, expected)
-        self.assertTrue(all(keys.any() for keys in state.state.part("indexer").stream().k.values()))
-        self.assertTrue(np.isfinite(logits).all())
+        for name in ("archs-qwen4exp", "archs-glm5-next"):
+            try:
+                spec = self.models.spec(name)
+            except kvstate.StateFormatError:
+                continue                        # GLM5-Next: a7b94df2c only
+            with self.subTest(model=name):
+                with self.assertRaisesRegex(translate.IndexerKeysUnavailable, "no indexer keys"):
+                    self.translate_into_itself(name, 30)
+                ridge = self.ridge(name)
+                self.assertEqual(ridge.weights[0].shape[1], spec.indexer.head_size * spec.indexer_key_slots)
+                native, logits, report, state, expected, spec = self.translate_into_itself(name, 30, ridge=ridge)
+                self.assertEqual(report["indexer"], "ridge")
+                assert_states_equal(self, state, expected)
+                self.assertTrue(all(keys.any() for keys in state.state.part("indexer").stream().k.values()))
+                self.assertTrue(np.isfinite(logits).all())
 
     def test_rope_conventions_match_llama_cpp(self):
         # A first layer's pre-RoPE K row (and indexer key) depends on its token alone, so the cache rows one
@@ -346,11 +472,16 @@ class IdentityTranslationTests(unittest.TestCase):
         # scaling, offset or rotary width leaves them apart. This checks kvstate's RoPE against the rows
         # llama.cpp stores, also for the graphs without a pre-RoPE capture (kimi-k3 and kimi-linear: NoPE;
         # bailingmoe3, hy_v4 and its indexer keys).
-        names = list(ff.TINY) + (["archs-" + arch for arch in ff.ARCHS] if ff.LLAMA_ARCHS else [])
+        names = list(ff.TINY) + list(ff.GEMMA)
+        if ff.LLAMA_ARCHS:
+            names += ["archs-" + arch for arch in ff.ARCHS + ff.GQA_ARCHS + ff.LATER_ARCHS]
         rng = np.random.default_rng(5)
         checked = set()
         for name in names:
-            spec = self.models.spec(name)
+            try:
+                spec = self.models.spec(name)
+            except (unittest.SkipTest, kvstate.StateFormatError):
+                continue                        # not written by this test-llama-archs, or not on this revision
             if 0 not in spec.attention_layers:
                 continue
             prompt = (ff.ascii_ids(rng, 6, self.models.vocab[name]) * 7)[:40]     # six tokens at 6-7 positions each
@@ -403,9 +534,11 @@ class IdentityTranslationTests(unittest.TestCase):
 
 @unittest.skipUnless(ff.DRIVER and ff.PROBE, "set KVPARK_STATE_DRIVER and KVPARK_KV_PROBE for the cross-family hub")
 class CrossFamilyTests(unittest.TestCase):
-    """qwen3 (GQA) <-> deepseek2 (MLA), deepseek32 (DSA: the hub's indexer ridge) and dots3note (DSA-iSWA:
-    a sliding-window source encodes its global layers) through a hub fitted on kv_probe captures of the
-    four fixtures."""
+    """qwen3 (GQA) <-> deepseek2 (MLA), deepseek32 (DSA: the hub's indexer ridge), dots3note (DSA-iSWA:
+    a sliding-window source encodes its global layers) and gemma4 with a 16-token window (iSWA with
+    per-layer head sizes and proportional RoPE: as a target its sliding layers hold the last 17 cells,
+    as a source its global layers alone are encoded) through a hub fitted on kv_probe captures of the
+    five fixtures."""
 
     @classmethod
     def setUpClass(cls):
@@ -421,10 +554,16 @@ class CrossFamilyTests(unittest.TestCase):
         records = ff.rendered_records(conversations)
         (cls.root / "records.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
         arguments = []
-        for name in ("qwen3", "deepseek2", "deepseek32", "dots3note"):
+        names = ("qwen3", "deepseek2", "deepseek32", "dots3note")
+        # probes built before the GQA rows refuse gemma4: the hub then leaves it out
+        names += ("gemma4-w16",) if ff.probe_supports(cls.models.path("gemma4-w16"), cls.root) else ()
+        for name in names:
             keys = ("k", "v", "ik") if name in ("deepseek32", "dots3note") else None
             capture = ff.probe_collect(cls.models.path(name), records, cls.root / f"{name}-capture", keys=keys)
             arguments += ["--model", f"{name}={capture}@{cls.root / 'records.jsonl'}"]
+        if "gemma4-w16" in names:
+            arguments += ["--source-global", "gemma4-w16"]
+        cls.gemma = "gemma4-w16" in names
         cls.bundle = cls.root / "hub"
         with open(os.devnull, "w") as quiet:
             stdout, sys.stdout = sys.stdout, quiet
@@ -463,9 +602,12 @@ class CrossFamilyTests(unittest.TestCase):
         return state, report, restored, logits, t0
 
     def test_gqa_and_mla_translate_both_ways(self):
-        for source, target in (("qwen3", "deepseek2"), ("deepseek2", "qwen3"), ("qwen3", "deepseek32"),
-                               ("deepseek2", "deepseek32"), ("qwen3", "dots3note"), ("dots3note", "qwen3"),
-                               ("dots3note", "deepseek2")):
+        pairs = [("qwen3", "deepseek2"), ("deepseek2", "qwen3"), ("qwen3", "deepseek32"), ("deepseek2", "deepseek32"),
+                 ("qwen3", "dots3note"), ("dots3note", "qwen3"), ("dots3note", "deepseek2")]
+        if self.gemma:
+            pairs += [("qwen3", "gemma4-w16"), ("gemma4-w16", "qwen3"), ("gemma4-w16", "deepseek32"),
+                      ("dots3note", "gemma4-w16")]
+        for source, target in pairs:
             with self.subTest(source=source, target=target):
                 state, report, restored, logits, t0 = self.switch(source, target, self.bundle)
                 spec = self.models.spec(target)

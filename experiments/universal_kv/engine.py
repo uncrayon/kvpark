@@ -7,10 +7,12 @@ Job:
     {"hub": DIR, "tail": 2048, "fill": "mean", "device": "auto",       # device: auto | cpu | gpu
      "conversation": {"messages": [...], "tools": null,      # chat.py rules; ends with the new message
                       "template_options": null},             # optional: the request's template fields
-     "source": {"name": "qwen38", "gguf": PATH, "state": SLOT_FILE, "runtime": null},
+     "source": {"name": "qwen38", "gguf": PATH, "state": SLOT_FILE, "runtime": null,
+                "build_info": null},                           # optional: the server's /props build_info
      "target": {"name": "muse", "gguf": PATH, "template_state": SLOT_FILE, "output": NEW_FILE,
                 "tokens": [[id, "piece" | [bytes]], ...],      # the target server's /tokenize
                 "runtime": null,                               # optional: the server's RoPE settings
+                "build_info": null,                            # optional: the server's /props build_info
                 "template_kwargs": null,                       # optional: the server's template flags
                 "max_t0_message": null,                        # optional: T0 stops before message k
                 "recurrent_mean": null,                        # optional (hybrid targets): a mean npz
@@ -21,9 +23,16 @@ Job:
 names, kvstate.RUNTIME_ROPE_KEYS: rope_scaling_type, rope_freq_base, rope_freq_scale,
 yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow, yarn_orig_ctx; None = unset),
 passed to kvstate.ModelSpec.from_metadata: the RoPE that de-rotates the source's keys and rotates
-the target's must be the one each server applies (only the MLA family and the hybrids accept
-overrides). A GGUF's rope_freqs.weight (granitehybrid's frequency factors) is read once into its
-profile, so specs rotate with it as ModelSpec.from_gguf's do.
+the target's must be the one each server applies (the MLA family, the hybrids and the GQA family
+accept overrides). The RoPE frequency factors a GGUF keeps as tensors (rope_freqs.weight of
+granitehybrid, llama, mistral3 and gemma4; kvstate.ROPE_FACTOR_TENSOR_ARCHITECTURES) are read once
+into its profile, so specs rotate with them as ModelSpec.from_gguf's do; a GGUF whose factors
+kvstate refuses (LongRoPE rope_factors_long/short: phi3's, or a llama's) gets no spec. "build_info" (llama-server's
+/props build_info, "b<number>-<commit>") names the llama.cpp pin the server runs
+(kvstate.llama_revision_of; job_revision), whose layouts and RoPE the side's spec takes; without it,
+or when it names no known pin, the spec is kvstate's default revision. Either way the states are
+read in the layout they hold (kvstate.parse_file tries the other pin's reading too, and translate
+takes the template's and the source state's).
 
 The target record is the conversation rendered with the target's own chat template and the
 generation prompt (what the target server will process next); its tokens come from the target
@@ -41,8 +50,17 @@ used (report["rendering"]); when none matches, the job
 fails with TemplateMismatch (a ValueError; `engine.py JOB` exits with TEMPLATE_MISMATCH), so
 the bridge can translate the template's default rendering instead. The source record is
 rebuilt from the source slot itself: its token ids decoded with the source vocabulary, and
-every message segment located in that text in order. A template that re-renders history
-differently (dropped reasoning, other whitespace) only costs alignment, never correctness.
+every message segment located in that text, where the source's own template renders it in the
+part of the text that rendering spells (source_spans: the history up to the reply the source
+generated), else in order (located_record: the in-order occurrences covering the most bytes;
+report["source_segments_rendered"] and ["source_segments_found"]). A template that re-renders
+history differently (dropped reasoning, other whitespace, arguments written JSON-escaped) only
+costs alignment, never correctness; both records span a segment's text inside the whitespace at
+its edges (chat.render, live), which templates often trim.
+Vocabularies (vocabulary, TOKENIZER_MODELS: GPT-2 byte-level BPE, Gemma 4's BPE, SentencePiece)
+are decoded as llama.cpp's token_to_piece prints them, and the space a SentencePiece tokenizer
+puts before each text after a special token (add_space_prefix) is dropped from both sides'
+pieces (spelled_pieces), so that the pieces join to the text.
 
 A source slot that holds media (images or audio its server's projector encoded) is read up to
 its first medium (kvstate.media_cut and truncate_state: the media cells and everything after
@@ -98,14 +116,17 @@ if __name__ == "__main__":
     for _name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ.setdefault(_name, "8")
 
+import bisect
 from collections import OrderedDict
 import functools
+import itertools
 import json
 import mmap
 from pathlib import Path
 import sys
 import threading
 import time
+from typing import NamedTuple
 import zipfile
 
 import jinja2
@@ -125,16 +146,29 @@ import chat  # noqa: E402
 import gguf_tensors  # noqa: E402
 import kvstate  # noqa: E402
 
-CONTROL = 3            # llama.cpp token type: control (special) token
-PROFILE_FORMAT = 2     # 2: the EOS text and rope_freqs.weight (frequency factors) are kept too
+# llama.cpp token types (llama_token_type, the GGUF's tokenizer.ggml.token_type)
+NORMAL, UNKNOWN, CONTROL, USER_DEFINED, UNUSED, BYTE = 1, 2, 3, 4, 5, 6
+# tokens llama.cpp prints as their text and reads as special fragments (attr_special and
+# user-defined: llama_vocab::impl::token_to_piece, cache_special_tokens)
+RAW_TYPES = (UNKNOWN, CONTROL, USER_DEFINED)
+# tokenizer.ggml.model values the engine reads (llama_vocab::impl::load): byte-level BPE,
+# Gemma 4's BPE with SentencePiece pieces, SentencePiece ("llama": Jamba)
+TOKENIZER_MODELS = ("gpt2", "gemma4", "llama")
+# BPE pre-tokenizers whose pieces write a space as U+2581 (escape_whitespaces in llama-vocab.cpp)
+ESCAPED_PRE = ("gemma4", "granite-embed-multi-311m", "mmbert", "sarvam-moe")
+PROFILE_FORMAT = 4     # 2: the EOS text and rope_freqs.weight (frequency factors) are kept too;
+                       # 3: the pre-tokenizer and add_space_prefix (non-BPE vocabularies);
+                       # 4: the frequency factors of every kvstate.ROPE_FACTOR_TENSOR_ARCHITECTURES model
 MAX_ARRAY = 1 << 16    # per-layer metadata arrays are read whole (the vocabulary is kept apart)
 # what this engine handles beyond earlier ones (the bridge skips those switches for engines
 # without them): "template-options" renders the target with the request's template options;
 # "media-source" reads a source slot that holds media up to its first medium; "recurrent-mean"
-# starts a hybrid target's recurrent cell from target["recurrent_mean"]
-FEATURES = ("media-source", "template-options", "recurrent-mean")
+# starts a hybrid target's recurrent cell from target["recurrent_mean"]; "vocabularies" reads
+# vocabularies other than GPT-2 byte-level BPE (TOKENIZER_MODELS: Gemma 4's BPE, SentencePiece)
+FEATURES = ("media-source", "template-options", "recurrent-mean", "vocabularies")
 TEMPLATE_MISMATCH = 4  # exit status of `engine.py JOB` when the job fails with TemplateMismatch
 MEAN_CACHE = 4         # recurrent mean groups kept per process (a Qwen3.8 group: 157 MB in float32)
+LOCATE_OCCURRENCES = 1024  # located_record: a segment text found more often in the source is not placed
 
 
 class TemplateMismatch(ValueError):
@@ -162,9 +196,10 @@ def _identity(gguf_path):
 
 def profile(gguf_path, cache_dir=None):
     """What the engine needs from a GGUF, parsed once and cached per file identity: the metadata
-    summary (state spec), the vocabulary with token types, the chat template, BOS and EOS text,
-    and granitehybrid's RoPE frequency factors (rope_freqs.weight; [] without one, None for
-    other architectures)."""
+    summary (state spec), the vocabulary with token types, tokenizer model, pre-tokenizer and
+    add_space_prefix, the chat template, BOS and EOS text, and the RoPE frequency factors of a
+    kvstate.ROPE_FACTOR_TENSOR_ARCHITECTURES model (kvstate.gguf_rope_freq_factors: [] without them;
+    {"refused": reason} when kvstate refuses them; None for other architectures)."""
     return _profile(*_identity(gguf_path), cache_dir)
 
 
@@ -179,9 +214,12 @@ def _profile(path, size, mtime_ns, cache_dir):
         # 64 entries (a deep model's per-layer head counts or indexer types): built again
         if data.get("format") == PROFILE_FORMAT and not _summarized(data.get("metadata", {})):
             return data
-    reader, tensors = gguf_tensors.reader(str(path))
-    field = reader.fields.get("tokenizer.ggml.model")
-    model = field.contents() if field is not None else None
+    reader, _ = gguf_tensors.reader(str(path))
+
+    def tokenizer_key(name):
+        field = reader.fields.get(f"tokenizer.ggml.{name}")
+        return field.contents() if field is not None else None
+    model = tokenizer_key("model")
     types = reader.fields.get("tokenizer.ggml.token_type")
     info = chat.gguf_tokenizer_info(str(path))
     if info["chat_template"] is None:
@@ -190,15 +228,19 @@ def _profile(path, size, mtime_ns, cache_dir):
     metadata = {name: gguf_tensors._field_value(item, MAX_ARRAY) for name, item in reader.fields.items()
                 if not name.startswith(("GGUF.", "tokenizer."))}
     factors = None
-    if metadata.get("general.architecture") == "granitehybrid":
-        # an optional tensor the metadata does not show (kvstate.ModelSpec.from_gguf reads it alike)
-        factors = []
-        if "rope_freqs.weight" in tensors:
-            factors = [float(x) for x in np.asarray(gguf_tensors.read_tensor(str(path), "rope_freqs.weight"),
-                                                    dtype=np.float32).ravel()]
+    if metadata.get("general.architecture") in kvstate.ROPE_FACTOR_TENSOR_ARCHITECTURES:
+        # tensors the metadata does not show, from whichever file of a split GGUF holds them
+        # (kvstate.ModelSpec.from_gguf reads them alike)
+        try:
+            found = kvstate.gguf_rope_freq_factors(path, kvstate.ModelSpec.from_metadata(_json_value(metadata)))
+            factors = None if found is None else list(found)
+        except kvstate.StateFormatError as error:
+            factors = {"refused": str(error)}
     data = {"format": PROFILE_FORMAT, "file": key,
             "metadata": _json_value(metadata),
-            "tokenizer_model": model, "tokens": list(reader.fields["tokenizer.ggml.tokens"].contents()),
+            "tokenizer_model": model, "tokenizer_pre": tokenizer_key("pre"),
+            "add_space_prefix": tokenizer_key("add_space_prefix"),
+            "tokens": list(reader.fields["tokenizer.ggml.tokens"].contents()),
             "token_types": list(types.contents()) if types is not None else [],
             "chat_template": info["chat_template"], "bos_token": info["bos_token"], "eos_token": info["eos_token"],
             "rope_freq_factors": factors}
@@ -219,18 +261,32 @@ def _summarized(metadata):
 _PROFILE_CACHE = [None]
 
 
-def spec_of(gguf_path, runtime=None):
-    """The model's kvstate.ModelSpec, as ModelSpec.from_gguf builds it (the frequency factors of a
-    rotating granitehybrid included); runtime: the serving context's RoPE settings (see the
-    module docstring)."""
+def spec_of(gguf_path, runtime=None, llama_revision=None):
+    """The model's kvstate.ModelSpec, as ModelSpec.from_gguf builds it (its RoPE frequency factors
+    included); runtime: the serving context's RoPE settings (see the module docstring);
+    llama_revision: the pin the server runs (job_revision), else kvstate's default."""
     if runtime is not None and not isinstance(runtime, dict):
         raise ValueError("a runtime must be a mapping of RoPE settings")
     data = profile(str(gguf_path), _PROFILE_CACHE[0])
-    spec = kvstate.ModelSpec.from_metadata(data["metadata"], runtime=runtime)
+    spec = kvstate.ModelSpec.from_metadata(data["metadata"], runtime=runtime, llama_revision=llama_revision)
     factors = data.get("rope_freq_factors")
-    if factors is not None and spec.architecture == "granitehybrid" and spec.rope_type != "none":
-        spec = kvstate.ModelSpec.from_metadata(data["metadata"], runtime=runtime, rope_freq_factors=factors)
+    if isinstance(factors, dict):
+        raise kvstate.StateFormatError(factors["refused"])
+    if factors is not None and spec.rope_type != "none":
+        spec = kvstate.ModelSpec.from_metadata(data["metadata"], runtime=runtime, rope_freq_factors=factors,
+                                               llama_revision=llama_revision)
     return spec
+
+
+def job_revision(side):
+    """The kvstate.LLAMA_REVISIONS pin a job side's server runs: its "build_info" (/props) when that
+    names a known pin, else None (kvstate's default)."""
+    info = side.get("build_info")
+    if info is None:
+        return None
+    if not isinstance(info, str):
+        raise ValueError("a build_info must be llama-server's /props build_info string")
+    return kvstate.llama_revision_of(info)
 
 
 @functools.lru_cache(maxsize=None)
@@ -247,61 +303,209 @@ def _byte_decoder():
     return {chr(c): b for b, c in zip(bs, cs)}
 
 
+class Vocabulary(NamedTuple):
+    """A GGUF's vocabulary as llama.cpp reads it (llama_vocab::impl::load).
+
+    spelling: how a normal token's string spells its bytes, "bpe" (GPT-2 byte-level characters)
+    or "spm" (SentencePiece: U+2581 for a space; byte tokens <0xNN> carry one byte each), for
+    SentencePiece vocabularies and BPE ones that escape whitespace (Gemma 4). space_prefix: the
+    tokenizer puts a space before the text that starts a prompt or follows a special token
+    (a SentencePiece vocabulary's add_space_prefix, true unless the GGUF says false), which the
+    pieces print and the text does not hold (spelled_pieces)."""
+
+    tokens: tuple
+    types: tuple
+    model: str
+    spelling: str
+    space_prefix: bool
+
+
 def vocabulary(gguf_path):
-    """(token strings, token types, tokenizer model) of a GGUF (byte-level BPE only)."""
+    """The Vocabulary of a GGUF (TOKENIZER_MODELS: byte-level BPE, Gemma 4's BPE, SentencePiece)."""
     return _vocabulary(*_identity(gguf_path), _PROFILE_CACHE[0])
 
 
 @functools.lru_cache(maxsize=8)
 def _vocabulary(path, size, mtime_ns, cache_dir):
     data = _profile(path, size, mtime_ns, cache_dir)
-    if data["tokenizer_model"] != "gpt2":
-        raise ValueError(f"{path}: tokenizer model {data['tokenizer_model']!r} is not supported yet "
-                         "(byte-level BPE only)")
-    return tuple(data["tokens"]), tuple(data["token_types"]), data["tokenizer_model"]
+    model = data["tokenizer_model"]
+    if model not in TOKENIZER_MODELS:
+        raise ValueError(f"{path}: tokenizer model {model!r} is not supported yet "
+                         f"(supported: {', '.join(TOKENIZER_MODELS)})")
+    spm = model == "llama"
+    escaped = spm or model == "gemma4" or data.get("tokenizer_pre") in ESCAPED_PRE
+    prefix = data.get("add_space_prefix")
+    return Vocabulary(tuple(data["tokens"]), tuple(data["token_types"]), model, "spm" if escaped else "bpe",
+                      spm and prefix is not False)
 
 
-def token_bytes(gguf_path, ids):
-    tokens, types, _ = vocabulary(str(gguf_path))
-    decoder = _byte_decoder()
-    out = []
-    for token_id in ids:
-        text = tokens[int(token_id)]
-        if types and types[int(token_id)] == CONTROL:
-            out.append(text.encode("utf-8"))
-        else:
-            out.append(bytes(decoder[ch] for ch in text) if all(ch in decoder for ch in text) else text.encode("utf-8"))
-    return out
+def _token_type(vocab, token_id):
+    return vocab.types[token_id] if vocab.types else NORMAL
+
+
+def _piece(vocab, token_id):
+    """llama_vocab::impl::token_to_piece(token, special=true) of one token: special and
+    user-defined tokens as their text, normal tokens decoded (GPT-2 byte characters, or U+2581
+    as a space), byte tokens as their byte, unused and undefined tokens as nothing."""
+    text = vocab.tokens[token_id] or f"[EMPTY_{token_id}]"      # llama.cpp renames empty strings
+    kind = _token_type(vocab, token_id)
+    if kind in RAW_TYPES:
+        return text.encode("utf-8")
+    if kind == NORMAL:
+        if vocab.spelling == "spm":
+            return text.replace("\u2581", " ").encode("utf-8")
+        decoder = _byte_decoder()
+        if all(ch in decoder for ch in text):
+            return bytes(decoder[ch] for ch in text)
+        # llama_decode_text: a character outside the byte map becomes a marker naming it
+        return b"".join(bytes([decoder[ch]]) if ch in decoder else
+                        f"[UNK_BYTE_0x{ch.encode('utf-8').hex()}{text}]".encode("utf-8") for ch in text)
+    if kind == BYTE:
+        return bytes([int(text[3:5], 16)])
+    return b""
+
+
+def token_bytes(gguf_path, ids, *, spelled=False):
+    """Each token's bytes as llama-server's /tokenize pieces give them (llama_token_to_piece with
+    special=true); spelled=True: as spelled_pieces returns them (their join is the text)."""
+    vocab = vocabulary(str(gguf_path))
+    pieces = [_piece(vocab, int(token_id)) for token_id in ids]
+    return spelled_pieces(gguf_path, ids, pieces) if spelled else pieces
+
+
+def spelled_pieces(gguf_path, ids, pieces):
+    """The pieces as the tokenized text spells them. A SentencePiece tokenizer with
+    add_space_prefix tokenizes the text at the start of a prompt and after each special
+    token with a space in front (llama_vocab::impl::tokenize: is_prev_special), which that
+    text's first piece prints: it is dropped there, so the pieces join to the text the server
+    tokenized. Every other vocabulary's pieces are returned as they are.
+
+    "Special" is read from the GGUF token types (RAW_TYPES), not from the attributes llama.cpp
+    derives at load (it marks some NORMAL end-of-turn tokens CONTROL too; no local SentencePiece
+    vocabulary has such a token), and text holding a literal U+2581 cannot be spelled back (it
+    tokenizes as a space): either way the target pieces do not spell the rendering and the
+    engine refuses the switch (TemplateMismatch)."""
+    vocab = vocabulary(str(gguf_path))
+    pieces = list(pieces)
+    if not vocab.space_prefix:
+        return pieces
+    after_special = True
+    for index, token_id in enumerate(ids):
+        kind = _token_type(vocab, int(token_id))
+        if after_special and kind == NORMAL and pieces[index].startswith(b" "):
+            pieces[index] = pieces[index][1:]
+        after_special = kind in RAW_TYPES
+    return pieces
 
 
 def token_arrays(gguf_path, ids, pieces):
     """token_id / byte_end / special from token ids and their byte pieces."""
-    _, types, _ = vocabulary(str(gguf_path))
+    types = vocabulary(str(gguf_path)).types
     ends = np.cumsum([len(piece) for piece in pieces]).astype(np.int64)
     special = np.asarray([1 if types and types[int(i)] == CONTROL else 0 for i in ids], dtype=np.uint8)
     return {"token_id": np.asarray(ids, dtype=np.int32), "byte_end": ends, "special": special}
 
 
-def located_record(conversation, document_id, text_bytes):
-    """A rendered-record stand-in for text the source model actually processed: segments located in order."""
-    keys, spans, cursor = [], [], 0
+def _common_prefix(a, b):
+    """Length of the longest common prefix of two byte strings."""
+    low, high = 0, min(len(a), len(b))
+    while low < high:
+        middle = (low + high + 1) // 2
+        if a[:middle] == b[:middle]:
+            low = middle
+        else:
+            high = middle - 1
+    return low
+
+
+def source_spans(conversation, source_profile, options, ids, pieces, gguf):
+    """The spans the source's own template gives the segments in its slot's text: chat.render
+    (live, no generation prompt) in each chat.server_contexts candidate for the request's options,
+    the one sharing the longest prefix with the text (after a leading control token, BOS, when
+    the rendering lacks it), and of its spans those inside that prefix, as [[segment, start,
+    end]]. The slot holds the previous request and the reply the source generated, so the prefix
+    usually runs to that reply; [] when no candidate renders."""
+    joined = b"".join(pieces)
+    types = vocabulary(str(gguf)).types
+    shifts = [0] + ([len(pieces[0])] if len(ids) and types and types[int(ids[0])] == CONTROL else [])
+    try:
+        contexts = chat.server_contexts(options, eos_token=source_profile.get("eos_token") or "")
+    except ValueError:
+        return []
+    best = (0, [])
+    for _, context in contexts:
+        try:
+            rendered = chat.render(conversation, source_profile["chat_template"], bos_token=source_profile["bos_token"],
+                                   extra_context=context, live=True)
+        except (ValueError, jinja2.TemplateError):
+            continue
+        text = rendered.text.encode("utf-8")
+        for shift in shifts:
+            common = _common_prefix(text, joined[shift:])
+            if common > best[0]:
+                best = (common, [[n, a + shift, b + shift] for n, a, b in rendered.segments if b <= common])
+    return best[1]
+
+
+def located_record(conversation, document_id, text_bytes, known=None):
+    """A rendered-record stand-in for text the source model actually processed. `known` spans
+    (source_spans: where the source's own template puts them) are kept; every later segment's
+    core (chat.render's live spans: the text inside the whitespace at its edges) is located after
+    them, in segment order and without overlaps, choosing the occurrences that cover the most
+    bytes (the earliest on ties). A segment the source template renders elsewhere or not at all
+    (a tool-call argument that also appears in a later answer, content written after its tool
+    calls) then costs only itself, not the segments after it; one found more than
+    LOCATE_OCCURRENCES times is too ambiguous to place."""
+    known = sorted(known or [], key=lambda span: span[1])
+    after, last = (known[-1][2], max(n for n, _, _ in known)) if known else (0, -1)
+    keys, found = [], []                    # found: (segment, start, end) occurrences, by segment
     for number, (key, value) in enumerate(chat.segment_texts(conversation)):
         keys.append(key)
-        needle = value.encode("utf-8")
-        found = text_bytes.find(needle, cursor)
-        if found >= 0:
-            spans.append([number, found, found + len(needle)])
-            cursor = found + len(needle)
-    return {"document_id": document_id, "text": text_bytes.decode("utf-8", errors="strict"), "segments": spans,
-            "segment_keys": keys, "split": "test", "final_message_segments": []}
+        needle = value.strip(chat.EDGE_SPACE).encode("utf-8")
+        starts, at = [], text_bytes.find(needle, after) if needle and number > last else -1
+        while at >= 0 and len(starts) <= LOCATE_OCCURRENCES:
+            starts.append(at)
+            at = text_bytes.find(needle, at + 1)
+        if len(starts) <= LOCATE_OCCURRENCES:
+            found.extend((number, start, start + len(needle)) for start in starts)
+    # longest chain: best[i] = (bytes covered by the best chain ending in occurrence i, -its end)
+    # over the earlier segments' occurrences ending before i starts (a Fenwick tree of maxima)
+    ends = sorted({end for _, _, end in found})
+    tree, best, previous = [None] * (len(ends) + 1), [], []
+    for _, group in itertools.groupby(range(len(found)), key=lambda i: found[i][0]):
+        group = list(group)
+        for i in group:
+            number, start, end = found[i]
+            node, chain = bisect.bisect_right(ends, start), None
+            while node:
+                if tree[node] is not None and (chain is None or tree[node] > chain):
+                    chain = tree[node]
+                node -= node & -node
+            best.append(((chain[0] if chain else 0) + end - start, -end))
+            previous.append(chain[2] if chain else None)
+        for i in group:                     # a segment's own occurrences never chain
+            node = bisect.bisect_left(ends, found[i][2]) + 1
+            while node <= len(ends):
+                if tree[node] is None or (*best[i], i) > tree[node]:
+                    tree[node] = (*best[i], i)
+                node += node & -node
+    spans, i = [], max(range(len(best)), key=best.__getitem__, default=None)
+    while i is not None:
+        spans.append(list(found[i]))
+        i = previous[i]
+    return {"document_id": document_id, "text": text_bytes.decode("utf-8", errors="strict"),
+            "segments": [list(span) for span in known] + spans[::-1], "segment_keys": keys, "split": "test",
+            "final_message_segments": []}
 
 
-def target_pieces(tokens):
+def target_pieces(tokens, gguf_path=None):
+    """(ids, byte pieces) of a target server's /tokenize answer; with the target's GGUF, the
+    pieces as the text spells them (spelled_pieces)."""
     ids, pieces = [], []
     for token_id, piece in tokens:
         ids.append(int(token_id))
         pieces.append(bytes(piece) if isinstance(piece, list) else piece.encode("utf-8"))
-    return ids, pieces
+    return ids, (spelled_pieces(gguf_path, ids, pieces) if gguf_path is not None else pieces)
 
 
 _MEANS = OrderedDict()             # (path, size, mtime_ns, group) -> recurrent_init.RecurrentMean
@@ -426,7 +630,7 @@ def _spelling_shift(joined, text, ids, pieces, gguf, *, prefix):
         return joined[at:].startswith(text) if prefix else joined[at:] == text
     if spells(0):
         return 0
-    _, types, _ = vocabulary(str(gguf))
+    types = vocabulary(str(gguf)).types
     lead = pieces[0] if pieces and types and types[ids[0]] == CONTROL else b""
     if lead and joined.startswith(lead) and spells(len(lead)):
         return len(lead)
@@ -500,14 +704,15 @@ def run(job, *, hub=None, backend=None, log=None):
         hub = hub_module.open_hub(job["hub"], cache_dir=job.get("cache_dir"))
     timings["hub_open_s"] = round(time.perf_counter() - t, 3)
     t = time.perf_counter()
-    source_spec, target_spec = spec_of(src["gguf"], src.get("runtime")), spec_of(tgt["gguf"], tgt.get("runtime"))
+    source_spec = spec_of(src["gguf"], src.get("runtime"), llama_revision=job_revision(src))
+    target_spec = spec_of(tgt["gguf"], tgt.get("runtime"), llama_revision=job_revision(tgt))
     target_profile = profile(str(tgt["gguf"]), _PROFILE_CACHE[0])
     timings["profiles_s"] = round(time.perf_counter() - t, 3)
     if translate.numpy_only(target_spec) and backend.name != "numpy":
         # a DeepSeek V4 target pools on the CPU: the numpy backend keeps its hub sides resident
         backend = backends.select("cpu")
     t = time.perf_counter()
-    ids, pieces = target_pieces(tgt["tokens"])
+    ids, pieces = target_pieces(tgt["tokens"], tgt["gguf"])
     joined = b"".join(pieces)
     rendered, shift, rendering = render_target(conversation, target_profile, template_options, ids, pieces,
                                                tgt["gguf"], media=media, server_kwargs=server_kwargs)
@@ -532,8 +737,10 @@ def run(job, *, hub=None, backend=None, log=None):
         source_media = None
     timings["read_source_s"] = round(time.perf_counter() - t_read, 3)
     source_ids = np.asarray(source_state.tokens)
-    source_piece_bytes = token_bytes(src["gguf"], source_ids)
-    source_record = located_record(conversation, document_id, b"".join(source_piece_bytes))
+    source_piece_bytes = token_bytes(src["gguf"], source_ids, spelled=True)
+    known = source_spans(conversation, profile(str(src["gguf"]), _PROFILE_CACHE[0]), template_options, source_ids,
+                         source_piece_bytes, src["gguf"])
+    source_record = located_record(conversation, document_id, b"".join(source_piece_bytes), known=known)
     source_tokens = token_arrays(src["gguf"], source_ids, source_piece_bytes)
 
     P = len(ids)
@@ -601,7 +808,7 @@ def run(job, *, hub=None, backend=None, log=None):
     # whole 128-token blocks): the restore, the .resume and the native tail follow the report's
     t0 = int(report.get("t0", t0))
     report.update(engine_timings=timings, P=P, t0=t0, tail=P - t0, source_tokens=int(len(source_ids)),
-                  source_segments_found=len(source_record["segments"]),
+                  source_segments_found=len(source_record["segments"]), source_segments_rendered=len(known),
                   segments=len(source_record["segment_keys"]), output=str(tgt["output"]), output_bytes=written,
                   backend_info=backend.describe(), blas=blas["name"], blas_gflops=blas["gflops"],
                   engine_seconds=round(time.perf_counter() - started, 3))
