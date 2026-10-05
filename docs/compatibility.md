@@ -28,7 +28,8 @@ longer accepts `--mmap`, `--no-mmap`, `--mlock` or `--direct-io`; use `--load-mo
 The state-format changes between the two pins that matter to the KV translator are
 summarized in [validation](validation.md#llamacpp-a7b94df2c-runtime-upgrade--october-4-2026);
 the full comparison is local evidence of the development checkout and is not part of
-the repository.
+the repository. The translator (`kvpark bridge`) reads and writes both pins' states, so
+servers on either pin can switch conversations with each other.
 
 ### DFlash drafts with images
 

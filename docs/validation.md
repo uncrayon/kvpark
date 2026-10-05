@@ -377,12 +377,14 @@ ran at about 350 t/s and decode at 7.8 t/s.
 lists, mtmd chunks and the `.resume` sidecar did not change. The KV translator's
 readers are affected in three places: nextn layers are no longer in the trunk cache
 of deepseek2 and similar models, qwen4exp's indexer cache is K-only with k-pool rows,
-and bailingmoe3 uses M-RoPE when its GGUF has rope sections. The experiment suites
-still pass with the old binaries. Run against new-pin binaries, they fail only in
-tests that hit these changes or changed fixture defaults.
-[experiments/linear_transfer/STATE_FORMAT_a7b94df.md](../experiments/linear_transfer/STATE_FORMAT_a7b94df.md) lists the changes and what
-`kvstate.py`, `kv_probe.cpp`, `state_driver.cpp` and `kvpark/bridge/resume.py` must
-change.
+and bailingmoe3 uses M-RoPE when its GGUF has rope sections.
+[experiments/linear_transfer/STATE_FORMAT_a7b94df.md](../experiments/linear_transfer/STATE_FORMAT_a7b94df.md) lists the changes.
+`kvstate.py` and the translator now read and write both pins' states (a state is read
+with either pin's layout, whichever fits), and every experiment suite passes with
+either pin's binaries; the commands are in
+[experiments/linear_transfer/README.md](../experiments/linear_transfer/README.md#tests-on-both-pinned-runtimes).
+Since October 5, 2026 the repository's `runtime/` is a `scripts/build_runtime.py` build
+of a7b94df2c; the 85d5703a3 build that was there is kept at `runtime-85d5703a3/`.
 
 ### Switching the local Qwen3.8 service to the new ROCm build
 

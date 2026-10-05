@@ -21,9 +21,10 @@ from kvpark.bridge.messages import MEDIA_PARTS, media_digest
 KVSTATE = Path(__file__).resolve().parents[1] / "experiments" / "linear_transfer" / "kvstate.py"
 
 
-def write_gguf(path, arch, **counts):
-    """A GGUF v3 header without tensors: a few keys of other types, then general.architecture and
-    `counts` (uint32 values; a keyword's double underscores stand for dots)."""
+def write_gguf(path, arch, *, strings=None, flags=None, tensors=(), **counts):
+    """A GGUF v3 header: a few keys of other types, then general.architecture and `counts` (uint32
+    values; a keyword's double underscores stand for dots), `strings` and `flags` ({key: str or bool}),
+    and the tensor infos of `tensors` (names; one F32 element each, no data)."""
     def string(text):
         data = text.encode()
         return struct.pack("<Q", len(data)) + data
@@ -33,7 +34,10 @@ def write_gguf(path, arch, **counts):
            string("x.flags") + struct.pack("<IIQ", 9, 7, 3) + bytes(3),
            string("general.architecture") + struct.pack("<I", 8) + string(arch)]
     kvs += [string(key.replace("__", ".")) + struct.pack("<II", 4, value) for key, value in counts.items()]
-    Path(path).write_bytes(b"GGUF" + struct.pack("<IQQ", 3, 0, len(kvs)) + b"".join(kvs))
+    kvs += [string(key) + struct.pack("<I", 8) + string(value) for key, value in (strings or {}).items()]
+    kvs += [string(key) + struct.pack("<IB", 7, bool(value)) for key, value in (flags or {}).items()]
+    infos = [string(name) + struct.pack("<IQIQ", 1, 1, 0, 32 * n) for n, name in enumerate(tensors)]
+    Path(path).write_bytes(b"GGUF" + struct.pack("<IQQ", 3, len(infos), len(kvs)) + b"".join(kvs) + b"".join(infos))
     return path
 
 
@@ -462,6 +466,8 @@ class BridgeTest(unittest.TestCase):
         job = self.servers["b"].restored_payload["job"]
         self.assertEqual(job["target"]["runtime"], self.config["models"]["b"]["runtime"])
         self.assertNotIn("runtime", job["source"])
+        # each server's llama.cpp build (/props): the engine takes the layouts of the pin it names
+        self.assertEqual((job["source"]["build_info"], job["target"]["build_info"]), ("b1-test", "b1-test"))
         for bad, error in (({"rope_scale": 2}, "unknown"), ({"rope_scaling_type": "longrope"}, "rope_scaling_type"),
                            ({"rope_freq_base": float("nan")}, "finite"), ({"yarn_orig_ctx": -1}, "nonnegative"),
                            ({"yarn_ext_factor": True}, "finite")):
@@ -910,7 +916,7 @@ class BridgeTest(unittest.TestCase):
         root = Path(self.tmp.name)
         for side, arch, code in (("b", "mamba2", "no-per-token-cache"), ("a", "rwkv7", "no-per-token-cache"),
                                  ("a", "deepseek4", "dsv4-source"), ("b", "deepseek4", "no-head-decoders"),
-                                 ("b", "llama", "unsupported-arch")):
+                                 ("b", "gpt2", "unsupported-arch")):
             with self.subTest(side=side, arch=arch):
                 self.config["models"][side]["gguf"] = str(write_gguf(root / f"{arch}.gguf", arch))
                 self.config["models"][side]["arch"] = arch
@@ -923,6 +929,71 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(self.servers["a"].calls, [])          # decided before any server is touched
         self.assertEqual(self.servers["b"].calls, [])
 
+    def test_models_ruled_out_by_their_gguf_are_skipped(self):
+        # beyond the architecture: a vocabulary that appends EOS to every text (an embedding model such as
+        # gte-Qwen2), and LongRoPE (rope_factors_long/short without rope_freqs.weight in Phi-3/4 or a LongRoPE
+        # Llama or Mistral 3; a "longrope" scaling type in any model)
+        root = Path(self.tmp.name)
+        gte = write_gguf(root / "gte.gguf", "qwen2", flags={"tokenizer.ggml.add_eos_token": True})
+        factors = ["token_embd.weight", "rope_factors_long.weight", "rope_factors_short.weight"]
+        longrope = write_gguf(root / "phi-long.gguf", "phi3", tensors=factors)
+        llama = write_gguf(root / "llama-long.gguf", "llama", tensors=factors)
+        mistral = write_gguf(root / "mistral-long.gguf", "mistral3", strings={"mistral3.rope.scaling.type": "longrope"},
+                             tensors=["token_embd.weight"])
+        for side, path, arch, code in (("b", gte, "qwen2", "embedding-model"), ("a", gte, "qwen2", "embedding-model"),
+                                       ("b", longrope, "phi3", "rope-factors"), ("a", llama, "llama", "rope-factors"),
+                                       ("b", mistral, "mistral3", "rope-factors")):
+            with self.subTest(side=side, arch=arch):
+                self.config["models"][side].update(gguf=str(path), arch=arch, hub_name=f"{arch}-model")
+                report = self.switch()
+                self.assertEqual(report["skipped"], code)
+                self.assertIn(side, report["note"])
+                self.config["models"][side].update(gguf=str(self.gguf), arch="qwen3", hub_name=side)
+        self.assertEqual(self.servers["a"].calls, [])          # decided before any server is touched
+        self.assertEqual(self.servers["b"].calls, [])
+        # an EOS flag that is false, Phi-3 with rope_freqs.weight or without factors: not ruled out here
+        self.assertIsNone(capabilities.model("m", "qwen3", write_gguf(root / "eos-off.gguf", "qwen3",
+                                                                        flags={"tokenizer.ggml.add_eos_token": False})))
+        for name, tensors in (("phi-freqs", ["rope_freqs.weight", "rope_factors_long.weight"]),
+                              ("phi-plain", ["token_embd.weight"])):
+            self.assertIsNone(capabilities.model("m", "phi3", write_gguf(root / f"{name}.gguf", "phi3", tensors=tensors)))
+        # nor a Llama with rope_freqs.weight or a YaRN scaling type, nor factor tensors an architecture never loads
+        self.assertIsNone(capabilities.model("m", "llama", write_gguf(root / "llama3.gguf", "llama", tensors=[
+            "rope_freqs.weight"], strings={"llama.rope.scaling.type": "yarn"})))
+        self.assertIsNone(capabilities.model("m", "qwen3", write_gguf(root / "qwen-factors.gguf", "qwen3", tensors=factors)))
+        # a split GGUF keeps its factor tensors in any of its files
+        first = write_gguf(root / "phi-00001-of-00002.gguf", "phi3", split__count=2, tensors=["token_embd.weight"])
+        write_gguf(root / "phi-00002-of-00002.gguf", "phi3", split__count=2, tensors=["rope_factors_short.weight"])
+        self.assertEqual(capabilities.model("m", "phi3", first)[0], "rope-factors")
+        self.assertEqual(capabilities.gguf_tensor_names(first), ["token_embd.weight"])
+        self.assertIsNone(capabilities.gguf_facts(root / "missing.gguf"))
+
+    def test_vocabularies_the_engine_cannot_read_are_skipped(self):
+        root = Path(self.tmp.name)
+        self.config["models"]["b"]["gguf"] = str(write_gguf(root / "gemma.gguf", "qwen3",
+                                                            strings={"tokenizer.ggml.model": "gemma4"}))
+        # an engine from before the "vocabularies" feature reads GPT-2 byte-level BPE only
+        report = self.switch()
+        self.assertEqual(report["skipped"], "tokenizer")
+        self.assertIn('"vocabularies"', report["note"])
+        self.assertFalse(any("save" in path for _, path in self.servers["a"].calls))
+        # one with it translates the switch
+        script = root / "vocabularies" / "engine.py"
+        script.parent.mkdir()
+        script.write_text('FEATURES = ("media-source", "template-options", "recurrent-mean", "vocabularies")\n'
+                          + FAKE_ENGINE)
+        self.config["engine"]["script"] = str(script)
+        report = self.switch()
+        self.assertTrue(report["reuse_ok"])
+        self.assertIn("vocabularies", report["engine_features"])
+        # a vocabulary no engine reads (and an unreadable tokenizer key is left to the engine)
+        self.config["models"]["a"]["gguf"] = str(write_gguf(root / "t5.gguf", "qwen3",
+                                                            strings={"tokenizer.ggml.model": "t5"}))
+        report = self.switch()
+        self.assertEqual(report["skipped"], "tokenizer")
+        self.assertIn("t5", report["note"])
+        self.assertIsNone(capabilities.tokenizer(("a", None), ("b", "gpt2"), frozenset()))
+
     def test_translatable_architectures_are_read_by_the_state_codec(self):
         if not KVSTATE.is_file():
             self.skipTest("no experiments/linear_transfer/kvstate.py in this checkout")
@@ -932,9 +1003,9 @@ class BridgeTest(unittest.TestCase):
         # the gate never lets through a model whose state the engine cannot even parse
         self.assertLessEqual(set(capabilities.TRANSLATABLE), codec)
         # kvpark bridge add refuses RoPE settings for exactly the codec's dense architectures
-        # (DeepSeek V4's pooled-cache codec takes the server's settings, like MLA and the hybrids)
+        # (DeepSeek V4's pooled-cache codec takes the server's settings, like MLA, the hybrids and the GQA family)
         dense = codec - set(constants["MLA_ARCHITECTURES"] + constants["HYBRID_ARCHITECTURES"]
-                            + constants["RECURRENT_ARCHITECTURES"]) - {"deepseek4"}
+                            + constants["RECURRENT_ARCHITECTURES"] + constants["GQA_ARCHITECTURES"]) - {"deepseek4"}
         self.assertEqual(set(registry.FIXED_ROPE_ARCHS), dense)
         # the hybrids (a recurrent cell beside attention: kvpark bridge add --recurrent-mean) are the codec's
         # GQA hybrids, Qwen3.5 and the MLA family's K-only hybrids
@@ -942,6 +1013,8 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(capabilities.HYBRID - set(constants["HYBRID_ARCHITECTURES"] + constants["MLA_ARCHITECTURES"]),
                          {"qwen35"})
         self.assertLessEqual(capabilities.HYBRID, capabilities.TRANSLATABLE)
+        # the bridge looks for LongRoPE factor tensors where the codec refuses them
+        self.assertEqual(capabilities.ROPE_FACTOR_ARCHITECTURES, set(constants["ROPE_FACTOR_TENSOR_ARCHITECTURES"]))
 
     def test_architecture_is_read_lazily_for_older_entries(self):
         stored = registry.load(self.config_path)
@@ -1035,6 +1108,21 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual((report["skipped"], report["draft"]["kind"]), ("draft-unsupported", "other"))
         self.assertIn("draft-eagle3", report["note"])
         self.assertFalse(any("save" in path for _, path in self.servers["a"].calls))
+
+    def test_shared_draft_runs_only_as_mtp(self):
+        # Gemma 4's MTP head (gemma4-assistant) writes no cells of its own: its 8-byte blob is restored as
+        # it is; another speculative type that saves the same blob is not that draft
+        head = struct.pack("<Ii", resume.IO_MAGIC, 0)
+        target = self.servers["b"]
+        target.patched, target.speculative, target.draft = True, "draft-mtp", lambda n: head
+        report = self.switch()
+        self.assertTrue(report["reuse_ok"])
+        self.assertEqual((report["draft"]["kind"], report["draft"]["blob_bytes"]), ("shared", 8))
+        self.assertEqual(target.restored_resume.draft, head)
+        target.speculative = "draft-eagle3"
+        report = self.switch()
+        self.assertEqual((report["skipped"], report["draft"]["kind"]), ("draft-unsupported", "other"))
+        self.assertIn("draft-eagle3", report["note"])
 
     def test_upstream_deepseek4_target_with_a_draft_is_skipped(self):
         # an upstream server keeps no .resume: its draft layout comes from the speculative types, and a

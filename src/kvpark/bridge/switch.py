@@ -3,18 +3,19 @@
     report = switch(config, conversation, "qwen38", "muse")
 
 0. The switch is skipped (``report["skipped"]`` = a reason code, ``report["note"]``) when the
-   translator cannot handle it: an architecture the engine cannot translate (see
-   capabilities.py), media the target cannot take that get no text surrogate (the media
-   policy says skip, or nothing could make one; or, with an engine older than the
-   "media-source" feature, media in the source's cache), a prompt too short to be worth
-   translating, a DSA target without indexer keys for a prompt this long, or a draft model
-   whose state the bridge cannot synthesize; or, at step 4, when the engine daemon's memory
-   guard refuses the job ("engine-memory"), the hub has no indexer keys after all
-   ("no-indexer-keys"), or the engine cannot reproduce the target's rendering of the
-   conversation ("template-mismatch"; with the request's template options it first falls back
-   to the default rendering, see switch(), and "template-options" means too little of that
-   rendering is shared with the request's). The target then simply prefills the conversation
-   natively.
+   translator cannot handle it: an architecture the engine cannot translate, an embedding model
+   or a LongRoPE model, a vocabulary the engine cannot read (with an engine older than the
+   "vocabularies" feature: any but GPT-2 byte-level BPE; see capabilities.py), media the target
+   cannot take that get no text surrogate (the media policy says skip, or nothing could make
+   one; or, with an engine older than the "media-source" feature, media in the source's
+   cache), a prompt too short to be worth translating, a DSA target without indexer keys for a
+   prompt this long, or a draft model whose state the bridge cannot synthesize; or, at step 4,
+   when the engine daemon's memory guard refuses the job ("engine-memory"), the hub has no
+   indexer keys after all ("no-indexer-keys"), or the engine cannot reproduce the target's
+   rendering of the conversation ("template-mismatch"; with the request's template options it
+   first falls back to the default rendering, see switch(), and "template-options" means too
+   little of that rendering is shared with the request's). The target then simply prefills the
+   conversation natively.
    Media the target's server has no encoder for (an image going to a text-only model) are
    replaced first by text surrogates (surrogates.py: "[Image description: ...]" from the cache,
    the conversation, the source model or a describer; report["surrogates"]); a side request to
@@ -35,11 +36,12 @@
    the request's template options included, and checks that the target's tokens spell it).
    It runs on the resident engine daemon (the job is sent over its socket, so the
    conversation never touches the disk) or, where no daemon can run, in a one-shot process
-   (engine_client.py). A hybrid target's recurrent cell at T0 - 1 starts from its registered
-   mean (kvpark bridge add --recurrent-mean; report["recurrent"]), else from zeros. The engine's
-   T0 is final (a DeepSeek V4 target rounds it down to whole 128-token blocks). On a
-   kvpark-patched target the bridge then writes the matching .resume (resume.py: the draft
-   state of a translated restore).
+   (engine_client.py). The job names each server's llama.cpp build (/props build_info), whose
+   pin's layouts the engine's specs take. A hybrid target's recurrent cell at T0 - 1 starts
+   from its registered mean (kvpark bridge add --recurrent-mean; report["recurrent"]), else
+   from zeros. The engine's T0 is final (a DeepSeek V4 target rounds it down to whole
+   128-token blocks). On a kvpark-patched target the bridge then writes the matching .resume
+   (resume.py: the draft state of a translated restore).
 5. The target slot is erased and the translated file restored; every bridge file is deleted
    as soon as it has been used.
 6. Optionally (never with media the target reads itself) a warm request (one generated token)
@@ -69,7 +71,8 @@ MIN_HANDOVER_TOKENS = 1024     # below tail + this, a switch translates nothing 
 DRAFT_WINDOW = 2048            # sliding window of the DFlash drafts in use (dflash.attention.sliding_window)
 MEDIA_STAND_IN = "kvpark-media-message"
 # /slots speculative.types that run each draft kind resume.classify_draft tells from the state
-DRAFT_TYPES = {"dflash": {"draft-dflash", "draft-dspark"}, "mtp": {"draft-mtp"}}
+# ("shared": a draft that writes no cells of its own, Gemma 4's MTP head over the target's cache)
+DRAFT_TYPES = {"dflash": {"draft-dflash", "draft-dspark"}, "mtp": {"draft-mtp"}, "shared": {"draft-mtp"}}
 # how the engine refuses a DSA target without indexer keys (translate.IndexerKeysUnavailable)
 INDEXER_REFUSAL = "no indexer keys"
 
@@ -301,8 +304,12 @@ def switch(config, conversation, source, target, *, tail=None, fill=None, warm=T
         return report
 
     # 0. what the translator can handle (first: a model it cannot handle has no hub adapter either)
+    source_arch = registry.model_arch(config, source, path=config_path)
     target_arch = registry.model_arch(config, target, path=config_path)
-    rule = (capabilities.check((source, registry.model_arch(config, source, path=config_path)), (target, target_arch))
+    # embedding models and LongRoPE first: their GGUF, not their architecture, rules them out
+    rule = (capabilities.model(source, source_arch, src_cfg["gguf"])
+            or capabilities.model(target, target_arch, tgt_cfg["gguf"])
+            or capabilities.check((source, source_arch), (target, target_arch))
             # a DeepSeek V4 target's pooled caches need the hub's head decoders
             or capabilities.heads(tgt_cfg["hub_name"], target_arch, registry.hub_manifest(config)))
     if rule:
@@ -324,6 +331,18 @@ def switch(config, conversation, source, target, *, tail=None, fill=None, warm=T
             asked["features"] = engine_client.features(config, bridge_dir, log=log)
             report["engine_features"] = sorted(asked["features"])
         return asked["features"]
+
+    def build_info(role, server):
+        """The server's llama.cpp build (/props build_info, asked once; None when it reports none)."""
+        key = f"build_info:{role}"
+        if key not in asked:
+            try:
+                props = server.props()
+            except (ServerError, OSError, ValueError):     # the engine then uses its default pin
+                props = None
+            info = props.get("build_info") if isinstance(props, dict) else None
+            asked[key] = info if isinstance(info, str) else None
+        return asked[key]
 
     def save_source():
         """Step 3, once: the source's slot (its cache for the conversation) into its slot directory."""
@@ -357,6 +376,14 @@ def switch(config, conversation, source, target, *, tail=None, fill=None, warm=T
             except ServerError as error:     # the surrogates stand; the source re-reads its conversation
                 report["source_restore_error"] = str(error)[:300]
             report["timings"]["source_restore_s"] = round(time.perf_counter() - t, 3)
+
+    # vocabularies the engine reads (an engine older than the "vocabularies" feature: GPT-2 byte-level BPE)
+    vocabularies = [(name, (capabilities.gguf_facts(cfg["gguf"]) or {}).get("tokenizer"))
+                    for name, cfg in ((source, src_cfg), (target, tgt_cfg))]
+    if any(model not in (None, *capabilities.TOKENIZERS) for _, model in vocabularies):
+        rule = capabilities.tokenizer(*vocabularies, engine_features())
+        if rule:
+            return skip(*rule)
 
     try:
         media = messages.media(conversation)
@@ -582,10 +609,14 @@ def switch(config, conversation, source, target, *, tail=None, fill=None, warm=T
                 if tgt_cfg.get("recurrent_tools"):
                     target_job["recurrent_tools"] = True
             source_job = {"name": src_cfg["hub_name"], "gguf": src_cfg["gguf"], "state": str(source_file)}
-            for job_side, cfg in ((source_job, src_cfg), (target_job, tgt_cfg)):
+            for job_side, cfg, role, server in ((source_job, src_cfg, "source", A), (target_job, tgt_cfg, "target", B)):
                 if cfg.get("runtime"):
                     # the server's RoPE settings (kvpark bridge add --rope-*/--yarn-*): its cache layout
                     job_side["runtime"] = cfg["runtime"]
+                if build_info(role, server):
+                    # the server's llama.cpp build: the engine takes the layouts of the pin it names
+                    # (an engine that does not know the field ignores it)
+                    job_side["build_info"] = build_info(role, server)
             job_conversation = {"messages": conversation["messages"], "tools": conversation.get("tools")}
             if options_:
                 # the engine renders the request as the server does, with its template options

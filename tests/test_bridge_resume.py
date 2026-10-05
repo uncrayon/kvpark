@@ -8,10 +8,13 @@ from pathlib import Path
 
 from kvpark.bridge import resume
 
-# Template draft blobs written by the kvpark-patched CPU llama-server (runtime/build) for a
+# Template draft blobs written by the kvpark-patched CPU llama-server (runtime/build, 85d5703a3 then) for a
 # one-token-prompt save of five tokens, from the tiny fixtures of
 # experiments/universal_kv/fixtures_bridge/make_fixtures.py. Every header byte is the server's;
-# the row values (random weights) are zeroed so the samples compress.
+# the row values (random weights) are zeroed so the samples compress. Both pins write them: the
+# 85d5703a3 server wrote these, and the a7b94df2c server's templates of the same fixtures
+# (evidence/llamacpp-upgrade/live-resume-new-cpu, October 4 2026) are byte for byte the same
+# with their rows zeroed (dflash-mrope, dflash-neox and mtp).
 GOLDEN = {
     # Qwen3.5 hybrid target + M-RoPE DFlash draft (2 layers, 1 KV head of 32, F16), -fa on
     "dflash-mrope": "eNq7YSOyngEIGIGYlQECGBkQ4D8QwMSQMUycCcpngmKYODNUnBmKYeIsUHEWKIaJMyDZPdDugJnlwDAKqAFGw3I0LEfDcngDAMXwKwg=",
@@ -172,6 +175,34 @@ class StateBlobTest(unittest.TestCase):
         out = resume.parse_state_blob(resume.translated_draft(streams, 9))
         self.assertEqual([s is None for s in out.sections[1].streams], [True, False])
         self.assertEqual(out.sections[1].streams[1].positions, (7, 8))
+
+    def test_qwen4exp_mtp_draft_is_not_synthesized(self):
+        # a7b94df2c's qwen4exp MTP draft context (inferred from src/llama-model.cpp, not run): the MTP
+        # block's attention KV, a recurrent memory without layers and the K-only indexer cache; no
+        # reading fits it, so the bridge skips such a target rather than guess a draft for it
+        layerless = struct.pack("<IiIII", 1, 4, 0, 0, 4)
+        draft = blob(kv_section(5, 1, ext=True), layerless, kv_section(5, 1, ext=True, v=False))
+        layout = resume.classify_draft(draft, n_tokens=5)
+        self.assertEqual(layout.kind, "other")
+        with self.assertRaisesRegex(ValueError, "no translated draft"):
+            resume.translated_draft(layout, 10)
+
+    def test_shared_draft_of_gemma4_assistant(self):
+        # Gemma 4's MTP head (gemma4-assistant) caches nothing of its own: its iSWA cache views the target's
+        # last sliding and full layers, and such a cache writes nothing, so the blob is the io magic and the
+        # sequence id; a translated restore gets the same 8 bytes (the draft then reads the restored target)
+        head = struct.pack("<Ii", resume.IO_MAGIC, 0)
+        self.assertEqual(resume.parse_state_blob(head).sections, [])
+        layout = resume.classify_draft(head, n_tokens=2100)
+        self.assertEqual(layout.kind, "shared")
+        self.assertIn("gemma4-assistant", layout.note)
+        self.assertEqual(resume.translated_draft(layout, 2000), head)
+        template = resume.Resume(head, b"", [resume.Checkpoint(1500, 476, 2099, b"swa", head)]).to_bytes()
+        data, layout = resume.translated_resume(template, 2000, n_tokens=2100)
+        parsed = resume.parse_resume(data)
+        self.assertEqual((layout.kind, parsed.draft, parsed.speculative, parsed.checkpoints), ("shared", head, b"", []))
+        # a cut header is not a blob at all
+        self.assertEqual(resume.classify_draft(head[:6]).kind, "other")
 
     def test_unreadable_and_ambiguous_bytes(self):
         self.assertEqual(resume.classify_draft(b"\x01\x02\x03").kind, "other")

@@ -402,10 +402,11 @@ def prewarm(config, model_names, bridge_dir, *, timeout=120.0, warm_up=True, log
 
 def features(config, bridge_dir, *, log=lambda event: None):
     """What the engine that will run this configuration's jobs handles beyond earlier engines
-    (engine.py FEATURES: "template-options", "media-source"): the daemon's own list from its ping
-    (the daemon is started when nobody answers, as the job would start it), else, where jobs run
-    one-shot, the FEATURES the engine script declares (read from its source, never run). An
-    empty set for an engine that declares none (one from before the list existed)."""
+    (engine.py FEATURES: "media-source", "template-options", "recurrent-mean", "vocabularies"): the
+    daemon's own list from its ping (the daemon is started when nobody answers, as the job would
+    start it), else, where jobs run one-shot, the FEATURES the engine script declares (read from
+    its source, never run). An empty set for an engine that declares none (one from before the
+    list existed)."""
     engine = config.get("engine") or {}
     if engine.get("mode", "daemon") != "oneshot" and daemon_supported(bridge_dir) and _daemon_script(config):
         try:

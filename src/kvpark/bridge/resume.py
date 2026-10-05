@@ -1,28 +1,32 @@
 """Slot resume sidecars of kvpark-patched llama-servers, and the draft state a translated restore needs.
 
-A kvpark-patched llama-server (runtime/source, and the production Qwen build that carries the
-same patch) writes ``<slot file>.resume`` next to every slot save and requires it on every
-restore (tools/server/server-context.cpp:41-121, save 2650, restore 2715). Upstream servers
-neither write nor read it. Layout, little-endian::
+A kvpark-patched llama-server (runtime/ as scripts/build_runtime.py builds it at llama.cpp
+a7b94df2c, and the production Qwen build that carries the same patch on 85d5703a3) writes
+``<slot file>.resume`` next to every slot save and requires it on every restore
+(tools/server/server-context.cpp:42-122, save 2805, restore 2870 at a7b94df2c; the file is the
+same on both pins). Upstream servers neither write nor read it. Layout, little-endian::
 
     u32 magic 0x51534c54, u32 version 1
     u64 size, draft blob          llama_state_seq_get_data_ext(ctx_dft, slot, flags 0); empty
                                   when the server has no draft context
     u64 size, speculative blob    common_speculative_get_state: only EAGLE3 keeps one (for
                                   hybrid targets); DFlash and MTP write nothing, and every
-                                  set_state ignores an empty blob (common/speculative.cpp:175, 872-905)
+                                  set_state ignores an empty blob (common/speculative.cpp:214, 944-977)
     u32 checkpoint count; per checkpoint i64 n_tokens, i32 pos_min, i32 pos_max and three
                                   sized blobs (target, draft, speculative)
 
 On restore a server with a draft context requires a non-empty draft blob that
 llama_state_seq_set_data_ext consumes completely; a server without one requires an empty blob
-("Slot archive requires draft context"). Any failure clears the slot and fails the restore.
+("Slot archive requires draft context"). Any failure clears the slot and fails the restore;
+on a7b94df2c a refused state also leaves no rows behind (a failed restore zeroes the cells it
+had written, llama_kv_cache::state_clear, and hybrid memories drop every part they restored).
 
 A draft blob is a sequence-state blob: u32 io magic 0xaf143cd8, i32 seq_id, then the draft
-memory's state_write (src/llama-context.cpp:3065-3134). Memories are sequences of sections:
+memory's state_write (src/llama-context.cpp:3190-3262). Memories are sequences of sections:
 a plain KV cache is one KV section, iSWA is a base then a sliding-window KV section
 (src/llama-kv-cache-iswa.cpp:259-273), hybrid memory is a KV then a recurrent section. A KV
-section (src/llama-kv-cache.cpp state_write 2053-2121, meta 2203-2234, data 2236-2333)::
+section (src/llama-kv-cache.cpp state_write 2065-2133, meta 2211-2242, data 2244-2341; the
+sections and rows of the draft memories below are the same on both pins)::
 
     u32 n_stream; per stream: u32 cell_count, and when it is not 0:
       per cell: i32 pos, u32 n_seq_id (1), [i32 x, i32 y, i32 tok when the model uses M-RoPE], i32 seq_id
@@ -31,31 +35,43 @@ section (src/llama-kv-cache.cpp state_write 2053-2121, meta 2203-2234, data 2236
       per layer (none for K-only caches): v_trans 0: i32 v_type, u64 v_row_bytes, v rows;
                                           v_trans 1: i32 v_type, u32 element size, u32 n_embd_v, elements
 
-A recurrent section (src/llama-memory-recurrent.cpp:766-990) is u32 cell_count, per cell i32 pos
+A recurrent section (src/llama-memory-recurrent.cpp:784-1008) is u32 cell_count, per cell i32 pos
 and u32 n_seq_id (0 for a single-sequence save), u32 s_trans, u32 n_layer, then (type, row size,
 rows) for every recurrent layer's r rows and again for its s rows.
 
 The blob does not say whether cells carry the M-RoPE extension or whether V exists, so
 ``parse_state_blob`` tries every reading and keeps the ones that consume the blob exactly;
 the draft of a native slot save holds exactly the saved prompt's positions, which settles the
-rare remaining ambiguity.
+rare remaining ambiguity. (On a7b94df2c a DFlash draft skips the rows of an M-RoPE image, so
+a save with images holds a position gap; the bridge's layout templates are one-line text saves.)
 
 Drafts after a translated restore. The translated target state covers [0, T0) and the server
 prefills [T0, P) natively, feeding the draft as it goes:
 
 * DFlash/DFlash2/DSpark (an iSWA blob whose base cache has no layers; every layer slides over
   a window of usually 2048 tokens). Its K/V at a position are a function of the target's
-  hidden states at that position only (common/speculative.cpp:1090-1173), so with a native
+  hidden states at that position only (common/speculative.cpp:1157-1239), so with a native
   tail of at least window - 1 tokens the draft's whole visible window is native. The blob is
   an "aligned dummy": two zero K/V cells at T0 - 2 and T0 - 1 in the template's layout. They
   sit outside every later query's window, keep the draft's last position equal to the
-  target's (the production build counts draft positions from the draft's own last
-  position), pass the strict "next position = last + 1" check of non-M-RoPE drafts, and two
-  of them survive the server re-evaluating the last restored token.
+  target's (which the 85d5703a3 production build needs: its contiguous-positions patch counts
+  draft positions from the draft's own last position; on a7b94df2c the draft takes the
+  target's positions, so an empty draft would line up too), pass the strict "next position =
+  last + 1" check of non-M-RoPE (NEOX) drafts, and two of them survive the server
+  re-evaluating the last restored token.
 * MTP (a plain KV blob with one layer: the nextn head's own full-attention cache). An empty
   marker (no cells): zero cells would be attended by every later draft and dilute it. MTP
   then sees only [T0, P) and what follows, as after any restore. The marker does not clear
   the draft sequence, so the slot must be erased before the restore (the bridge always does).
+  On a7b94df2c a qwen4exp MTP draft holds the MTP block's attention and indexer and a
+  recurrent memory without layers (src/llama-model.cpp:2720-2727): no reading here fits it, so
+  it is classified "other" and such a target is skipped (not run: no qwen4exp MTP model).
+* Shared (gemma4-assistant, Gemma 4's MTP head: an iSWA cache whose layers are views of the
+  target's last sliding and last full layer, src/llama-model.cpp:2825-2853). A cache sharing another
+  context's cells writes and reads nothing (llama_kv_cache::state_write/state_read_sinfo return
+  first, src/llama-kv-cache.cpp:2066-2069, 2145-2148), so its blob is the io magic and the sequence
+  id alone, and that same 8-byte blob is the translated draft: the draft reads the restored target
+  rows. (Measured on the Gemma-4 26B-A4B and 31B servers with their gemma4-assistant MTP heads.)
 * No draft context: no blob.
 """
 
@@ -71,7 +87,7 @@ STATE_FILE_MAGIC = 0x67677371         # llama_state_seq_save_file, include/llama
 TOKEN_NULL = -1
 MAX_STREAMS = 256                     # LLAMA_MAX_SEQ
 MAX_LAYERS = 4096
-GGML_TYPES = 64                       # ggml types are small enums (GGML_TYPE_COUNT is 43 in the pin)
+GGML_TYPES = 64                       # ggml types are small enums (GGML_TYPE_COUNT is 43 on both pins)
 MAX_SECTIONS = 3                      # iSWA hybrid: base, sliding window, recurrent
 
 
@@ -143,7 +159,7 @@ def parse_resume(data):
 
 def slot_token_count(path):
     """Prompt tokens in a slot file (llama_state_seq_save_file; llama-server packs its tokens as
-    [-1, version, n, ...], tools/server/server-common.cpp:278-316)."""
+    [-1, version, n, ...], tools/server/server-common.cpp:295-333)."""
     with open(path, "rb") as stream:
         head = stream.read(24)
     if len(head) < 12:
@@ -386,11 +402,14 @@ def _fits(sections, n_tokens):
 
 def parse_state_blob(data, *, n_tokens=None):
     """The sections of a llama_state_seq_get_data blob. `n_tokens` (the prompt length of the
-    save it came from) settles readings that the bytes alone leave open."""
+    save it came from) settles readings that the bytes alone leave open. A memory that shares
+    another context's cells writes nothing: no sections."""
     reader = _Reader(data)
     if reader.u32() != IO_MAGIC:
         raise StateBlobError("not a sequence state blob")
     seq_id = reader.i32()
+    if reader.offset == len(data):
+        return StateBlob(seq_id, [])
     found = {}
     for ext in (False, True):
         for v_present in (True, False):
@@ -408,7 +427,7 @@ def parse_state_blob(data, *, n_tokens=None):
 
 # -- drafts --------------------------------------------------------------------------------------
 
-DRAFT_KINDS = ("none", "dflash", "mtp", "other")
+DRAFT_KINDS = ("none", "dflash", "mtp", "shared", "other")
 
 
 @dataclasses.dataclass
@@ -427,6 +446,9 @@ def classify_draft(draft, *, n_tokens=None):
     except StateBlobError as error:
         return DraftLayout("other", f"unreadable draft state ({error})")
     sections = blob.sections
+    if not sections:
+        return DraftLayout("shared", "draft memory that writes no cells of its own (it shares another context's, "
+                           "e.g. gemma4-assistant's views of the target's cache)", blob)
     described = "; ".join(section.describe() for section in sections)
     kv = all(isinstance(section, KVSection) for section in sections)
     if kv and len(sections) == 2 and sections[0].layers == () and sections[1].layers:
@@ -476,19 +498,22 @@ def translated_draft(layout, t0):
     """The draft blob for a translated restore of [0, t0), in the layout of a native save."""
     if layout.kind == "none":
         return b""
+    if layout.kind not in ("mtp", "dflash", "shared"):
+        # (an unreadable draft has no blob at all)
+        raise ValueError(f"no translated draft for {layout.kind} drafts: {layout.note}")
     blob = layout.blob
     head = struct.pack("<Ii", IO_MAGIC, blob.seq_id)
+    if layout.kind == "shared":
+        return head
     if layout.kind == "mtp":
         return head + _kv_bytes(blob.sections[0], (), blob.seq_id)
-    if layout.kind == "dflash":
-        if t0 < 2:
-            raise ValueError("an aligned draft needs at least two restored tokens")
-        base, window = blob.sections
-        positions = (t0 - 2, t0 - 1)
-        # both caches use the context's V layout; an empty base stream does not record it
-        return head + _kv_bytes(base, positions, blob.seq_id, v_trans=window.v_trans) + _kv_bytes(
-            window, positions, blob.seq_id)
-    raise ValueError(f"no translated draft for {layout.kind} drafts: {layout.note}")
+    if t0 < 2:
+        raise ValueError("an aligned draft needs at least two restored tokens")
+    base, window = blob.sections
+    positions = (t0 - 2, t0 - 1)
+    # both caches use the context's V layout; an empty base stream does not record it
+    return head + _kv_bytes(base, positions, blob.seq_id, v_trans=window.v_trans) + _kv_bytes(
+        window, positions, blob.seq_id)
 
 
 def translated_resume(template_resume, t0, *, n_tokens=None):
