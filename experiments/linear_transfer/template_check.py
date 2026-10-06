@@ -24,10 +24,16 @@ starts a throwaway CPU llama-server on a tokenizer twin of the model (tokenizer_
 model carrying every tokenizer.* key of the GGUF, so its template, BOS/EOS text and vocabulary
 are the real ones; no weights are loaded); --url compares with a running server of the model
 itself.
+
+add_generation_prompt=False (check_server, compare_server) compares whole conversations as
+chat.py renders a corpus record: the request asks for no generation prompt, and the twin server
+runs with --no-prefill-assistant, so a final assistant message is rendered as a complete turn
+instead of being continued.
 """
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -322,9 +328,11 @@ def server_request(url, method, path, body=None, timeout=300):
         raise RuntimeError(f"HTTP {error.code}: {text}") from None
 
 
-def served_prompt(url, conversation, options=None):
+def served_prompt(url, conversation, options=None, *, add_generation_prompt=True):
     """llama-server's /apply-template prompt for a conversation and request options."""
     body = {"messages": conversation["messages"], **(options or {})}
+    if not add_generation_prompt:
+        body["add_generation_prompt"] = False
     if conversation.get("tools"):
         body["tools"] = conversation["tools"]
     return server_request(url, "POST", "/apply-template", body)["prompt"]
@@ -335,11 +343,12 @@ def _around(text, at, width=60):
 
 
 def compare_server(url, template, bos_token, eos_token, conversations=None, option_sets=OPTION_SETS, *,
-                   add_bos=False, add_eos=False):
+                   add_bos=False, add_eos=False, add_generation_prompt=True):
     """Report dict: per conversation and options, the server's /apply-template prompt (or its
     error) against chat.render in each chat.server_contexts candidate, in the engine's order;
     "context" names the first whose rendering is the server's bytes (None: no parity), and
-    "escaped" the segments that rendering writes JSON-escaped (no span for the engine).
+    "escaped" the segments that rendering writes JSON-escaped (no span for the engine);
+    "prompt_sha256" is the sha256 of the server's prompt (UTF-8).
     report["parity"] is True when every case the server renders has a matching context;
     report["by_conversation"] counts each conversation's cases.
 
@@ -363,7 +372,7 @@ def compare_server(url, template, bos_token, eos_token, conversations=None, opti
             counts["cases"] += 1
             case = {"conversation": conversation.get("id"), "options": options}
             try:
-                prompt = served_prompt(url, conversation, options)
+                prompt = served_prompt(url, conversation, options, add_generation_prompt=add_generation_prompt)
             except RuntimeError as error:
                 prompt, case["server_error"] = None, str(error)[:300]
             renderings, errors = {}, {}
@@ -375,8 +384,9 @@ def compare_server(url, template, bos_token, eos_token, conversations=None, opti
             for name, context in contexts:
                 try:
                     rendered = chat.render({"messages": conversation["messages"], "tools": conversation.get("tools")},
-                                           template, bos_token=bos_token, add_generation_prompt=True,
-                                           extra_context=context, live=True)
+                                           template, bos_token=bos_token,
+                                           add_generation_prompt=add_generation_prompt, extra_context=context,
+                                           live=True)
                     renderings[name] = as_served(rendered.text)
                     escaped[name] = [rendered.segment_keys[number] for number in rendered.escaped]
                 except Exception as error:      # noqa: BLE001  (jinja2 errors, transformed content)
@@ -387,6 +397,7 @@ def compare_server(url, template, bos_token, eos_token, conversations=None, opti
                 outcome = "server_errors"
                 counts["both_errors"] += not renderings
             else:
+                case["prompt_sha256"] = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
                 case["context"] = next((name for name, text in renderings.items() if text == prompt), None)
                 if case["context"] is not None:
                     outcome = "matched"
@@ -414,7 +425,8 @@ def compare_server(url, template, bos_token, eos_token, conversations=None, opti
             "cases": cases}
 
 
-def check_server(model, *, url=None, server_binary=None, workdir=None, ports=TWIN_PORTS, conversations=None):
+def check_server(model, *, url=None, server_binary=None, workdir=None, ports=TWIN_PORTS, conversations=None,
+                 option_sets=OPTION_SETS, add_generation_prompt=True):
     """compare_server for a GGUF (on `conversations`, default BATTERY): against a running server of
     it (url) or a throwaway CPU llama-server (server_binary) on its tokenizer twin. The report also
     names the server's template capabilities and whether its /props template is the GGUF's."""
@@ -429,8 +441,9 @@ def check_server(model, *, url=None, server_binary=None, workdir=None, ports=TWI
             twin = tokenizer_twin(model, Path(temporary) / "twin.gguf")
             slots = Path(temporary) / "slots"
             slots.mkdir()
+            extra = ["--jinja"] + ([] if add_generation_prompt else ["--no-prefill-assistant"])
             server = fixtures_media.Server(server_binary, twin, slots, Path(temporary) / "server.log",
-                                           fixtures_media.free_port(ports), ctx=4096, extra=["--jinja"])
+                                           fixtures_media.free_port(ports), ctx=4096, extra=extra)
             url = server.url
         try:
             props = server_request(url, "GET", "/props")
@@ -449,7 +462,8 @@ def check_server(model, *, url=None, server_binary=None, workdir=None, ports=TWI
             add_bos = start == 1
             add_eos = special["eos_token"] is not None and full[start + len(plain):] == [special["eos_token"]]
             report = compare_server(url, info["chat_template"], info["bos_token"], info["eos_token"],
-                                    conversations, add_bos=add_bos, add_eos=add_eos)
+                                    conversations, option_sets, add_bos=add_bos, add_eos=add_eos,
+                                    add_generation_prompt=add_generation_prompt)
         finally:
             if server is not None:
                 server.close()

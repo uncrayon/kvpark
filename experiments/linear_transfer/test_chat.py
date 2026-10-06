@@ -871,6 +871,27 @@ class LlamaServerParityTests(unittest.TestCase):
             self.assertEqual(report["counts"]["mismatch"], report["counts"]["cases"])
             self.assertEqual(report["cases"][0]["first_difference"], 0)
 
+    def test_whole_conversations_compare_without_a_generation_prompt(self):
+        """check_server(add_generation_prompt=False): conversations that end with the assistant's
+        answer, as corpus records render them; the server neither adds a generation prompt nor
+        continues the final message (--no-prefill-assistant)."""
+        import template_check
+        from tiny_fixture import create_fixture
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory) / "model.gguf"
+            create_fixture(model, "qwen3", control_tokens=["<|im_start|>", "<|im_end|>"], chat_template=QWEN_LIKE)
+            whole = [{**c, "messages": c["messages"] + [{"role": "assistant", "content": "That is all."}]}
+                     for c in template_check.BATTERY if c["messages"][-1]["role"] == "user"]
+            report = template_check.check_server(model, server_binary=SERVER, workdir=directory, conversations=whole,
+                                                 option_sets=[{}], add_generation_prompt=False)
+            self.assertTrue(report["parity"], [c for c in report["cases"] if not c.get("context")][:2])
+            self.assertEqual(report["counts"]["cases"], len(whole))
+            self.assertGreater(len(whole), 3)
+            # with a generation prompt the same conversations are no request shape the twin renders alike
+            prompts = template_check.check_server(model, server_binary=SERVER, workdir=directory,
+                                                  conversations=whole[:1], option_sets=[{}])
+            self.assertFalse(prompts["parity"])
+
     def test_real_templates_have_parity(self):
         import template_check
         models = [m for m in (QWEN_GGUF, MUSE_GGUF, QWEN3_GGUF, ORNITH_GGUF) if m.is_file()]

@@ -5,7 +5,11 @@ The translator fills those cells from the target's table (`fill="table"`) instea
 row, so every template token gets its own typical values. Same file format as
 linear_transfer/handoff.py (TokenTable reads it).
 
-    token_tables.py --model NAME=CAPTURES@RECORDS.jsonl [...] --output DIR
+    token_tables.py --model NAME=CAPTURES@RECORDS.jsonl [...] --output DIR [--only NAME ...]
+
+The hub spans are those of every --model given (as the hub was fitted, or onboarded with its
+pivots); --only builds the tables of the named models alone (an onboarded model: give it and its
+pivots, and --only it).
 """
 
 import os
@@ -74,11 +78,18 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", type=parse_model, action="append", required=True)
     parser.add_argument("--output", type=Path, required=True, help="directory for <NAME>.npz tables")
+    parser.add_argument("--only", action="append", metavar="NAME", help="build only this model's table "
+                        "(repeatable; default: every model)")
     args = parser.parse_args(argv)
+    names = [name for name, _, _ in args.model]
+    if args.only and set(args.only) - set(names):
+        raise SystemExit(f"--only names a model without --model: {sorted(set(args.only) - set(names))}")
     args.output.mkdir(parents=True, exist_ok=True)
     views = [hub.CaptureView(name, captures, records) for name, captures, records in args.model]
     spans = hub.joint_spans(views)
     for view in views:
+        if args.only and view.name not in args.only:
+            continue
         handoff.write_token_table(args.output / f"{view.name}.npz", build(view, uncovered_rows(view, spans)),
                                   {"hub_models": [v.name for v in views]})
     return 0

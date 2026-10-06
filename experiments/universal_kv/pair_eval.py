@@ -16,9 +16,21 @@ message to score):
 5. seed-score on the target (GPU, f16 cache, flash attention on): native full prefill vs
    sanity / hub / floor / hub_prefix / floor_prefix, the first 256 tokens of the final message.
 
+Both models render with their templates' own defaults (chat.py corpus mode), or with
+--server-render as llama-server renders a chat (chat.server_context: its default template kwargs,
+preserve_reasoning on, which a template such as Qwen3.6's reads as preserve_thinking and then keeps
+the reasoning of earlier turns; the thinking switch; the clock fixed at SERVER_RENDER_NOW so the
+renderings are reproducible): what a live switch holds when a server renders a conversation other
+than its template's defaults do.
+
 A hybrid target's recurrent cell at T0 - 1 starts from --recurrent (recurrent_init: zero, the
 default, or mean with --recurrent-mean, its group by the conversation's tools unless
 --recurrent-group) in every built condition.
+
+--ids evaluates a fixed set of conversations (document ids, e.g. RESULTS.md section 2's) where they
+fit the prefix range; when fewer than --min-documents of them do (a template that renders them
+shorter), the documents are selected from the whole corpus as without --ids. The report records
+the selection ("ids" or "fallback") and why each named conversation was left out.
 
 Writes <output>/report.json and prints token-weighted delta NLL with document-bootstrap CIs.
 """
@@ -30,6 +42,7 @@ if __name__ == "__main__":
         os.environ.setdefault(_name, "8")
 
 import argparse
+import datetime
 import json
 from pathlib import Path
 import shutil
@@ -62,11 +75,42 @@ def probe(probe_path, artifacts, mode, model, records, output, *, ctx, extra=())
                        env=collect_v2.probe_environment(artifacts))
 
 
-def render(conversation, gguf):
-    template, bos = chat.gguf_chat_context(gguf)
-    rendered = chat.render(conversation, template, bos_token=bos)
+# --server-render: the clock llama-server's datetime, date_string and strftime_now read
+SERVER_RENDER_NOW = datetime.datetime(2026, 1, 1, 12, 0)
+
+
+def render(conversation, gguf, server=False):
+    """The conversation's record as the model's template renders it (chat.py corpus mode), with the
+    EOS text llama.cpp gives every template (DeepSeek-V2's closes each answer with it); server: as
+    llama-server renders it (chat.server_context with no request options, at SERVER_RENDER_NOW)."""
+    info = chat.gguf_tokenizer_info(gguf)
+    if info["chat_template"] is None:
+        raise ValueError("model has no tokenizer.chat_template metadata")
+    context = (chat.server_context({}, server=True, eos_token=info["eos_token"], now=SERVER_RENDER_NOW) if server
+               else {"eos_token": info["eos_token"]})
+    rendered = chat.render(conversation, info["chat_template"], bos_token=info["bos_token"], extra_context=context)
     return chat.rendered_record({**conversation, "split": "test", "source": conversation.get("source", "eval")},
                                 "model", rendered)
+
+
+def wanted_ids(text, document_ids):
+    """The document ids --ids names (full ids, or prefixes of 8+ hex digits matching one id of the
+    corpus; @FILE: one per line); ids not in the corpus are kept as given."""
+    if not text:
+        return set()
+    if text.startswith("@"):
+        items = [line.strip() for line in Path(text[1:]).read_text(encoding="utf-8").splitlines()]
+    else:
+        items = [item.strip() for item in text.split(",")]
+    out = set()
+    for item in filter(None, items):
+        if len(item) < 8:
+            raise SystemExit(f"--ids: {item!r} is shorter than 8 hex digits")
+        found = [did for did in document_ids if did.startswith(item)]
+        if len(found) > 1:
+            raise SystemExit(f"--ids: {item!r} matches {len(found)} documents")
+        out.add(found[0] if found else item)
+    return out
 
 
 def boot(sums, counts, seed=0):
@@ -83,6 +127,10 @@ def main(argv=None):
     parser.add_argument("--min-prefix", type=int, default=4096, help="target tokens before the final message")
     parser.add_argument("--max-prefix", type=int, default=30000)
     parser.add_argument("--sources", help="comma list of conversation 'source' values to keep")
+    parser.add_argument("--ids", help="comma list of document ids (or unique prefixes of 8+ hex digits) to evaluate, "
+                        "or @FILE with one per line; --limit does not apply to them")
+    parser.add_argument("--min-documents", type=int, default=1, help="with --ids: fewer of them fitting the prefix "
+                        "range select from the whole corpus instead")
     parser.add_argument("--hub", type=Path, required=True)
     parser.add_argument("--source", required=True, help="NAME=GGUF (NAME as in the hub)")
     parser.add_argument("--target", required=True, help="NAME=GGUF")
@@ -97,6 +145,9 @@ def main(argv=None):
                         "calibrate), for strategies that read it")
     parser.add_argument("--recurrent-group", help="the mean's group (default: chat, or all for conversations "
                         "with tools, as the engine picks it)")
+    parser.add_argument("--server-render", action="store_true",
+                        help="render both models as llama-server does (its default template kwargs and thinking "
+                        "switch, the clock at SERVER_RENDER_NOW) instead of with their templates' defaults")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     args.output.mkdir(parents=True, exist_ok=False)
@@ -117,7 +168,8 @@ def main(argv=None):
         if keep and conversation.get("source") not in keep:
             continue
         try:
-            records = {"s": render(conversation, s_gguf), "t": render(conversation, t_gguf)}
+            records = {"s": render(conversation, s_gguf, args.server_render),
+                       "t": render(conversation, t_gguf, args.server_render)}
         except ValueError as error:
             print(json.dumps({"skip": conversation.get("id"), "reason": str(error)[:120]}))
             continue
@@ -126,7 +178,8 @@ def main(argv=None):
     for side, gguf in (("s", s_gguf), ("t", t_gguf)):
         tokens[side] = collect_v2.tokenize(args.probe, gguf, [r[side] for _, r in candidates], ctx=args.ctx,
                                            workdir=args.output)
-    documents = []
+    wanted = wanted_ids(args.ids, [records["t"]["document_id"] for _, records in candidates])
+    documents, left_out = [], {}
     for conversation, records in candidates:
         did = records["t"]["document_id"]
         P = handoff.handoff_position(records["t"], tokens["t"][did])
@@ -134,15 +187,22 @@ def main(argv=None):
         t0 = (P - args.tail) // 512 * 512
         total = max(len(tokens["t"][did]["token_id"]), len(tokens["s"][did]["token_id"]))
         if not args.min_prefix <= P <= args.max_prefix or total + 64 > args.ctx or t0 <= (t_spec.n_swa or 0) + 1:
+            if did in wanted:
+                left_out[did] = {"P": P, "tokens": total, "t0": t0}
             continue
         documents.append({"conversation": conversation, "records": records, "id": did, "P": P, "P_s": P_s, "t0": t0})
     documents.sort(key=lambda d: d["P"])
-    if len(documents) > args.limit:
+    chosen = [d for d in documents if d["id"] in wanted]
+    selection = "ids" if wanted and len(chosen) >= args.min_documents else ("fallback" if wanted else "corpus")
+    if selection == "ids":
+        documents = chosen
+    elif len(documents) > args.limit:
         picks = np.unique(np.round(np.linspace(0, len(documents) - 1, args.limit)).astype(int))
         documents = [documents[i] for i in picks]
     if not documents:
         raise SystemExit("no conversation fits the prefix range")
-    print(json.dumps({"documents": len(documents), "prefix": [d["P"] for d in documents]}), flush=True)
+    print(json.dumps({"documents": len(documents), "selection": selection, "prefix": [d["P"] for d in documents],
+                      "left_out": {did[:12]: item for did, item in left_out.items()}}), flush=True)
 
     for side, gguf, at in (("s", s_gguf, "P_s"), ("t", t_gguf, "t0")):
         probe(args.probe, artifacts, "save-state", gguf,
@@ -223,8 +283,12 @@ def main(argv=None):
         summary[name]["kl"] = float(np.mean([row[name]["kl"] for row in rows]))
         summary[name]["top1"] = float(np.mean([row[name]["top1"] for row in rows]))
     report = {"source": s_name, "target": t_name, "tail": args.tail, "hub": str(args.hub.resolve()),
-              "corpus": str(args.corpus.resolve()), "recurrent": args.recurrent, "documents": rows,
-              "summary": summary}
+              "corpus": str(args.corpus.resolve()), "recurrent": args.recurrent,
+              "rendering": "server" if args.server_render else "template",
+              "recurrent_mean": None if args.recurrent_mean is None else str(args.recurrent_mean.resolve()),
+              "selection": selection, "ids": sorted(wanted), "left_out": left_out,
+              "missing_ids": sorted(set(wanted) - {r["t"]["document_id"] for _, r in candidates}),
+              "documents": rows, "summary": summary}
     (args.output / "report.json").write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
     for row in rows:
         print(f"{row['document_id'][:12]} {str(row['source'])[:14]:>14} P={row['P']:>6} "

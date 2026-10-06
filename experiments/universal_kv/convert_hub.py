@@ -22,6 +22,13 @@ as they are, with their "files" entries: hub.Hub reads them as format 1 npz in e
 a translation into the model reads them on numpy only. Every file's sha256 is in the manifest;
 readers verify it once per file identity (hub.Verifier). The input bundle is only read; the
 output directory must not exist.
+
+    python convert_hub.py HUB HUB-v2 --reuse BASE-v2 [--reuse ...]
+
+--reuse names format 2 bundles converted before (e.g. the base an onboarded HUB grew from): a
+model whose format 1 files have the very sha256 such a bundle was converted from keeps that
+bundle's sides as hard links (no conversion, no disk), so converting an onboarded bundle only
+converts the new model.
 """
 
 import argparse
@@ -78,18 +85,52 @@ def side_arrays(arrays, layers):
     return source_layers, subset, {"encoder": encoder, "decoder": decoder, "view": view}
 
 
-def convert(source, output, *, f16=True, log=print):
+def reusable(manifest, name, reuse):
+    """(bundle directory, its manifest) of the first format 2 bundle in `reuse` converted from exactly
+    the model's format 1 files (every file of the model, same sha256), or None."""
+    keys = [key for key in manifest["files"] if hub_module._owner(key, manifest["models"]) == name]
+    for directory, other in reuse:
+        if other["format_version"] != hub_module.FORMAT_V2 or name not in other["models"]:
+            continue
+        sources = other.get("converted_from", {}).get("files", {})
+        if all(sources.get(key, {}).get("sha256") == manifest["files"][key]["sha256"] for key in keys):
+            return directory, other
+    return None
+
+
+def link_model(name, directory, other, output, new, log=print):
+    """Link a model's sides (and copied head files) from a format 2 bundle into `new` (the manifest)."""
+    for stem, entry in other["sides"].items():
+        if hub_module._owner(stem, other["models"]) == name:
+            for item in entry["files"].values():
+                hub_module.link_file(directory / item["file"], output / item["file"])
+            new["sides"][stem] = entry
+    for key, item in (other.get("files") or {}).items():
+        if hub_module._owner(key, other["models"]) == name:
+            hub_module.link_file(directory / item["file"], output / item["file"])
+            new.setdefault("files", {})[key] = dict(item)
+    log(json.dumps({"linked": name, "from": str(directory)}))
+
+
+def convert(source, output, *, f16=True, log=print, reuse=()):
     source, output = Path(source), Path(output)
     manifest = hub_module.read_manifest(source)
     if manifest["format_version"] != hub_module.FORMAT:
         raise ValueError(f"{source} is not a format {hub_module.FORMAT} hub")
+    reuse = [(Path(directory), hub_module.read_manifest(directory)) for directory in reuse]
     output.mkdir(parents=True, exist_ok=False)
     verifier = hub_module.Verifier()
     new = {key: value for key, value in manifest.items() if key != "files"}
     new.update(format_version=hub_module.FORMAT_V2, sides={},
                converted_from={"directory": str(source.resolve()), "format_version": manifest["format_version"],
                                "files": manifest["files"]})
+    linked = set()
     for name in manifest["models"]:
+        found = reusable(manifest, name, reuse)
+        if found is not None:
+            link_model(name, *found, output, new, log=log)
+            linked.add(name)
+            continue
         for kind in hub_module.KINDS:
             started = time.perf_counter()
             entry = manifest["files"][f"{name}.{kind}"]
@@ -116,6 +157,8 @@ def convert(source, output, *, f16=True, log=print):
             log(json.dumps({"converted": f"{name}.{kind}", "source_layers": len(source_layers),
                             "seconds": round(time.perf_counter() - started, 2)}))
     for name in manifest.get("indexer_ridges", {}):
+        if name in linked:
+            continue
         entry = manifest["files"][f"{name}.indexer"]
         path = source / entry["file"]
         verifier.check(path, entry["sha256"])
@@ -130,6 +173,8 @@ def convert(source, output, *, f16=True, log=print):
         log(json.dumps({"converted": f"{name}.indexer", "layers": len(layers)}))
     for kind, entry in sorted((manifest.get("heads") or {}).items()):
         for name in entry["models"]:
+            if name in linked:
+                continue
             item = manifest["files"][f"{name}.{kind}"]
             path = source / item["file"]
             verifier.check(path, item["sha256"])
@@ -145,8 +190,10 @@ def main(argv=None):
     parser.add_argument("source", type=Path, help="format 1 hub bundle (read only)")
     parser.add_argument("output", type=Path, help="new directory for the format 2 bundle")
     parser.add_argument("--no-f16", action="store_true", help="skip the float16 copies of encoder/decoder sides")
+    parser.add_argument("--reuse", type=Path, action="append", default=[], metavar="V2_BUNDLE",
+                        help="link the sides of models this format 2 bundle was converted from (same files)")
     args = parser.parse_args(argv)
-    convert(args.source, args.output, f16=not args.no_f16)
+    convert(args.source, args.output, f16=not args.no_f16, reuse=args.reuse)
     return 0
 
 

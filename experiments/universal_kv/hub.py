@@ -36,11 +36,15 @@ centering and bases, then the fused encoder W = (basis2 * scale) @ encoder, one 
 instead of two) and the decoder side of the target. Bundles: format 1 (save_hub, one npz per
 model and kind) and format 2 (convert_hub.py: one flat C-contiguous .npy per model, kind and
 role, fused encoders precomputed). open_hub reads either lazily, side by side; load_hub reads
-a whole bundle of either format into HubKinds.
+a whole bundle of either format into HubKinds. An onboarding's bundle can hard-link the base's
+files (save_hub(link_base=...), after checking they hold the arrays in memory), and merge_bundles
+assembles a base and the bundles of models onboarded into it separately into one bundle of hard
+links (campaign.py assemble); linked files are read-only and never cross a filesystem (link_file).
 """
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+import errno
 import hashlib
 import json
 import os
@@ -948,13 +952,20 @@ def fit_head(base_kind, pivots, target_view, spans, kind, *, alphas=(1e-4, 1e-3,
 
 # -- evaluation ---------------------------------------------------------------------------------
 
-def evaluate(hub_kind, views, spans, kind, split="test", chunk=4096):
-    """Variance-weighted R^2 (about the split's own mean) of every ordered pair, all target layers."""
+def evaluate(hub_kind, views, spans, kind, split="test", chunk=4096, involving=None, pairs=None):
+    """Variance-weighted R^2 (about the split's own mean) of every ordered pair, all target layers;
+    with `involving` (a model name) only the pairs that have it as source or target, with `pairs`
+    (an iterable of (source, target) names) only those pairs."""
     selected = spans.select(split)
     by_name = {view.name: view for view in views}
+    wanted = None if pairs is None else {tuple(pair) for pair in pairs}
     results = {}
     for source in views:
         for target in views:
+            if involving is not None and involving not in (source.name, target.name):
+                continue
+            if wanted is not None and (source.name, target.name) not in wanted:
+                continue
             layers = target.layers(kind)
             sse = np.zeros(len(layers))
             y_sum = [np.zeros(target.width(kind, l)) for l in layers]
@@ -981,14 +992,119 @@ def evaluate(hub_kind, views, spans, kind, split="test", chunk=4096):
 
 # -- persistence --------------------------------------------------------------------------------
 
-def save_hub(directory, hubs, views, spans, settings, base_models=None, indexer_ridges=None):
+def link_file(source, destination):
+    """Hard-link source to destination (a new path) and make the file read-only (0444: every name
+    of it, the base bundle's included, so no writer rewrites a shared file in place; a replacement
+    goes through a new file). Refused across filesystems, where a link would be a full copy."""
+    try:
+        os.link(source, destination)
+    except OSError as error:
+        if error.errno != errno.EXDEV:
+            raise
+        raise ValueError(f"cannot hard-link {source} to {destination}: they lie on different filesystems "
+                         "(a link would be a copy; build the bundle on the filesystem of its members)") from None
+    os.chmod(destination, 0o444)
+
+
+def _device(path):
+    """st_dev of path, or of its nearest existing ancestor."""
+    path = Path(path).absolute()
+    while not path.exists():
+        path = path.parent
+    return path.stat().st_dev
+
+
+def _arrays_match(path, arrays):
+    """Whether the npz at `path` holds exactly these arrays (the same names, shapes and values)."""
+    with np.load(path, allow_pickle=False) as stored:
+        if set(stored.files) != set(arrays):
+            return False
+        for key, value in arrays.items():
+            value = np.asarray(value)
+            other = stored[key]
+            if other.shape != value.shape or not np.array_equal(other, value):
+                return False
+    return True
+
+
+def _kind_arrays(hub, name):
+    """The arrays save_hub writes to <name>.<kind>.npz for a HubKind's model."""
+    t = hub.transforms[name]
+    arrays = {"basis2": t.basis2, "scale": t.scale, "encoder": hub.encoders[name],
+              "decoder_z_mean": hub.decoder_z_mean[name]}
+    for i, layer in enumerate(t.layers):
+        arrays[f"mean_{layer}"] = t.means[i]
+        arrays[f"basis_{layer}"] = t.bases[i]
+        arrays[f"decoder_{layer}"] = hub.decoders[name][i]
+        arrays[f"decoder_mean_{layer}"] = hub.decoder_mean[name][i]
+    if name in hub.source_transforms:
+        st = hub.source_transforms[name]
+        arrays.update(source_basis2=st.basis2, source_scale=st.scale, source_encoder=hub.source_encoders[name],
+                      source_layers=np.asarray(st.layers, dtype=np.int64))
+        for i, layer in enumerate(st.layers):
+            arrays[f"source_mean_{layer}"] = st.means[i]
+            arrays[f"source_basis_{layer}"] = st.bases[i]
+    return arrays
+
+
+def _ridge_arrays(ridge):
+    """The arrays save_hub writes to <name>.indexer.npz for an IndexerRidge."""
+    arrays = {"layers": np.asarray(ridge.layers, dtype=np.int64)}
+    for i, layer in enumerate(ridge.layers):
+        arrays.update({f"x_mean_{layer}": ridge.x_means[i], f"weight_{layer}": ridge.weights[i],
+                       f"y_mean_{layer}": ridge.y_means[i]})
+    return arrays
+
+
+def _head_arrays(head, name):
+    """The arrays save_hub writes to <name>.<kind>.npz for a HeadKind's model."""
+    layers = list(head.layers[name])
+    arrays = {"layers": np.asarray(layers, dtype=np.int64), "decoder_z_mean": head.decoder_z_mean[name]}
+    for i, layer in enumerate(layers):
+        arrays[f"decoder_{layer}"] = head.decoders[name][i]
+        arrays[f"decoder_mean_{layer}"] = head.decoder_mean[name][i]
+    return arrays
+
+
+def save_hub(directory, hubs, views, spans, settings, base_models=None, indexer_ridges=None, link_base=None):
     """Write a hub bundle; base_models (a loaded manifest's "models") covers models not given as views;
     indexer_ridges ({name: IndexerRidge}) go to <name>.indexer.npz; HeadKinds among `hubs` go to
-    <name>.<kind>.npz (decoders only; own sources are not saved) and manifest["heads"]."""
+    <name>.<kind>.npz (decoders only; own sources are not saved) and manifest["heads"].
+
+    link_base: the format 1 bundle an onboarding started from (add_model_kind leaves the arrays of
+    its models untouched): the files of its models are hard links to its own (read-only, link_file),
+    with its manifest entries, so only the onboarded model's files are written. Before a file is
+    linked, its sha256 is checked against the base manifest and its arrays against the ones in
+    memory: a base model whose arrays changed is refused (ValueError), never linked."""
     directory = Path(directory)
     heads = {kind: hub for kind, hub in hubs.items() if isinstance(hub, HeadKind)}
     hubs = {kind: hub for kind, hub in hubs.items() if not isinstance(hub, HeadKind)}
+    linked = {}
+    if link_base is not None:
+        link_base = Path(link_base)
+        base_manifest = read_manifest(link_base)
+        if base_manifest["format_version"] != FORMAT:
+            raise ValueError(f"{link_base} is not a format {FORMAT} bundle: its files cannot be linked")
+        linked = {key: entry for key, entry in base_manifest["files"].items()
+                  if _owner(key, base_manifest["models"]) is not None}
     directory.mkdir(parents=True, exist_ok=False)
+
+    verifier = Verifier()
+
+    def linked_entry(key, arrays):
+        """Link the base bundle's file of `key` into the new bundle once it holds exactly `arrays`
+        (the arrays in memory); its manifest entry, or None when the base has no such file."""
+        entry = linked.get(key)
+        if entry is not None:
+            path = link_base / entry["file"]
+            verifier.check(path, entry["sha256"])
+            if not _arrays_match(path, arrays):
+                raise ValueError(f"{key}: the arrays in memory differ from {path}: a base model changed, "
+                                 "its file cannot be linked")
+            link_file(path, directory / entry["file"])
+            manifest["files"][key] = dict(entry)
+        return entry
+
     models = dict(base_models or {})
     models.update({view.name: {"architecture": view.architecture,
                                "layers": {kind: view.layers(kind) for kind in KINDS},
@@ -1002,21 +1118,9 @@ def save_hub(directory, hubs, views, spans, settings, base_models=None, indexer_
         manifest[f"{kind}_eigenvalues"] = [float(v) for v in hub.eigenvalues]
         manifest[f"{kind}_alphas"] = {name: hub.alphas[name]["alpha"] for name in hub.names}
         for name in hub.names:
-            t = hub.transforms[name]
-            arrays = {"basis2": t.basis2, "scale": t.scale, "encoder": hub.encoders[name],
-                      "decoder_z_mean": hub.decoder_z_mean[name]}
-            for i, layer in enumerate(t.layers):
-                arrays[f"mean_{layer}"] = t.means[i]
-                arrays[f"basis_{layer}"] = t.bases[i]
-                arrays[f"decoder_{layer}"] = hub.decoders[name][i]
-                arrays[f"decoder_mean_{layer}"] = hub.decoder_mean[name][i]
-            if name in hub.source_transforms:
-                st = hub.source_transforms[name]
-                arrays.update(source_basis2=st.basis2, source_scale=st.scale, source_encoder=hub.source_encoders[name],
-                              source_layers=np.asarray(st.layers, dtype=np.int64))
-                for i, layer in enumerate(st.layers):
-                    arrays[f"source_mean_{layer}"] = st.means[i]
-                    arrays[f"source_basis_{layer}"] = st.bases[i]
+            arrays = _kind_arrays(hub, name)
+            if linked_entry(f"{name}.{kind}", arrays):
+                continue
             path = directory / f"{name}.{kind}.npz"
             np.savez(path, **arrays)
             manifest["files"][f"{name}.{kind}"] = {"file": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
@@ -1025,16 +1129,15 @@ def save_hub(directory, hubs, views, spans, settings, base_models=None, indexer_
         for name, ridge in sorted(indexer_ridges.items()):
             if name not in models:
                 raise ValueError(f"indexer ridge for {name}, which is not in the hub")
-            arrays = {"layers": np.asarray(ridge.layers, dtype=np.int64)}
-            for i, layer in enumerate(ridge.layers):
-                arrays.update({f"x_mean_{layer}": ridge.x_means[i], f"weight_{layer}": ridge.weights[i],
-                               f"y_mean_{layer}": ridge.y_means[i]})
-            path = directory / f"{name}.indexer.npz"
-            np.savez(path, **arrays)
-            manifest["files"][f"{name}.indexer"] = {"file": path.name, "sha256": sha256_file(path)}
             manifest["indexer_ridges"][name] = {"layers": list(ridge.layers),
                                                 "alphas": {str(l): ridge.fit.get(l, {}).get("alpha")
                                                            for l in ridge.layers}}
+            arrays = _ridge_arrays(ridge)
+            if linked_entry(f"{name}.indexer", arrays):
+                continue
+            path = directory / f"{name}.indexer.npz"
+            np.savez(path, **arrays)
+            manifest["files"][f"{name}.indexer"] = {"file": path.name, "sha256": sha256_file(path)}
     if heads:
         manifest["heads"] = {}
         for kind, head in sorted(heads.items()):
@@ -1043,15 +1146,14 @@ def save_hub(directory, hubs, views, spans, settings, base_models=None, indexer_
                 if name not in models:
                     raise ValueError(f"{kind} heads for {name}, which is not in the hub")
                 layers = list(head.layers[name])
-                arrays = {"layers": np.asarray(layers, dtype=np.int64), "decoder_z_mean": head.decoder_z_mean[name]}
-                for i, layer in enumerate(layers):
-                    arrays[f"decoder_{layer}"] = head.decoders[name][i]
-                    arrays[f"decoder_mean_{layer}"] = head.decoder_mean[name][i]
+                manifest["heads"][kind]["models"][name] = {"layers": layers,
+                                                           "alpha": head.alphas.get(name, {}).get("alpha")}
+                arrays = _head_arrays(head, name)
+                if linked_entry(f"{name}.{kind}", arrays):
+                    continue
                 path = directory / f"{name}.{kind}.npz"
                 np.savez(path, **arrays)
                 manifest["files"][f"{name}.{kind}"] = {"file": path.name, "sha256": sha256_file(path)}
-                manifest["heads"][kind]["models"][name] = {"layers": layers,
-                                                           "alpha": head.alphas.get(name, {}).get("alpha")}
     (directory / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n", encoding="utf-8")
 
 
@@ -1364,6 +1466,93 @@ def _load_heads(hubs, directory, manifest, verifier):
         return hubs
     hub = Hub(directory, verifier=verifier)
     return with_heads(hubs, [hub.head(kind) for kind in manifest["heads"]])
+
+
+def _owner(key, names):
+    """The model a manifest key ("<name>.<kind>", "<name>.<kind>.<role>") belongs to: the longest
+    name it starts with (model names may hold dots)."""
+    found = [name for name in names if key.startswith(name + ".")]
+    return max(found, key=len) if found else None
+
+
+def _bundle_entries(manifest):
+    """{(table, key): entry} of the files a bundle lists: format 1 "files", format 2 "sides" (and the
+    format 1 "files" it copies, DeepSeek V4 heads)."""
+    out = {("files", key): entry for key, entry in (manifest.get("files") or {}).items()}
+    out.update({("sides", key): entry for key, entry in (manifest.get("sides") or {}).items()})
+    return out
+
+
+def _entry_files(table, entry):
+    return [item["file"] for item in entry["files"].values()] if table == "sides" else [entry["file"]]
+
+
+def merge_bundles(output, bundles):
+    """Assemble one bundle `output` (new) from bundles of one format: the first is the base, each
+    other one was grown from it by onboarding (fit_hub.py --base: the models it shares with the base
+    hold the very same files) and adds its own models. Every file is a hard link, so assembling
+    refits nothing and costs no disk; the order does not matter, and two bundles may not add the
+    same model. The manifest keeps the base's settings and spans and records each member bundle's
+    settings under "assembled". `output` must lie on the members' filesystem (a link across
+    filesystems would be a copy: refused before anything is written). Returns the manifest."""
+    import copy
+    output, bundles = Path(output), [Path(b) for b in bundles]
+    manifests = [read_manifest(b) for b in bundles]
+    base = manifests[0]
+    version = base["format_version"]
+    if any(m["format_version"] != version for m in manifests):
+        raise ValueError("bundles of different formats cannot be merged (convert_hub.py first)")
+    for path, manifest in zip(bundles[1:], manifests[1:]):
+        for kind in KINDS:
+            if manifest[f"{kind}_eigenvalues"] != base[f"{kind}_eigenvalues"]:
+                raise ValueError(f"{path} was not grown from {bundles[0]}: its {kind} hub latent differs")
+    devices = {_device(path) for path in bundles}
+    if devices != {_device(output)}:
+        raise ValueError(f"{output} and the bundles it assembles lie on different filesystems: "
+                         "hard links cannot cross them (assemble next to the members)")
+    merged = copy.deepcopy(base)
+    entries = {item: (bundles[0], entry) for item, entry in _bundle_entries(base).items()}
+    base_names = set(base["models"])
+    for path, manifest in zip(bundles[1:], manifests[1:]):
+        names = set(manifest["models"])
+        for (table, key), entry in _bundle_entries(manifest).items():
+            owner = _owner(key, names)
+            if owner in base_names:
+                if entries.get((table, key), (None, None))[1] != entry:
+                    raise ValueError(f"{path}: {key} differs from the base bundle's (not grown from it)")
+                continue
+            if (table, key) in entries:
+                raise ValueError(f"{key} is in {entries[table, key][0]} and in {path}: a model added twice")
+            entries[table, key] = (path, entry)
+        for name in sorted(names - base_names):
+            merged["models"][name] = manifest["models"][name]
+            for kind in KINDS:
+                merged[f"{kind}_alphas"][name] = manifest[f"{kind}_alphas"][name]
+            if name in manifest.get("indexer_ridges", {}):
+                merged.setdefault("indexer_ridges", {})[name] = manifest["indexer_ridges"][name]
+            for kind, head in (manifest.get("heads") or {}).items():
+                if name in head["models"]:
+                    merged.setdefault("heads", {}).setdefault(kind, {"base": head["base"], "models": {}})
+                    merged["heads"][kind]["models"][name] = head["models"][name]
+            if version == FORMAT_V2:
+                for key, item in manifest["converted_from"]["files"].items():
+                    if _owner(key, names) == name:
+                        merged["converted_from"]["files"][key] = item
+        merged.setdefault("assembled", {})[str(path.resolve())] = {
+            "models": sorted(names - base_names), "settings": manifest.get("settings")}
+    output.mkdir(parents=True, exist_ok=False)
+    merged["files"], merged["sides"] = {}, {}
+    for (table, key), (path, entry) in sorted(entries.items()):
+        for name in _entry_files(table, entry):
+            link_file(path / name, output / name)
+        merged[table][key] = entry
+    if version == FORMAT:
+        merged.pop("sides")
+    elif not merged["files"]:
+        merged.pop("files")
+    merged["assembled_base"] = str(bundles[0].resolve())
+    (output / "manifest.json").write_text(json.dumps(merged, indent=1) + "\n", encoding="utf-8")
+    return merged
 
 
 def load_indexer_ridges(directory, *, verifier=None):

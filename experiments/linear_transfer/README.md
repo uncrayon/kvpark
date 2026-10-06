@@ -897,6 +897,10 @@ segments.
   arguments, a Hermes agent transcript) under the 8 `OPTION_SETS` (reasoning effort, thinking,
   preserve_reasoning): 96 cases per model; `--conversations JSONL` compares other conversations.
   The report gives `parity`, the counts, `by_conversation` and the escaped segments per case.
+  From Python, `check_server(..., add_generation_prompt=False)` compares whole conversations the
+  way a corpus record renders them: the request asks for no generation prompt and the twin runs
+  with `--no-prefill-assistant`, so a final assistant message is a complete turn
+  (`experiments/universal_kv/campaign.py` checks every new model's records so).
 
 ```bash
 experiments/linear_transfer/.venv/bin/python experiments/linear_transfer/template_check.py --model /srv/models/qwen3-4b-instruct/Qwen3-4B-Instruct-2507-Q8_0.gguf --server-binary runtime/build/bin/llama-server --output /tmp/parity-qwen3-4b.json

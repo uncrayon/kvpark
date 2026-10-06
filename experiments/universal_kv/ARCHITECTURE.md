@@ -179,6 +179,19 @@ as llama.cpp prints them and render each conversation exactly as llama-server do
   needs only its own captures on the hub corpus plus one or more pivot models' captures; its
   encoder regresses onto the pivots' latent estimates and its decoder from them. Existing
   adapters are untouched (test_hub.py checks bit-identity).
+- **Growing the hub (campaign.py).** Every new model is onboarded against the same base
+  (hub4-d4096, its four models as pivots), so its adapters depend on the base and its own
+  captures only, never on another new model. Its bundle hard-links the base's files
+  (`fit_hub.py --link-base`, after checking they hold the arrays in memory; `convert_hub.py
+  --reuse`), and `campaign.py assemble` merges the base and any set of onboarded bundles into
+  one hub per format (`hub.merge_bundles`: hard links, any order, no refit). Linked files are
+  read-only (0444, every name of the inode, the base's included) and never cross a filesystem
+  (a link there would be a copy). Two onboarded models translate between each other through the
+  same latent; the onboarding tests each one against the pivots only, and `campaign.py assemble
+  --evaluate` measures the pairs between onboarded models (they all capture the same dev and test
+  documents). An assembled hub is never changed: onboarding a model again (`--redo onboard`)
+  leaves it with the old adapters, which `campaign.py status` flags by sha256; the bridge moves
+  to a newly assembled directory.
 - **Other cache families in the same hub.** An MLA model's K view is its pre-RoPE row
   [c_kv | k_pe] and its V view is c_kv (the V that attention reads); into an MLA target only
   the K kind is decoded. A DSA model can carry an *indexer ridge* (`fit_hub.py --indexer-ridge

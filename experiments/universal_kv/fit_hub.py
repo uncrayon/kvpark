@@ -11,6 +11,11 @@ its K rows) into the bundle; with --base the base bundle's ridges are kept. --he
 DeepSeek V4 model's head decoders (hub.fit_head: its captured compressor inputs, keys csa, hca and
 lid, out of the K latent of the other models) into the bundle; with --base the base bundle's
 heads are kept.
+
+Onboarding (--base) leaves the base models' adapters untouched: --link-base hard-links their files
+from the base bundle (a format 1 bundle) instead of writing them again, so the new bundle costs
+only the new model's files, and --evaluate new measures only the pairs that involve the new model
+(the base pairs are in the base bundle's evaluation.json).
 """
 
 import os
@@ -83,9 +88,15 @@ def main(argv=None):
     parser.add_argument("--heads", action="append", default=[], metavar="NAME",
                         help="fit this DeepSeek V4 model's head decoders from its captured compressor inputs "
                         "(keys csa, hca, lid)")
+    parser.add_argument("--link-base", action="store_true",
+                        help="with --base: hard-link the base models' files instead of writing them again")
+    parser.add_argument("--evaluate", choices=("all", "new"), default="all",
+                        help="test R^2 of every ordered pair, or (with --base) only those with the new model")
     args = parser.parse_args(argv)
     if args.output.exists():
         raise SystemExit(f"output exists: {args.output}")
+    if (args.link_base or args.evaluate == "new") and not args.base:
+        raise SystemExit("--link-base and --evaluate new need --base")
     started = time.perf_counter()
     log_path = args.output.with_name(args.output.name + ".log.jsonl")
 
@@ -119,8 +130,9 @@ def main(argv=None):
             hubs[kind] = hub.fit_hub_kind(views, spans, kind, layer_rank=args.layer_rank, view_dim=args.view_dim,
                                           hub_dim=args.hub_dim, fit_rows=args.fit_rows, chunk=args.chunk, log=log,
                                           source_layers={n: layers[kind] for n, layers in source_layers.items()})
+        involving = views[0].name if args.evaluate == "new" else None
         evaluation[kind] = {f"{s}->{t}": item for (s, t), item in
-                            hub.evaluate(hubs[kind], views, spans, kind, chunk=args.chunk).items()}
+                            hub.evaluate(hubs[kind], views, spans, kind, chunk=args.chunk, involving=involving).items()}
         log(json.dumps({"stage": "test", "kind": kind,
                         "r2": {pair: round(item["r2"], 4) for pair, item in evaluation[kind].items()}}))
         for item in args.direct:
@@ -148,7 +160,9 @@ def main(argv=None):
     settings["models"] = {name: {"captures": [str(c.resolve()) for c in caps], "records": str(rec.resolve())}
                           for name, caps, rec in args.model}
     settings["base"] = str(args.base.resolve()) if args.base else None
-    hub.save_hub(args.output, hubs, views, spans, settings, base_models=base_models, indexer_ridges=ridges)
+    settings["linked_base"] = bool(args.link_base)
+    hub.save_hub(args.output, hubs, views, spans, settings, base_models=base_models, indexer_ridges=ridges,
+                 link_base=args.base if args.link_base else None)
     (args.output / "evaluation.json").write_text(json.dumps(evaluation, indent=1) + "\n", encoding="utf-8")
     log(json.dumps({"stage": "done", "seconds": round(time.perf_counter() - started, 1)}))
     return 0

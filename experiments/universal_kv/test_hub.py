@@ -1,7 +1,9 @@
+import errno
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -164,6 +166,12 @@ class HubTest(unittest.TestCase):
         results = hub.evaluate(base, views, spans, "k")
         for pair in (("c", "a"), ("a", "c"), ("c", "b"), ("b", "c")):
             self.assertGreater(results[pair]["r2"], 0.95, pair)
+        new_only = hub.evaluate(base, views, spans, "k", involving="c")          # fit_hub.py --evaluate new
+        self.assertEqual(set(new_only), {pair for pair in results if "c" in pair})
+        self.assertEqual(new_only["a", "c"], results["a", "c"])
+        chosen = hub.evaluate(base, views, spans, "k", pairs=[("c", "b"), ("b", "c")])   # campaign.py assemble --evaluate
+        self.assertEqual(set(chosen), {("c", "b"), ("b", "c")})
+        self.assertEqual(chosen["c", "b"], results["c", "b"])
         with self.assertRaisesRegex(ValueError, "already in the hub"):
             hub.add_model_kind(base, views[2], views[:2], spans, "k", log=lambda line: None)
 
@@ -381,6 +389,90 @@ class SidesAndBundlesTest(unittest.TestCase):
             third = hub.open_hub(v2, cache_dir=stamps.parent)
             with self.assertRaisesRegex(ValueError, "manifest hash"):
                 third.encoder_side("k", "b")
+
+    def test_onboarded_bundles_link_the_base_and_assemble_into_one_hub(self):
+        """fit_hub.py --base --link-base, convert_hub.py --reuse and campaign.py assemble on a small
+        hub: two models onboarded separately against the same base end up in one bundle of hard
+        links, in both formats, translating as their own bundles do."""
+        import convert_hub
+        views, spans, latent = make_views(n=1200)
+        # two more models of the same latent, onboarded separately with a and b as pivots
+        extra = {"d": FakeView("d", latent, [10, 10], 4), "e": FakeView("e", latent, [6, 6, 6], 5)}
+        spans.rows.update({name: np.arange(1200) for name in extra})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base_hubs = {kind: hub.fit_hub_kind(views[:2], spans, kind, layer_rank=8, view_dim=12, hub_dim=6,
+                                                log=lambda line: None) for kind in hub.KINDS}
+            hub.save_hub(root / "base", base_hubs, views[:2], spans, {"note": "base"})
+            convert_hub.convert(root / "base", root / "base-v2", log=lambda line: None)
+            base_manifest = hub.read_manifest(root / "base")
+            for name in extra:
+                hubs, manifest = hub.load_hub(root / "base")
+                for kind in hub.KINDS:
+                    hub.add_model_kind(hubs[kind], extra[name], views[:2], spans, kind, layer_rank=8, view_dim=12,
+                                       log=lambda line: None)
+                hub.save_hub(root / name, hubs, [extra[name]] + views[:2], spans, {"note": name},
+                             base_models=manifest["models"], link_base=root / "base")
+                logs = []
+                convert_hub.convert(root / name, root / f"{name}-v2", log=logs.append, reuse=[root / "base-v2"])
+                self.assertEqual([json.loads(line).get("linked") for line in logs if "linked" in line], ["a", "b"])
+                for kind in hub.KINDS:
+                    for model in ("a", "b"):                         # the base's files, linked, read-only
+                        entry = base_manifest["files"][f"{model}.{kind}"]
+                        self.assertEqual((root / name / entry["file"]).stat().st_ino,
+                                         (root / "base" / entry["file"]).stat().st_ino)
+                        self.assertEqual((root / "base" / entry["file"]).stat().st_mode & 0o777, 0o444)
+                    self.assertEqual((root / name / f"{name}.{kind}.npz").stat().st_nlink, 1)
+            # a base model whose arrays changed in memory is never linked
+            hubs, manifest = hub.load_hub(root / "base")
+            hubs["v"].encoders["a"] = hubs["v"].encoders["a"] + 1e-3
+            with self.assertRaisesRegex(ValueError, "a base model changed"):
+                hub.save_hub(root / "changed", hubs, views[:2], spans, {}, base_models=manifest["models"],
+                             link_base=root / "base")
+            # links never cross a filesystem (they would be copies)
+            with mock.patch("os.link", side_effect=OSError(errno.EXDEV, "cross-device link")):
+                with self.assertRaisesRegex(ValueError, "different filesystems"):
+                    hub.link_file(root / "base" / "manifest.json", root / "copied.json")
+            self.assertFalse((root / "copied.json").exists())
+            with mock.patch.object(hub, "_device", side_effect=lambda path: 1 if "elsewhere" in str(path) else 0):
+                with self.assertRaisesRegex(ValueError, "different filesystems"):
+                    hub.merge_bundles(root / "elsewhere", [root / "base", root / "d"])
+            self.assertFalse((root / "elsewhere").exists())
+            with self.assertRaisesRegex(ValueError, "not a format 1"):
+                hub.save_hub(root / "bad", base_hubs, views[:2], spans, {}, link_base=root / "base-v2")
+            merged = hub.merge_bundles(root / "hub5", [root / "base", root / "d", root / "e"])
+            merged_v2 = hub.merge_bundles(root / "hub5-v2", [root / "base-v2", root / "d-v2", root / "e-v2"])
+            self.assertEqual(sorted(merged["models"]), ["a", "b", "d", "e"])
+            self.assertEqual(sorted(merged_v2["models"]), ["a", "b", "d", "e"])
+            self.assertEqual(sorted(merged["assembled"]), sorted(str((root / n).resolve()) for n in ("d", "e")))
+            self.assertEqual(set(merged["k_alphas"]), {"a", "b", "d", "e"})
+            for directory_name in ("hub5", "hub5-v2"):
+                for path in (root / directory_name).iterdir():
+                    if path.name != "manifest.json":
+                        self.assertGreater(path.stat().st_nlink, 1, path.name)
+            # an assembled hub translates d -> e as e's own decoder after d's own encoder
+            lazy, lazy_v2 = hub.open_hub(root / "hub5"), hub.open_hub(root / "hub5-v2")
+            own_d, own_e = hub.open_hub(root / "d"), hub.open_hub(root / "e")
+            for kind in hub.KINDS:
+                blocks = {layer: extra["d"].rows(kind, layer, np.arange(30)) for layer in extra["d"].layers(kind)}
+                expected = own_e.decoder_side(kind, "e").decode(own_d.encoder_side(kind, "d").encode(blocks), [0, 1, 2])
+                for assembled in (lazy, lazy_v2):
+                    got = assembled.decoder_side(kind, "e").decode(assembled.encoder_side(kind, "d").encode(blocks),
+                                                                   [0, 1, 2])
+                    np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)
+            loaded, _ = hub.load_hub(root / "hub5-v2")
+            self.assertEqual(loaded["k"].names, ["a", "b", "d", "e"])
+            # members that were not grown from the base, or that add the same model twice, are refused
+            with self.assertRaisesRegex(ValueError, "added twice"):
+                hub.merge_bundles(root / "twice", [root / "base", root / "d", root / "d"])
+            with self.assertRaisesRegex(ValueError, "different formats"):
+                hub.merge_bundles(root / "mixed", [root / "base", root / "d-v2"])
+            other = {kind: hub.fit_hub_kind(views[:2], spans, kind, layer_rank=8, view_dim=12, hub_dim=5,
+                                            log=lambda line: None) for kind in hub.KINDS}
+            hub.save_hub(root / "other", other, views[:2], spans, {})
+            with self.assertRaisesRegex(ValueError, "not grown from"):
+                hub.merge_bundles(root / "foreign", [root / "base", root / "other"])
+            self.assertFalse((root / "twice").exists() or (root / "foreign").exists())
 
     def test_lazy_format_1_reads_only_the_sides_asked_for(self):
         with tempfile.TemporaryDirectory() as directory:
