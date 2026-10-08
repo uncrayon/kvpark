@@ -18,7 +18,12 @@ N models). Train split only:
 
 A translation m -> n is decode_n(encode_m(rows)). With M models the hub stores 2M adapters
 instead of M(M - 1) pairwise maps; adding a model needs stages 1-2 for it and two ridge
-fits against the hub latents of the hub corpus.
+fits against the hub latents of the hub corpus (add_model_kind). Its decoder regresses its rows on
+the pooled pivot estimates, as stage 4 does; its encoder (solve_onboard_encoder, ONBOARD_ENCODERS)
+cannot regress onto its own estimate of Z, since Z was fitted without it: "ridge" regresses onto the
+mean of the pivots' estimates, which a MAXVAR hub shrinks by lambda / M per dimension, "consensus"
+onto Z itself, and match, tls, reverse and cca rescale those encodings (README "Onboarding
+encoders"). reencode_model_kind fits only the encoder again, its transforms and decoders untouched.
 
 Views are whatever the captures hold per attention layer, so cache families mix freely: GQA
 heads (Qwen3, Muse, the Qwen3.5 hybrids' attention layers) and MLA rows (deepseek2 and
@@ -29,7 +34,15 @@ section of a translated state. A DeepSeek V4 model's K view is its pre-RoPE late
 its compressor inputs (HEAD_KINDS: per CSA, HCA or LID layer the row [a | s]) get head decoders
 out of the K latent (HeadKind, fit_head), which dsv4_pool pools into its compressed caches.
 
-All statistics are float64 sums over float32 chunks; nothing is held for all rows at once.
+All statistics are float64 sums over float32 chunks; nothing is held for all rows at once. The fits'
+products (projections, Grams, cross products) run on the fit backend (fit_backend.current(): numpy on
+the CPU, or a torch GPU in float16 with float32 accumulation, fit_hub.py --fit-device); eigh, solve and
+svd stay LAPACK on the CPU, in float64 except the top eigenvectors of a large matrix (_top_eig: float32
+subset solves, fit_backend.top_eig). Decoders are fitted from pooled statistics (_DecoderStats): the
+cross moments of the pooled source estimates with the target rows are those of their sum (the target
+rows repeat for every source), the pooled Gram is pooled from per-source moments, and the ridge
+strength is chosen on the dev spans from their Gram and cross moments in closed form, without
+predicting the dev rows for every alpha.
 
 Translation needs one *side* per kind and model: the encoder side of the source (stage-1
 centering and bases, then the fused encoder W = (basis2 * scale) @ encoder, one matrix
@@ -60,12 +73,23 @@ sys.path.insert(0, str(HERE.parent / "linear_transfer"))
 
 from align import _segment_bytes, classify_tokens, segment_table  # noqa: E402
 from captures import CaptureSet  # noqa: E402
+import fit_backend  # noqa: E402
 
 KINDS = ("k", "v")
 INDEXER_KEY = "ik"              # capture key of the pre-RoPE DSA indexer keys (kv_probe)
 FORMAT = 1
 FORMAT_V2 = 2
 _POOL = ThreadPoolExecutor(8)   # memory-mapped reads: page faults in parallel threads
+
+
+def _no_check(where=None):
+    return None
+
+
+# the resource guard's hook (resource_guard.Guard.check): every fit loop calls it between chunks and
+# before its large eigendecompositions, so a fit sleeps while the CPU is too hot and stops when it is
+# critical. fit_hub.py (and diagnostics) set it for a fit; a no-op otherwise.
+guard_check = _no_check
 
 
 def read_jsonl(path):
@@ -193,35 +217,84 @@ def joint_spans(views):
 # -- streaming statistics -----------------------------------------------------------------------
 
 class Moments:
-    """Streaming mean and covariance (float64 sums of float32 chunks, shifted by the first chunk's mean)."""
+    """Streaming mean and covariance (float64 sums of float32 chunks, shifted by the first chunk's mean).
+    The Gram of each chunk runs on the fit backend current at construction (backend=); its sum stays
+    there until it is first read (squares, covariance), after which no chunk may be added. The
+    covariance is computed once (callers must not modify it in place)."""
 
-    def __init__(self, dim):
+    def __init__(self, dim, backend=None):
+        self.backend = backend or fit_backend.current()
         self.n, self.shift = 0, None
         self.sum = np.zeros(dim)
-        self.squares = np.zeros((dim, dim))
+        self._squares, self._held, self._covariance = self.backend.zeros(dim, dim, symmetric=True), None, None
 
     def add(self, x):
-        x = np.asarray(x, dtype=np.float32)
+        if self._held is not None:
+            raise RuntimeError("Moments: a chunk added after the sums were read")
+        backend = self.backend
+        x = backend.put(x)
         if self.shift is None:
-            self.shift = x.mean(axis=0, dtype=np.float64).astype(np.float32)
-        xc = x - self.shift
+            self.shift = backend.col_mean32(x)
+        xc = backend.sub(x, self.shift)
         self.n += len(x)
-        self.sum += xc.sum(axis=0, dtype=np.float64)
-        self.squares += (xc.T @ xc).astype(np.float64)
+        self.sum += backend.col_sum64(xc)
+        backend.add_gram(self._squares, xc)
+
+    @property
+    def squares(self):
+        if self._held is None:
+            self._held, self._squares = self.backend.fetch(self._squares), None
+        return self._held
 
     @property
     def mean(self):
         return self.shift.astype(np.float64) + self.sum / self.n
 
     def covariance(self):
-        centered = self.sum / self.n
-        cov = self.squares / self.n - np.outer(centered, centered)
-        return (cov + cov.T) / 2
+        if self._covariance is None:
+            centered = self.sum / self.n
+            cov = self.squares / self.n - np.outer(centered, centered)
+            self._covariance = (cov + cov.T) / 2
+        return self._covariance
+
+
+def _pool(moments):
+    """(rows, mean, scatter) of the rows of several Moments together: the parallel-axis theorem."""
+    n = sum(m.n for m in moments)
+    mean = sum(m.n * m.mean for m in moments) / n
+    return n, mean, _scatter_about(moments, mean)
+
+
+def _scatter_about(moments, center):
+    """sum over the rows of several Moments of (x - center)(x - center)' (float64)."""
+    scatter = 0
+    for m in moments:
+        offset = m.mean - center
+        scatter = scatter + m.n * m.covariance() + m.n * np.outer(offset, offset)
+    return scatter
 
 
 def chunks(n, size):
     for start in range(0, n, size):
         yield slice(start, min(start + size, n))
+
+
+def _loaded_chunks(n, size, load):
+    """(part, load(part)) for the chunks of range(n). With a backend that prefetches (the GPU), the next
+    chunk's load (the capture reads) runs on a thread while this one is processed."""
+    parts = list(chunks(n, size))
+    if not fit_backend.current().prefetch or len(parts) < 2:
+        for part in parts:
+            yield part, load(part)
+        return
+    with ThreadPoolExecutor(1) as reader:
+        pending = reader.submit(load, parts[0])
+        for index, part in enumerate(parts):
+            data = pending.result()
+            if index + 1 < len(parts):
+                pending = reader.submit(load, parts[index + 1])
+            yield part, data
+            del data
 
 
 def subsample(indices, limit, seed=0, doc=None):
@@ -269,20 +342,44 @@ class ViewTransform:
 
 
 def _top_eig(cov, k):
-    values, vectors = np.linalg.eigh(cov)
-    order = np.argsort(values)[::-1][:k]
-    return np.clip(values[order], 0, None), vectors[:, order]
+    """The top k eigenpairs (fit_backend.top_eig: scipy's subset solver when importable, else numpy; a
+    large subset problem in float32)."""
+    return fit_backend.top_eig(cov, k)
+
+
+def _stage1(backend, transform, blocks):
+    """transform.stage1(blocks) on a fit backend (blocks: per layer, transform.layers order)."""
+    return backend.cat([backend.mm(backend.sub(block, mean), basis)
+                        for block, mean, basis in zip(blocks, transform.means, transform.bases)], axis=1)
+
+
+def _coords(backend, transform, blocks):
+    """transform(blocks) on a fit backend: the whitened view coordinates u."""
+    return backend.scale_cols(backend.mm(_stage1(backend, transform, blocks), transform.basis2), transform.scale)
+
+
+def _encode(backend, hub_kind, name, rows_by_layer):
+    """hub_kind.encode(name, rows_by_layer) on a fit backend."""
+    transform = hub_kind.source_transforms.get(name) or hub_kind.transforms[name]
+    return backend.mm(_stage1(backend, transform, [rows_by_layer[layer] for layer in transform.layers]),
+                      hub_kind.encoder_weight(name))
 
 
 def fit_view(view, kind, rows, *, layer_rank=512, view_dim=2048, eps=1e-3, chunk=4096, log=print, layers=None):
     """Stages 1-2 for one model and kind on the given global capture rows (optionally a layer subset)."""
+    backend = fit_backend.current()
     layers = list(view.layers(kind) if layers is None else layers)
+
+    def load(part):
+        return gather_layers(view, kind, layers, rows[part])
     moments = [Moments(view.width(kind, layer)) for layer in layers]
-    for part in chunks(len(rows), chunk):
-        for moment, block in zip(moments, gather_layers(view, kind, layers, rows[part])):
+    for part, blocks in _loaded_chunks(len(rows), chunk, load):
+        guard_check("view")
+        for moment, block in zip(moments, blocks):
             moment.add(block)
     means, bases, explained = [], [], []
     for moment in moments:
+        guard_check("view")
         cov = moment.covariance()
         values, vectors = _top_eig(cov, min(layer_rank, len(cov)))
         means.append(moment.mean.astype(np.float32))
@@ -291,8 +388,10 @@ def fit_view(view, kind, rows, *, layer_rank=512, view_dim=2048, eps=1e-3, chunk
     partial = ViewTransform(layers, means, bases, np.zeros((0, 0), np.float32), np.zeros(0, np.float32))
     width = sum(b.shape[1] for b in bases)
     second = Moments(width)
-    for part in chunks(len(rows), chunk):
-        second.add(partial.stage1(gather_layers(view, kind, layers, rows[part])))
+    for part, blocks in _loaded_chunks(len(rows), chunk, load):
+        guard_check("view")
+        second.add(_stage1(backend, partial, blocks))
+    guard_check("view")
     cov2 = second.covariance()
     values, vectors = _top_eig(cov2, min(view_dim, width))
     scale = 1 / np.sqrt(values + eps * values[0])
@@ -425,11 +524,121 @@ def _gather_blocks(view, kind, rows):
     return gather_layers(view, kind, view.layers(kind), rows)
 
 
+class _DecoderStats:
+    """The statistics of one target's ridge decoders (stage 4, onboarding, head decoders): the target's
+    row blocks regressed on the pooled hub estimates of `repeat` sources (each source's estimate of a
+    span is one regression row, the target's rows repeat for every source), streamed chunk by chunk.
+
+      add(z_total, z_col_sum, ys)  a train chunk: the sum over the sources of their estimates [n, D] (on
+                                   the backend), the sum of their column sums (float64) and the target's
+                                   blocks: the cross moments of the pooled estimates with the repeated
+                                   rows are those of z_total with the rows
+      finish(source_moments)       after the train pass, with the Moments of each source's estimates:
+                                   the pooled Gram (_pool), the centered cross moments, their projection
+                                   on the Gram's eigenvectors
+      add_dev(z_total, ys)         a dev chunk (after finish): the dev cross moments and row sums
+      solve(alphas, dev_moments)   (decoder per block, block means, z mean, alpha, dev R^2 per alpha):
+                                   the ridge strength with the best dev R^2, the dev sum of squared
+                                   errors of every alpha in closed form from the dev Gram (dev_moments:
+                                   Moments of each source's dev estimates) and cross moments.
+    """
+
+    def __init__(self, backend, dim, widths, repeat):
+        self.backend, self.dim, self.widths, self.repeat = backend, dim, list(widths), repeat
+        self.cross = [backend.zeros(dim, w) for w in self.widths]
+        self.y_sum = [np.zeros(w) for w in self.widths]
+        self.count, self.z_shift, self.y_shift = 0, None, None
+        self.dev_rows = 0
+
+    def add(self, z_total, z_col_sum, ys):
+        backend = self.backend
+        n = len(ys[0])
+        if self.z_shift is None:        # the mean of the first chunk's pooled estimates
+            self.z_shift = (np.asarray(z_col_sum) / (self.repeat * n)).astype(np.float32)
+            self.y_shift = [backend.col_mean32(y) for y in ys]
+        zc = backend.sub(z_total, self.repeat * self.z_shift)
+        for index, y in enumerate(ys):
+            yc = backend.sub(y, self.y_shift[index])
+            self.y_sum[index] += self.repeat * backend.col_sum64(yc)
+            backend.add_cross(self.cross[index], zc, yc)
+        self.count += self.repeat * n
+
+    def finish(self, source_moments):
+        backend = self.backend
+        count, self.z_mean, gram = _pool(source_moments)
+        if count != self.count:
+            raise ValueError(f"decoder statistics of {count} pooled estimates for {self.count} target rows")
+        self.pooled_var = np.diag(gram) / count
+        z_mean_c = self.z_mean - self.z_shift
+        self.y_means = [self.y_shift[i] + self.y_sum[i] / count for i in range(len(self.widths))]
+        evals, self.evecs = np.linalg.eigh(gram)
+        self.evals = np.clip(evals, 0, None)
+        self.projected = []
+        for index in range(len(self.widths)):
+            # sum (z - z_mean)(y - y_mean)' = sum (z - shift)(y - shift)' - n (z_mean - shift)(y_mean - shift)'
+            cross = backend.fetch(self.cross[index]) - count * np.outer(z_mean_c, self.y_sum[index] / count)
+            self.cross[index] = None
+            self.projected.append(self.evecs.T @ cross)
+        del gram
+        self.dev_cross = None
+
+    def add_dev(self, z_total, ys):
+        backend = self.backend
+        if self.dev_cross is None:
+            self.dev_cross = [backend.zeros(self.dim, w) for w in self.widths]
+            self.dev_y_sum, self.dev_y_sq = [np.zeros(w) for w in self.widths], 0.0
+            self._z_center = (self.repeat * self.z_mean).astype(np.float32)
+            self._y_centers = [m.astype(np.float32) for m in self.y_means]
+        zc = backend.sub(z_total, self._z_center)       # sum over the sources of (z - z_mean)
+        for index, y in enumerate(ys):
+            yc = backend.sub(y, self._y_centers[index])
+            self.dev_y_sq += backend.sq_sum64(yc)
+            self.dev_y_sum[index] += backend.col_sum64(yc)
+            backend.add_cross(self.dev_cross[index], zc, yc)
+        self.dev_rows += len(ys[0])
+
+    def dev_r2(self, alphas, dev_moments):
+        """{alpha: dev R^2} of the decoders of each alpha, from the dev statistics: with Z the dev
+        estimates less the train mean, Y the dev rows less the train mean and w = (G + lam)^-1 C =
+        V diag(1 / (e + lam)) P (G = V diag(e) V', P = V' C), summed over the repeated rows,
+        SSE = repeat |Y|^2 - 2 <Z'Y, w> + <Z'Z w, w> = repeat |Y|^2 - 2 sum_i r_i d_i + d' (Gd o PP') d
+        with d = 1 / (e + lam), r_i = sum_j P_ij (V' Z'Y)_ij, Gd = V' Z'Z V."""
+        backend = self.backend
+        evecs = self.evecs
+        gram_dev = evecs.T @ _scatter_about(dev_moments, self.z_mean) @ evecs
+        r, pp = np.zeros(self.dim), np.zeros((self.dim, self.dim))
+        for index, projected in enumerate(self.projected):
+            cross_dev = evecs.T @ backend.fetch(self.dev_cross[index])
+            self.dev_cross[index] = None
+            r += np.einsum("ij,ij->i", projected, cross_dev)
+            pp += projected @ projected.T
+        quadratic = gram_dev * pp
+        del gram_dev, pp
+        y_sq = self.repeat * self.dev_y_sq
+        # the dev rows' own spread (the R^2 denominator), about their own mean
+        total = self.repeat * (self.dev_y_sq - sum(float(np.sum(np.square(s))) for s in self.dev_y_sum) / self.dev_rows)
+        results = {}
+        for alpha in alphas:
+            d = 1.0 / (self.evals + alpha * float(self.evals.mean()))
+            sse = y_sq - 2.0 * float(r @ d) + float(d @ quadratic @ d)
+            results[alpha] = 1 - sse / max(total, 1e-30)
+        return results
+
+    def solve(self, alphas, dev_moments=None):
+        results = self.dev_r2(alphas, dev_moments) if self.dev_rows else {}
+        best = max(results, key=results.get) if results else alphas[len(alphas) // 2]
+        lam = best * float(self.evals.mean())
+        weights = [(self.evecs @ (p / (self.evals + lam)[:, None])).astype(np.float32) for p in self.projected]
+        return (weights, [m.astype(np.float32) for m in self.y_means], self.z_mean.astype(np.float32), best,
+                results)
+
+
 def fit_hub_kind(views, spans, kind, *, layer_rank=512, view_dim=2048, hub_dim=1024, eps=1e-3,
                  encoder_ridge=1e-3, alphas=(1e-4, 1e-3, 1e-2, 1e-1, 1.0), fit_rows=None, chunk=4096, log=print,
                  source_layers=None, gcca_ridge=1e-3):
     """source_layers: {model name: layers} for models that, as a translation source, only hold some layers
     for old tokens (sliding-window models keep only their global layers); those get a second encoder."""
+    backend = fit_backend.current()
     source_layers = {name: list(layers) for name, layers in (source_layers or {}).items()}
     names = [view.name for view in views]
     train, dev = spans.select("train"), spans.select("dev")
@@ -439,24 +648,49 @@ def fit_hub_kind(views, spans, kind, *, layer_rank=512, view_dim=2048, hub_dim=1
                                       view_dim=view_dim, eps=eps, chunk=chunk, log=log) for view in views}
     dims = [transforms[name].dim for name in names]
     offsets = np.cumsum([0] + dims)
+
+    def loader(selected):
+        """The row blocks of every view for a chunk of `selected` spans (on the backend)."""
+        def load(part):
+            return {v.name: _gather_blocks(v, kind, spans.rows[v.name][selected[part]]) for v in views}
+        return load
+
+    def uploaded(blocks_of):
+        return {name: [backend.put(block) for block in blocks] for name, blocks in blocks_of.items()}
+
     joint = Moments(int(offsets[-1]))
-    for part in chunks(len(train), chunk):
-        joint.add(np.concatenate([transforms[v.name](_gather_blocks(v, kind, spans.rows[v.name][train[part]]))
-                                  for v in views], axis=1))
+    for part, blocks_of in _loaded_chunks(len(train), chunk, loader(train)):
+        guard_check("gcca")
+        joint.add(backend.cat([_coords(backend, transforms[v.name], blocks_of[v.name]) for v in views], axis=1))
     cov = joint.covariance()
+    del joint                   # its float64 sums are as large as cov
     # MAXVAR as a generalized eigenproblem: whiten every view block with its own (ridged) train
     # covariance, so eigenvalues are sums of canonical correlations (at most the number of views)
-    # and no view's leftover variance can masquerade as a shared direction.
-    whiten = np.zeros_like(cov)
-    for index in range(len(names)):
-        block = slice(offsets[index], offsets[index + 1])
+    # and no view's leftover variance can masquerade as a shared direction. The block-diagonal
+    # whitening W is applied block by block (W C W without a dense W or dense temporaries: a
+    # seven-view hub of 4,096-dimensional views holds two 28,672-square float64 matrices, not four).
+    blocks = [slice(offsets[index], offsets[index + 1]) for index in range(len(names))]
+    whitens = []
+    for block in blocks:
+        guard_check("gcca")
         own = cov[block, block]
         evals, evecs = np.linalg.eigh(own + gcca_ridge * np.trace(own) / len(own) * np.eye(len(own)))
-        whiten[block, block] = (evecs / np.sqrt(np.clip(evals, 1e-12, None))) @ evecs.T
-    values, vectors = _top_eig(whiten @ cov @ whiten, min(hub_dim, len(cov)))
-    projection = (whiten @ vectors) / np.sqrt(np.maximum(values, 1e-12))   # [sum p, D]: Z = U @ projection
+        whitens.append((evecs / np.sqrt(np.clip(evals, 1e-12, None))) @ evecs.T)
+    whitened = np.empty_like(cov)
+    for row_block, row_whiten in zip(blocks, whitens):
+        rows = row_whiten @ cov[row_block]
+        for column_block, column_whiten in zip(blocks, whitens):
+            whitened[row_block, column_block] = rows[:, column_block] @ column_whiten
+        del rows
+    guard_check("gcca")
+    values, vectors = _top_eig(whitened, min(hub_dim, len(cov)))
+    del whitened
+    # [sum p, D]: Z = U @ projection
+    projection = np.concatenate([w @ vectors[block] for block, w in zip(blocks, whitens)]) \
+        / np.sqrt(np.maximum(values, 1e-12))
     encoders = {}
     for index, name in enumerate(names):
+        guard_check("gcca")
         block = slice(offsets[index], offsets[index + 1])
         own = cov[block, block]
         own_reg = own + encoder_ridge * np.trace(own) / len(own) * np.eye(len(own))
@@ -465,6 +699,8 @@ def fit_hub_kind(views, spans, kind, *, layer_rank=512, view_dim=2048, hub_dim=1
                     "top_eigenvalues": [round(float(v), 3) for v in values[:5]],
                     "eigenvalue_at_hub_dim": round(float(values[-1]), 4),
                     "seconds": round(time.perf_counter() - started, 1)}))
+    del cov
+    projection32 = projection.astype(np.float32)        # one array: the GPU backend keeps its upload
 
     # encoders from a layer subset: ridge from the subset's own view to the consensus Z
     source_transforms, source_encoders = {}, {}
@@ -475,104 +711,91 @@ def fit_hub_kind(views, spans, kind, *, layer_rank=512, view_dim=2048, hub_dim=1
                                                         layer_rank=layer_rank, view_dim=view_dim, eps=eps,
                                                         chunk=chunk, log=log, layers=source_layers[view.name])
         sub_moments = {name: Moments(t.dim) for name, t in source_transforms.items()}
-        sub_cross = {name: np.zeros((t.dim, len(values))) for name, t in source_transforms.items()}
+        sub_cross = {name: backend.zeros(t.dim, len(values)) for name, t in source_transforms.items()}
         sub_shift, z_sum = {}, np.zeros(len(values))
-        for part in chunks(len(train), chunk):
-            selected = train[part]
-            us, blocks_of = [], {}
-            for v in views:
-                blocks_of[v.name] = _gather_blocks(v, kind, spans.rows[v.name][selected])
-                us.append(transforms[v.name](blocks_of[v.name]))
-            z = np.concatenate(us, axis=1) @ projection.astype(np.float32)
-            z_sum += z.sum(axis=0, dtype=np.float64)
+        for part, blocks_of in _loaded_chunks(len(train), chunk, loader(train)):
+            guard_check("source_encoder")
+            blocks_of = uploaded(blocks_of)
+            us = [_coords(backend, transforms[v.name], blocks_of[v.name]) for v in views]
+            z = backend.mm(backend.cat(us, axis=1), projection32)
+            del us
+            z_sum += backend.col_sum64(z)
             for name, t in source_transforms.items():
                 index = {layer: i for i, layer in enumerate(transforms[name].layers)}
-                u_sub = t([blocks_of[name][index[layer]] for layer in t.layers])
+                u_sub = _coords(backend, t, [blocks_of[name][index[layer]] for layer in t.layers])
                 if name not in sub_shift:
-                    sub_shift[name] = u_sub.mean(axis=0, dtype=np.float64).astype(np.float32)
+                    sub_shift[name] = backend.col_mean32(u_sub)
                 sub_moments[name].add(u_sub)
-                sub_cross[name] += ((u_sub - sub_shift[name]).T @ z).astype(np.float64)
+                backend.add_cross(sub_cross[name], backend.sub(u_sub, sub_shift[name]), z)
         for name, t in source_transforms.items():
             m = sub_moments[name]
             # sum (u - u_mean)(z - z_mean)' = sum (u - shift) z' - n (u_mean - shift) z_mean'
-            centered_cross = sub_cross[name] - m.n * np.outer(m.mean - sub_shift[name], z_sum / m.n)
+            centered_cross = backend.fetch(sub_cross[name]) - m.n * np.outer(m.mean - sub_shift[name], z_sum / m.n)
             cov = m.covariance()
             reg = cov + encoder_ridge * np.trace(cov) / len(cov) * np.eye(len(cov))
             source_encoders[name] = np.linalg.solve(reg, centered_cross / m.n).astype(np.float32)
             log(json.dumps({"stage": "source_encoder", "kind": kind, "model": name, "layers": len(t.layers),
                             "view_dim": t.dim}))
+        del sub_moments, sub_cross
 
-    def chunk_data(selected):
-        """Per view: (z estimate [n, D] from its source encoder, its own row blocks) for span indices."""
+    def estimates(blocks_of):
+        """Per view: its z estimate [n, D] from its source encoder (on the backend)."""
         out = {}
         for v in views:
-            blocks = _gather_blocks(v, kind, spans.rows[v.name][selected])
+            blocks = blocks_of[v.name]
             if v.name in source_transforms:
                 t = source_transforms[v.name]
                 index = {layer: i for i, layer in enumerate(transforms[v.name].layers)}
-                z = t([blocks[index[layer]] for layer in t.layers]) @ source_encoders[v.name]
+                out[v.name] = backend.mm(_coords(backend, t, [blocks[index[layer]] for layer in t.layers]),
+                                         source_encoders[v.name])
             else:
-                z = transforms[v.name](blocks) @ encoders[v.name]
-            out[v.name] = (z, blocks)
+                out[v.name] = backend.mm(_coords(backend, transforms[v.name], blocks), encoders[v.name])
         return out
 
-    # one pass over the train spans accumulates every decoder's statistics; the input of
-    # model n's decoder is the stack of the z estimates of every other model
+    # one pass over the train spans accumulates every decoder's statistics: the input of model n's
+    # decoder is the pool of the z estimates of every other model (its Gram pooled from each model's
+    # own Moments of its estimates, its cross moments those of their sum)
     D = len(values)
-    acc = {}
-    for target in views:
-        widths = [target.width(kind, layer) for layer in target.layers(kind)]
-        acc[target.name] = {"z": Moments(D), "y_sum": [np.zeros(w) for w in widths],
-                            "cross": [np.zeros((D, w)) for w in widths], "count": 0,
-                            "z_shift": None, "y_shift": None}
-    for part in chunks(len(train), chunk):
-        data = chunk_data(train[part])
+    repeat = len(views) - 1
+    estimate_moments = {v.name: Moments(D) for v in views}
+    stats = {target.name: _DecoderStats(backend, D, [target.width(kind, layer) for layer in target.layers(kind)],
+                                        repeat) for target in views}
+    for part, blocks_of in _loaded_chunks(len(train), chunk, loader(train)):
+        guard_check("decoder")
+        blocks_of = uploaded(blocks_of)
+        z = estimates(blocks_of)
+        sums = {name: backend.col_sum64(z[name]) for name in names}
+        z_all = backend.total([z[name] for name in names])
+        for name in names:
+            estimate_moments[name].add(z[name])
         for target in views:
-            a = acc[target.name]
-            z = np.concatenate([data[v.name][0] for v in views if v.name != target.name], axis=0)
-            repeat = len(views) - 1
-            ys = data[target.name][1]
-            if a["z_shift"] is None:
-                a["z_shift"] = z.mean(axis=0, dtype=np.float64).astype(np.float32)
-                a["y_shift"] = [y.mean(axis=0, dtype=np.float64).astype(np.float32) for y in ys]
-            zc = z - a["z_shift"]
-            a["z"].add(z)
-            a["count"] += len(z)
-            for index, y in enumerate(ys):
-                yc = np.tile(y - a["y_shift"][index], (repeat, 1))
-                a["y_sum"][index] += yc.sum(axis=0, dtype=np.float64)
-                a["cross"][index] += (zc.T @ yc).astype(np.float64)
-    dev_data = chunk_data(dev) if len(dev) else None
+            stats[target.name].add(backend.minus(z_all, z[target.name]),
+                                   sum(sums[name] for name in names if name != target.name), blocks_of[target.name])
+        del z, z_all, blocks_of
+    for target in views:
+        stats[target.name].finish([estimate_moments[name] for name in names if name != target.name])
+    del estimate_moments
+    dev_moments = None
+    if len(dev):
+        dev_moments = {v.name: Moments(D) for v in views}
+        for part, blocks_of in _loaded_chunks(len(dev), chunk, loader(dev)):
+            guard_check("decoder")
+            blocks_of = uploaded(blocks_of)
+            z = estimates(blocks_of)
+            z_all = backend.total([z[name] for name in names])
+            for name in names:
+                dev_moments[name].add(z[name])
+            for target in views:
+                stats[target.name].add_dev(backend.minus(z_all, z[target.name]), blocks_of[target.name])
+            del z, z_all, blocks_of
 
     decoders, decoder_mean, decoder_z_mean, chosen = {}, {}, {}, {}
     for target in views:
-        a = acc[target.name]
-        count, z_moments = a["count"], a["z"]
-        z_mean_c = z_moments.mean - a["z_shift"]
-        gram = z_moments.covariance() * count
-        y_means = [a["y_shift"][i] + a["y_sum"][i] / count for i in range(len(a["y_sum"]))]
-        cross = [a["cross"][i] - count * np.outer(z_mean_c, a["y_sum"][i] / count) for i in range(len(a["y_sum"]))]
-        evals, evecs = np.linalg.eigh(gram)
-        evals = np.clip(evals, 0, None)
-        projected = [evecs.T @ c for c in cross]
-        results = {}
-        if dev_data is not None:
-            z_dev = np.concatenate([dev_data[v.name][0] for v in views if v.name != target.name], axis=0)
-            y_dev = [np.tile(y, (len(views) - 1, 1)) for y in dev_data[target.name][1]]
-            total = sum(float(np.sum(np.square(y - y.mean(axis=0)))) for y in y_dev)
-            for alpha in alphas:
-                lam = alpha * float(evals.mean())
-                weights = [evecs @ (p / (evals + lam)[:, None]) for p in projected]
-                sse = sum(float(np.sum(np.square(y - ((z_dev - z_moments.mean) @ w + m))))
-                          for y, w, m in zip(y_dev, weights, y_means))
-                results[alpha] = 1 - sse / total
-            best = max(results, key=results.get)
-        else:
-            best = alphas[len(alphas) // 2]
-        lam = best * float(evals.mean())
-        decoders[target.name] = [(evecs @ (p / (evals + lam)[:, None])).astype(np.float32) for p in projected]
-        decoder_mean[target.name] = [m.astype(np.float32) for m in y_means]
-        decoder_z_mean[target.name] = z_moments.mean.astype(np.float32)
+        guard_check("decoder")
+        others = [dev_moments[name] for name in names if name != target.name] if dev_moments else None
+        decoders[target.name], decoder_mean[target.name], decoder_z_mean[target.name], best, results = \
+            stats[target.name].solve(alphas, others)
+        stats[target.name] = None
         chosen[target.name] = {"alpha": best, "dev_r2": results}
         log(json.dumps({"stage": "decoder", "kind": kind, "model": target.name, "alpha": best,
                         "dev_r2": {str(a): round(r, 4) for a, r in results.items()}}))
@@ -582,22 +805,274 @@ def fit_hub_kind(views, spans, kind, *, layer_rank=512, view_dim=2048, hub_dim=1
 
 # -- onboarding a model into an existing hub ------------------------------------------------------
 
+ONBOARD_ENCODERS = ("ridge", "consensus", "match", "tls", "reverse", "cca", "reverse_z")
+CONSENSUS_ENCODERS = ("consensus", "cca", "reverse_z")   # regress onto the consensus Z: need every view it was fitted on
+# the onboarding encoder by default (Track A, 2026-10-06, RESULTS.md section 9), chosen for robustness: about 6 times
+# ridge's share of the floor's KL removed in both end-to-end runs (DeepSeek-V2-Lite and LFM2-2.6B -> Qwen3.8), held-out
+# R^2 within 0.03-0.05 (K) of the best encoder; reverse_z removed as much on average, but significantly more for one
+# source and less for the other, with a chat-level loss of 45% of a small floor and 0.19-0.27 less K R^2
+DEFAULT_ONBOARD_ENCODER = "reverse"
+# reverse and reverse_z scale dimension d by var(target_d) / cov(target_d, encoding_d), about 1 / R^2_d: unbounded as
+# R^2_d -> 0 (a view that barely predicts a dimension, e.g. the layer-subset encoder of a sliding-window model). Their
+# per-dimension variance is capped at ONBOARD_VARIANCE_CAP times the pooled pivot estimates' (what every decoder was
+# fitted on), i.e. the scale at sqrt(cap) times match's. 4 is the largest the end-to-end comparison covered: reverse
+# reached at most 2.4-3.75 on the pilots' train spans and won; reverse_z (median 8-10, up to 41) lost on LFM2's
+# low-floor chats (RESULTS.md section 9). It binds on none of the four models onboarded on 2026-10-07. 0: no cap.
+ONBOARD_VARIANCE_CAP = 4.0
+ONBOARD_WARN_R2 = 0.05          # an onboarding logs a warning when a dimension's train R^2 is below this
+
+
+def consensus_views(manifest, *, read=None):
+    """The models a bundle's hub latent was fitted on (the views of its GCCA): settings
+    "consensus_views" when recorded; else those of the base an assembled bundle (merge_bundles) or an
+    onboarded one grew from, all its models for a bundle fitted without --base; None when unknown."""
+    settings = manifest.get("settings") or {}
+    if settings.get("consensus_views"):
+        return list(settings["consensus_views"])
+    base = manifest.get("assembled_base") or settings.get("base")
+    if not base:
+        return list(manifest["models"])
+    base = Path(base)
+    if not (base / "manifest.json").is_file():
+        return None
+    return consensus_views((read or read_manifest)(base), read=read)
+
+
+def solve_onboard_encoder(method, cov_u, cross, target_cov, pooled_var, *, ridge=1e-3,
+                          variance_cap=ONBOARD_VARIANCE_CAP, info=None):
+    """The encoder [p, D] of an onboarded view from its train statistics.
+
+    cov_u [p, p]: the covariance of the new view's coordinates u; cross [p, D]: their covariance with
+    the regression target (the mean of the pivots' estimates, or for CONSENSUS_ENCODERS the consensus
+    Z); target_cov [D, D]: the target's covariance; pooled_var [D]: the per-dimension variance of the
+    pivots' estimates pooled (what every decoder was fitted on). Methods (ONBOARD_ENCODERS):
+
+      ridge      the ridge regression u -> target (target: the pivots' mean, onboarding until 2026-10-05)
+      consensus  the ridge regression u -> Z, an estimate of the consensus as a jointly fitted
+                 encoder is (cross and target_cov must be the consensus's)
+      match      ridge, rescaled per dimension to the pooled pivot estimates' variance
+      tls        ridge, rescaled per dimension to the target's variance: the geometric mean of the forward
+                 and the inverted reverse regression slopes, i.e. reduced-major-axis scaling (not orthogonal
+                 total least squares; the name stayed)
+      reverse    ridge, rescaled per dimension by var(target) / cov(target, encoding): the inverted
+                 reverse regression of the encoding on the target, which makes the encoding unbiased
+                 given the target (E[encoding | target] = target), not shrunk toward its mean
+      cca        the canonical correlation of u with the target, every canonical pair at unit gain:
+                 encodings with the target's covariance (cross and target_cov of the consensus), not
+                 scaled like the base views' estimates (that variant, RESULTS.md section 9's ccam, is the
+                 cca encoder times sqrt(pooled_var / var(Z)) per dimension; not an option here)
+      reverse_z  reverse onto the consensus Z (cross and target_cov of the consensus): unbiased given Z
+                 itself, a per-dimension variance up to 1 / R^2 of Z's (8-40 times the pooled pivot
+                 estimates' on the pilots)
+
+    variance_cap (reverse, reverse_z; ONBOARD_VARIANCE_CAP, 0 or None: none): each dimension's train variance at
+    most variance_cap times pooled_var's (the scale at most sqrt(variance_cap) times match's). info: a dict, filled
+    with the fit's per-dimension diagnostics on the train statistics (encoder_diagnostics: min_r2 and median_r2 of
+    the ridge fit onto the target, max_ratio of the encoding's variance over pooled_var, before the cap for the
+    reverse family as max_ratio_uncapped, and capped, the number of dimensions the cap limited).
+    """
+    if method not in ONBOARD_ENCODERS:
+        raise ValueError(f"unknown onboarding encoder {method!r} (one of {', '.join(ONBOARD_ENCODERS)})")
+    cov_u, cross = np.asarray(cov_u, dtype=np.float64), np.asarray(cross, dtype=np.float64)
+    target_var = np.diag(np.asarray(target_cov, dtype=np.float64))
+    pooled_var = np.asarray(pooled_var, dtype=np.float64)
+    reg = cov_u + ridge * np.trace(cov_u) / len(cov_u) * np.eye(len(cov_u))
+    out = info if info is not None else {}
+    out.clear()
+    out.update(method=method, cap=float(variance_cap) if variance_cap and method in ("reverse", "reverse_z") else None)
+    if method == "cca":
+        eu, vu = np.linalg.eigh(reg)
+        u_inv_root = (vu / np.sqrt(np.clip(eu, 1e-30, None))) @ vu.T
+        ez, vz = np.linalg.eigh(np.asarray(target_cov, dtype=np.float64))
+        ez = np.clip(ez, 1e-9 * max(float(ez.max()), 1e-30), None)
+        left, _, right = np.linalg.svd(u_inv_root @ cross @ ((vz / np.sqrt(ez)) @ vz.T), full_matrices=False)
+        encoder = u_inv_root @ left @ right @ ((vz * np.sqrt(ez)) @ vz.T)
+        out.update(encoder_diagnostics(encoder, cov_u, cross, target_var, pooled_var))
+        return encoder.astype(np.float32)
+    weight = np.linalg.solve(reg, cross)
+    variance = np.maximum(np.einsum("ij,ij->j", weight, cov_u @ weight), 1e-30)
+    covariance = np.einsum("ij,ij->j", weight, cross)          # cov(encoding_d, target_d) >= 0: reg is PD
+    scale = np.ones_like(variance)
+    if method == "match":
+        scale = np.sqrt(pooled_var / variance)
+    elif method == "tls":
+        scale = np.sqrt(target_var / variance)
+    elif method in ("reverse", "reverse_z"):
+        scale = target_var / np.maximum(covariance, 1e-30)
+        out["max_ratio_uncapped"] = round(float(np.max(scale ** 2 * variance / np.maximum(pooled_var, 1e-30))), 4)
+        limit = np.sqrt(variance_cap * pooled_var / variance) if variance_cap else np.inf
+        out["capped"] = int(np.count_nonzero(scale > limit))
+        scale = np.minimum(scale, limit)
+    encoder = weight * scale
+    out.update(encoder_diagnostics(encoder, cov_u, cross, target_var, pooled_var, ridge_fit=(variance, covariance)))
+    return encoder.astype(np.float32)
+
+
+def encoder_diagnostics(encoder, cov_u, cross, target_var, pooled_var, *, ridge_fit=None):
+    """Per-dimension train diagnostics of an onboarded encoder [p, D]: min_r2 and median_r2 (the squared
+    correlation of the encoding with the regression target, which a per-dimension rescaling keeps: for the
+    ridge-based methods the ridge fit's), min_ratio, median_ratio and max_ratio (its variance over the pooled
+    pivot estimates'), rounded for the log."""
+    variance = np.maximum(np.einsum("ij,ij->j", encoder, cov_u @ encoder), 1e-30)
+    covariance = np.einsum("ij,ij->j", encoder, cross)
+    if ridge_fit is not None:
+        variance_r, covariance_r = ridge_fit
+        r2 = covariance_r ** 2 / (np.maximum(variance_r, 1e-30) * np.maximum(target_var, 1e-30))
+    else:
+        r2 = covariance ** 2 / (variance * np.maximum(target_var, 1e-30))
+    ratio = variance / np.maximum(pooled_var, 1e-30)
+    return {"min_r2": round(float(np.min(r2)), 4), "median_r2": round(float(np.median(r2)), 4),
+            "min_ratio": round(float(np.min(ratio)), 4), "median_ratio": round(float(np.median(ratio)), 4),
+            "max_ratio": round(float(np.max(ratio)), 4)}
+
+
+def encoder_warnings(info, *, warn_r2=ONBOARD_WARN_R2):
+    """Why an onboarded encoder's diagnostics (solve_onboard_encoder's info) deserve a look: dimensions the
+    variance cap limited, a dimension the view barely predicts; [] when none."""
+    out = []
+    if info.get("capped"):
+        out.append(f"the variance cap ({info['cap']:g} x the pivots') limited {info['capped']} dimension(s); "
+                   f"uncapped the largest ratio was {info.get('max_ratio_uncapped')}")
+    if info.get("min_r2") is not None and info["min_r2"] < warn_r2:
+        out.append(f"a dimension's train R^2 is {info['min_r2']} (below {warn_r2}): the view barely predicts it")
+    return out
+
+
+def _onboard_target(encoder, consensus, pivots):
+    """The models whose full-view estimates define an onboarded encoder's regression target: for
+    CONSENSUS_ENCODERS the models the hub latent was fitted on (`consensus`, every one a pivot), else
+    none (the target is the mean of the pivots' estimates). ValueError for an unknown encoder."""
+    if encoder not in ONBOARD_ENCODERS:
+        raise ValueError(f"unknown onboarding encoder {encoder!r} (one of {', '.join(ONBOARD_ENCODERS)})")
+    if encoder not in CONSENSUS_ENCODERS:
+        return []
+    if not consensus:
+        raise ValueError(f"the {encoder} encoder needs the models the hub latent was fitted on (consensus=)")
+    absent = sorted(set(consensus) - {p.name for p in pivots})
+    if absent:
+        raise ValueError(f"the {encoder} encoder needs every model the hub latent was fitted on as a pivot; "
+                         f"missing {absent}")
+    return list(consensus)
+
+
+def _onboard_loader(hub_kind, new_view, pivots, spans, kind, selected, full_views=()):
+    """load(part) for _loaded_chunks: the new model's row blocks and each pivot's rows by layer (the
+    layers it provides as a source; for the models in full_views every layer) for a chunk of `selected`."""
+    name = new_view.name
+
+    def load(part):
+        chosen = selected[part]
+        out = {name: _gather_blocks(new_view, kind, spans.rows[name][chosen])}
+        for p in pivots:
+            wanted = hub_kind.transforms[p.name].layers if p.name in full_views else hub_kind.source_layers(p.name)
+            out[p.name] = dict(zip(wanted, gather_layers(p, kind, wanted, spans.rows[p.name][chosen])))
+        return out
+    return load
+
+
+def _pivot_estimates(backend, hub_kind, pivots, rows_of, full_views=()):
+    """([each pivot's estimate from the layers it provides as a source], the onboarded encoder's
+    regression target) on the backend: the consensus Z = M / lambda times the mean of the full-view
+    estimates of full_views, or without full_views the mean of the pivots' estimates."""
+    estimates, full = [], []
+    for p in pivots:
+        by_layer = rows_of[p.name]
+        estimates.append(_encode(backend, hub_kind, p.name, {l: by_layer[l] for l in hub_kind.source_layers(p.name)}))
+        if p.name in full_views:
+            t = hub_kind.transforms[p.name]
+            full.append(backend.mm(_coords(backend, t, [by_layer[l] for l in t.layers]), hub_kind.encoders[p.name])
+                        if p.name in hub_kind.source_transforms else estimates[-1])
+    if not full_views:
+        return estimates, backend.mean_of(estimates)
+    factor = (len(full_views) / len(full) / np.asarray(hub_kind.eigenvalues, dtype=np.float64)).astype(np.float32)
+    return estimates, backend.scale_cols(backend.total(full), factor)
+
+
+class _EncoderStats:
+    """The train statistics of an onboarded model's encoders (solve_onboard_encoder), streamed chunk by
+    chunk: per transform (key "full", and "sub" for a layer subset it provides as a source) the Moments
+    of its coordinates u and their cross moments with the regression target, the target's Moments and,
+    per pivot, the Moments of its estimates (pooled: what every decoder was fitted on)."""
+
+    def __init__(self, backend, transforms, dim, pivots):
+        self.backend, self.transforms = backend, dict(transforms)
+        self.u = {key: Moments(t.dim) for key, t in self.transforms.items()}
+        self.cross = {key: backend.zeros(t.dim, dim) for key, t in self.transforms.items()}
+        self.shift = {}
+        self.target, self.z_sum = Moments(dim), np.zeros(dim)
+        self.pivots = {name: Moments(dim) for name in pivots}
+
+    def add(self, blocks_by_layer, z_ref, estimates=None):
+        """A chunk: the new model's blocks {layer: rows on the backend}, the target, and (unless a caller
+        pools them itself) the pivots' estimates in self.pivots order."""
+        backend = self.backend
+        self.target.add(z_ref)
+        self.z_sum += backend.col_sum64(z_ref)
+        for key, t in self.transforms.items():
+            u = _coords(backend, t, [blocks_by_layer[layer] for layer in t.layers])
+            if key not in self.shift:
+                self.shift[key] = backend.col_mean32(u)
+            self.u[key].add(u)
+            backend.add_cross(self.cross[key], backend.sub(u, self.shift[key]), z_ref)
+        for moments, estimate in zip(self.pivots.values(), estimates or ()):
+            moments.add(estimate)
+
+    def pooled_var(self):
+        """Per hub dimension, the variance of the pivots' estimates pooled (each estimate one row)."""
+        count, _, scatter = _pool(list(self.pivots.values()))
+        return np.diag(scatter) / count
+
+    def solve(self, key, encoder, pooled_var, ridge, variance_cap=ONBOARD_VARIANCE_CAP, info=None):
+        m = self.u[key]
+        # sum (u - u_mean)(z - z_mean)' = sum (u - shift) z' - n (u_mean - shift) z_mean'
+        cross = self.backend.fetch(self.cross[key]) - m.n * np.outer(m.mean - self.shift[key], self.z_sum / m.n)
+        return solve_onboard_encoder(encoder, m.covariance(), cross / m.n, self.target.covariance(), pooled_var,
+                                     ridge=ridge, variance_cap=variance_cap, info=info)
+
+
+def _solve_encoders(stats, keys, encoder, pooled_var, ridge, variance_cap, *, kind, name, log):
+    """{key: encoder} of an onboarded model (stats: _EncoderStats) and {key: diagnostics}; logs the
+    diagnostics (stage "onboard-encoder") and any encoder_warnings (stage "onboard-warning", also on stderr)."""
+    encoders, infos = {}, {}
+    for key in keys:
+        info = {}
+        encoders[key] = stats.solve(key, encoder, pooled_var, ridge, variance_cap=variance_cap, info=info)
+        infos[key] = info
+        log(json.dumps({"stage": "onboard-encoder", "kind": kind, "model": name, "transform": key, **info}))
+        for warning in encoder_warnings(info):
+            log(json.dumps({"stage": "onboard-warning", "kind": kind, "model": name, "transform": key,
+                            "warning": warning}))
+            print(f"onboarding {name} ({kind}, {key}): {warning}", file=sys.stderr, flush=True)
+    return encoders, infos
+
+
 def add_model_kind(hub_kind, new_view, pivots, spans, kind, *, layer_rank=512, view_dim=2048, eps=1e-3,
                    encoder_ridge=1e-3, alphas=(1e-4, 1e-3, 1e-2, 1e-1, 1.0), fit_rows=None, chunk=4096,
-                   source_layers=None, log=print):
+                   source_layers=None, log=print, encoder=DEFAULT_ONBOARD_ENCODER, consensus=None,
+                   variance_cap=ONBOARD_VARIANCE_CAP):
     """Add `new_view` to a fitted hub without refitting the other models.
 
-    pivots: views of models already in the hub, with captures on the same corpus. The hub
-    latent of a span is approximated by the mean of the pivots' encoder estimates; the new
-    model's encoder is the ridge regression of its own view onto that latent, and its decoder
-    the ridge regression from the pooled pivot estimates onto its rows (as in stage 4).
+    pivots: views of models already in the hub, with captures on the same corpus. The new model's
+    decoder is the ridge regression from the pooled pivot estimates onto its rows (as in stage 4).
+    Its encoder (solve_onboard_encoder) regresses its own view onto the hub latent of a span:
+    `encoder` "ridge" (and match, tls, reverse) onto the mean of the pivots' estimates, which for a
+    MAXVAR hub is the consensus shrunk by lambda_d / M per dimension (M views, eigenvalues lambda: the
+    estimates of all M views sum to lambda_d Z_d), so its encodings spread about half as far as a
+    jointly fitted model's; "consensus" (and cca) onto the consensus itself, Z = M / lambda * the mean
+    of the full-view estimates of `consensus`, the models the hub latent was fitted on (all of them
+    must be pivots; consensus_views reads them from a bundle's manifest). The decoder does not depend on
+    the encoder: reencode_model_kind fits the encoder again with another method. variance_cap: the reverse
+    family's per-dimension variance cap (solve_onboard_encoder); the encoders' train diagnostics are logged
+    (stage "onboard-encoder") and kept in hub_kind.alphas[name]["encoder_stats"].
     """
+    backend = fit_backend.current()
     name = new_view.name
     if name in hub_kind.names:
         raise ValueError(f"{name} is already in the hub")
     missing = [p.name for p in pivots if p.name not in hub_kind.names]
     if missing:
         raise ValueError(f"pivots {missing} are not in the hub")
+    full_views = _onboard_target(encoder, consensus, pivots)
     train, dev = spans.select("train"), spans.select("dev")
     stats_rows = spans.rows[name][subsample(train, fit_rows, doc=spans.doc)]
     transform = fit_view(new_view, kind, stats_rows, layer_rank=layer_rank, view_dim=view_dim, eps=eps,
@@ -606,85 +1081,92 @@ def add_model_kind(hub_kind, new_view, pivots, spans, kind, *, layer_rank=512, v
                     log=log, layers=source_layers) if source_layers else None)
     D = len(hub_kind.eigenvalues)
     layers = new_view.layers(kind)
-    index = {layer: i for i, layer in enumerate(layers)}
     widths = [new_view.width(kind, layer) for layer in layers]
+    stats = _EncoderStats(backend, {"full": transform, **({"sub": sub} if sub is not None else {})}, D,
+                          [p.name for p in pivots])
+    decoder = _DecoderStats(backend, D, widths, len(pivots))
+    load = _onboard_loader(hub_kind, new_view, pivots, spans, kind, train, full_views)
+    for part, rows_of in _loaded_chunks(len(train), chunk, load):
+        guard_check("onboard")
+        blocks = [backend.put(block) for block in rows_of[name]]
+        estimates, z_ref = _pivot_estimates(backend, hub_kind, pivots, rows_of, full_views)
+        stats.add(dict(zip(layers, blocks)), z_ref, estimates)
+        decoder.add(backend.total(estimates), sum(backend.col_sum64(e) for e in estimates), blocks)
+        del rows_of, blocks, estimates, z_ref
 
-    def pivot_estimates(selected):
-        return [hub_kind.encode(p.name, {l: p.rows(kind, l, spans.rows[p.name][selected])
-                                         for l in hub_kind.source_layers(p.name)}) for p in pivots]
-
-    encoders = {"full": (transform, {"u": Moments(transform.dim), "cross": np.zeros((transform.dim, D)), "shift": None})}
-    if sub is not None:
-        encoders["sub"] = (sub, {"u": Moments(sub.dim), "cross": np.zeros((sub.dim, D)), "shift": None})
-    z_sum = np.zeros(D)
-    dec = {"z": Moments(D), "y_sum": [np.zeros(w) for w in widths], "cross": [np.zeros((D, w)) for w in widths],
-           "count": 0, "z_shift": None, "y_shift": None}
-    for part in chunks(len(train), chunk):
-        selected = train[part]
-        blocks = _gather_blocks(new_view, kind, spans.rows[name][selected])
-        estimates = pivot_estimates(selected)
-        z_ref = np.mean(estimates, axis=0)
-        z_sum += z_ref.sum(axis=0, dtype=np.float64)
-        for t, acc in encoders.values():
-            u = t([blocks[index[layer]] for layer in t.layers])
-            if acc["shift"] is None:
-                acc["shift"] = u.mean(axis=0, dtype=np.float64).astype(np.float32)
-            acc["u"].add(u)
-            acc["cross"] += ((u - acc["shift"]).T @ z_ref).astype(np.float64)
-        z = np.concatenate(estimates, axis=0)
-        if dec["z_shift"] is None:
-            dec["z_shift"] = z.mean(axis=0, dtype=np.float64).astype(np.float32)
-            dec["y_shift"] = [y.mean(axis=0, dtype=np.float64).astype(np.float32) for y in blocks]
-        zc = z - dec["z_shift"]
-        dec["z"].add(z)
-        dec["count"] += len(z)
-        for i, y in enumerate(blocks):
-            yc = np.tile(y - dec["y_shift"][i], (len(pivots), 1))
-            dec["y_sum"][i] += yc.sum(axis=0, dtype=np.float64)
-            dec["cross"][i] += (zc.T @ yc).astype(np.float64)
-
-    def solve_encoder(acc):
-        m = acc["u"]
-        cross = acc["cross"] - m.n * np.outer(m.mean - acc["shift"], z_sum / m.n)
-        cov = m.covariance()
-        reg = cov + encoder_ridge * np.trace(cov) / len(cov) * np.eye(len(cov))
-        return np.linalg.solve(reg, cross / m.n).astype(np.float32)
-
-    count, z_moments = dec["count"], dec["z"]
-    z_mean_c = z_moments.mean - dec["z_shift"]
-    gram = z_moments.covariance() * count
-    y_means = [dec["y_shift"][i] + dec["y_sum"][i] / count for i in range(len(widths))]
-    cross = [dec["cross"][i] - count * np.outer(z_mean_c, dec["y_sum"][i] / count) for i in range(len(widths))]
-    evals, evecs = np.linalg.eigh(gram)
-    evals = np.clip(evals, 0, None)
-    projected = [evecs.T @ c for c in cross]
-    results = {}
+    guard_check("onboard")
+    decoder.finish(list(stats.pivots.values()))
+    pooled_var = decoder.pooled_var
+    dev_moments = None
     if len(dev):
-        z_dev = np.concatenate(pivot_estimates(dev), axis=0)
-        y_dev = [np.tile(y, (len(pivots), 1)) for y in _gather_blocks(new_view, kind, spans.rows[name][dev])]
-        total = sum(float(np.sum(np.square(y - y.mean(axis=0)))) for y in y_dev)
-        for alpha in alphas:
-            lam = alpha * float(evals.mean())
-            weights = [evecs @ (p / (evals + lam)[:, None]) for p in projected]
-            sse = sum(float(np.sum(np.square(y - ((z_dev - z_moments.mean) @ w + m))))
-                      for y, w, m in zip(y_dev, weights, y_means))
-            results[alpha] = 1 - sse / total
-        best = max(results, key=results.get)
-    else:
-        best = alphas[len(alphas) // 2]
-    lam = best * float(evals.mean())
+        dev_moments = {p.name: Moments(D) for p in pivots}
+        for part, rows_of in _loaded_chunks(len(dev), chunk, _onboard_loader(hub_kind, new_view, pivots, spans,
+                                                                             kind, dev)):
+            guard_check("onboard")
+            estimates, _ = _pivot_estimates(backend, hub_kind, pivots, rows_of)
+            for p, estimate in zip(pivots, estimates):
+                dev_moments[p.name].add(estimate)
+            decoder.add_dev(backend.total(estimates), [backend.put(block) for block in rows_of[name]])
+            del rows_of, estimates
+    weights, means, z_mean, best, results = decoder.solve(
+        alphas, [dev_moments[p.name] for p in pivots] if dev_moments else None)
+    encoders, infos = _solve_encoders(stats, ["full"] + (["sub"] if sub is not None else []), encoder, pooled_var,
+                                      encoder_ridge, variance_cap, kind=kind, name=name, log=log)
     hub_kind.names.append(name)
     hub_kind.transforms[name] = transform
-    hub_kind.encoders[name] = solve_encoder(encoders["full"][1])
-    hub_kind.decoders[name] = [(evecs @ (p / (evals + lam)[:, None])).astype(np.float32) for p in projected]
-    hub_kind.decoder_mean[name] = [m.astype(np.float32) for m in y_means]
-    hub_kind.decoder_z_mean[name] = z_moments.mean.astype(np.float32)
-    hub_kind.alphas[name] = {"alpha": best, "dev_r2": results, "onboarded_with": [p.name for p in pivots]}
+    hub_kind.encoders[name] = encoders["full"]
+    hub_kind.decoders[name] = weights
+    hub_kind.decoder_mean[name] = means
+    hub_kind.decoder_z_mean[name] = z_mean
+    hub_kind.alphas[name] = {"alpha": best, "dev_r2": results, "onboarded_with": [p.name for p in pivots],
+                             "encoder": encoder, "encoder_stats": infos}
     if sub is not None:
         hub_kind.source_transforms[name] = sub
-        hub_kind.source_encoders[name] = solve_encoder(encoders["sub"][1])
+        hub_kind.source_encoders[name] = encoders["sub"]
     log(json.dumps({"stage": "onboard", "kind": kind, "model": name, "pivots": [p.name for p in pivots],
-                    "alpha": best, "dev_r2": {str(a): round(r, 4) for a, r in results.items()}}))
+                    "encoder": encoder, "alpha": best, "dev_r2": {str(a): round(r, 4) for a, r in results.items()}}))
+    return hub_kind
+
+
+def reencode_model_kind(hub_kind, new_view, pivots, spans, kind, *, encoder, consensus=None, encoder_ridge=1e-3,
+                        chunk=4096, log=print, variance_cap=ONBOARD_VARIANCE_CAP):
+    """Fit an onboarded model's encoder(s) again with another method (solve_onboard_encoder) from one
+    pass over the train spans, leaving its view transforms and decoders exactly as they are (no stage 1-2
+    refit, no decoder statistics): translations into the model, and between the other models, stay
+    bit-identical; only translations out of it change. pivots and consensus as for add_model_kind."""
+    backend = fit_backend.current()
+    name = new_view.name
+    if name not in hub_kind.names:
+        raise ValueError(f"{name} is not in the hub: onboard it first")
+    missing = [p.name for p in pivots if p.name not in hub_kind.names or p.name == name]
+    if missing or not pivots:
+        raise ValueError(f"pivots {missing or '(none)'} are not other models of the hub")
+    full_views = _onboard_target(encoder, consensus, pivots)
+    transforms = {"full": hub_kind.transforms[name]}
+    if name in hub_kind.source_transforms:
+        transforms["sub"] = hub_kind.source_transforms[name]
+    layers = transforms["full"].layers
+    stats = _EncoderStats(backend, transforms, len(hub_kind.eigenvalues), [p.name for p in pivots])
+    train = spans.select("train")
+    for part, rows_of in _loaded_chunks(len(train), chunk, _onboard_loader(hub_kind, new_view, pivots, spans, kind,
+                                                                           train, full_views)):
+        guard_check("onboard")
+        blocks = dict(zip(new_view.layers(kind), (backend.put(block) for block in rows_of[name])))
+        estimates, z_ref = _pivot_estimates(backend, hub_kind, pivots, rows_of, full_views)
+        stats.add({layer: blocks[layer] for layer in layers}, z_ref, estimates)
+        del rows_of, blocks, estimates, z_ref
+    guard_check("onboard")
+    pooled_var = stats.pooled_var()
+    previous = (hub_kind.alphas.get(name) or {}).get("encoder")
+    encoders, infos = _solve_encoders(stats, list(transforms), encoder, pooled_var, encoder_ridge, variance_cap,
+                                      kind=kind, name=name, log=log)
+    hub_kind.encoders[name] = encoders["full"]
+    if "sub" in transforms:
+        hub_kind.source_encoders[name] = encoders["sub"]
+    hub_kind.alphas[name] = {**(hub_kind.alphas.get(name) or {}), "encoder": encoder, "reencoded_from": previous,
+                             "onboarded_with": [p.name for p in pivots], "encoder_stats": infos}
+    log(json.dumps({"stage": "reencode", "kind": kind, "model": name, "pivots": [p.name for p in pivots],
+                    "encoder": encoder, "previous": previous, "rows": int(stats.u["full"].n)}))
     return hub_kind
 
 
@@ -737,6 +1219,7 @@ def fit_indexer_ridge(view, *, alphas=(1e-4, 1e-3, 1e-2, 1e-1, 1.0), fit_rows=No
         width = view.width("k", layer)
         joint = Moments(width + view.width(INDEXER_KEY, layer))
         for part in chunks(len(train), chunk):
+            guard_check("indexer_ridge")
             rows = train[part]
             joint.add(np.concatenate([view.rows("k", layer, rows), view.rows(INDEXER_KEY, layer, rows)], axis=1))
         cov, mean = joint.covariance(), joint.mean
@@ -870,6 +1353,7 @@ def fit_head(base_kind, pivots, target_view, spans, kind, *, alphas=(1e-4, 1e-3,
     spans (as add_model_kind fits a decoder). alphas[name] holds the alpha, the dev R^2 of every alpha
     (the selection criterion) and test_r2: per pivot, the chosen decoders' variance-weighted R^2 on the
     test spans over all layers (as evaluate scores a kind)."""
+    backend = fit_backend.current()
     name = target_view.name
     missing = [p.name for p in pivots if p.name not in base_kind.names]
     if missing or not pivots:
@@ -881,68 +1365,64 @@ def fit_head(base_kind, pivots, target_view, spans, kind, *, alphas=(1e-4, 1e-3,
     D = len(base_kind.eigenvalues)
     widths = [target_view.width(kind, layer) for layer in layers]
 
-    def estimate(pivot, selected):
-        return base_kind.encode(pivot.name, {l: pivot.rows(HEAD_BASE, l, spans.rows[pivot.name][selected])
-                                             for l in base_kind.source_layers(pivot.name)})
+    def loader(selected, with_pivots=True):
+        """Each pivot's base-kind source rows by layer and the target's rows of `kind` for a chunk."""
+        def load(part):
+            chosen = selected[part]
+            out = {name: gather_layers(target_view, kind, layers, spans.rows[name][chosen])}
+            for p in pivots if with_pivots else ():
+                wanted = base_kind.source_layers(p.name)
+                out[p.name] = dict(zip(wanted, gather_layers(p, HEAD_BASE, wanted, spans.rows[p.name][chosen])))
+            return out
+        return load
 
-    def estimates(selected):
-        return np.concatenate([estimate(p, selected) for p in pivots], axis=0)
+    def estimate(pivot, rows_of):
+        return _encode(backend, base_kind, pivot.name, rows_of[pivot.name])
 
-    def targets(selected):
-        return [np.tile(target_view.rows(kind, layer, spans.rows[name][selected]), (len(pivots), 1))
-                for layer in layers]
-    acc = {"z": Moments(D), "y_sum": [np.zeros(w) for w in widths], "cross": [np.zeros((D, w)) for w in widths],
-           "count": 0, "z_shift": None, "y_shift": None}
-    for part in chunks(len(train), chunk):
-        z, ys = estimates(train[part]), targets(train[part])
-        if acc["z_shift"] is None:
-            acc["z_shift"] = z.mean(axis=0, dtype=np.float64).astype(np.float32)
-            acc["y_shift"] = [y.mean(axis=0, dtype=np.float64).astype(np.float32) for y in ys]
-        zc = z - acc["z_shift"]
-        acc["z"].add(z)
-        acc["count"] += len(z)
-        for i, y in enumerate(ys):
-            yc = y - acc["y_shift"][i]
-            acc["y_sum"][i] += yc.sum(axis=0, dtype=np.float64)
-            acc["cross"][i] += (zc.T @ yc).astype(np.float64)
-    count, z_moments = acc["count"], acc["z"]
-    if not count:
+    pivot_moments = {p.name: Moments(D) for p in pivots}
+    decoder = _DecoderStats(backend, D, widths, len(pivots))
+    for part, rows_of in _loaded_chunks(len(train), chunk, loader(train)):
+        guard_check("head")
+        estimates = [estimate(p, rows_of) for p in pivots]
+        sums = 0
+        for p, z in zip(pivots, estimates):
+            pivot_moments[p.name].add(z)
+            sums = sums + backend.col_sum64(z)
+        decoder.add(backend.total(estimates), sums, [backend.put(y) for y in rows_of[name]])
+        del rows_of, estimates
+    if not decoder.count:
         raise ValueError(f"no train spans to fit the {kind} heads of {name}")
-    z_mean_c = z_moments.mean - acc["z_shift"]
-    gram = z_moments.covariance() * count
-    y_means = [acc["y_shift"][i] + acc["y_sum"][i] / count for i in range(len(widths))]
-    cross = [acc["cross"][i] - count * np.outer(z_mean_c, acc["y_sum"][i] / count) for i in range(len(widths))]
-    evals, evecs = np.linalg.eigh(gram)
-    evals = np.clip(evals, 0, None)
-    projected = [evecs.T @ c for c in cross]
-    results = {}
+    decoder.finish([pivot_moments[p.name] for p in pivots])
+    del pivot_moments
+    dev_moments = None
     if len(dev):
-        z_dev, y_dev = estimates(dev), targets(dev)
-        total = sum(float(np.sum(np.square(y - y.mean(axis=0)))) for y in y_dev)
-        for alpha in alphas:
-            lam = alpha * float(evals.mean())
-            weights = [evecs @ (p / (evals + lam)[:, None]) for p in projected]
-            sse = sum(float(np.sum(np.square(y - ((z_dev - z_moments.mean) @ w + m))))
-                      for y, w, m in zip(y_dev, weights, y_means))
-            results[alpha] = 1 - sse / max(total, 1e-30)
-        best = max(results, key=results.get)
-    else:
-        best = alphas[len(alphas) // 2]
-    lam = best * float(evals.mean())
-    weights = [(evecs @ (p / (evals + lam)[:, None])).astype(np.float32) for p in projected]
-    z_mean, means = z_moments.mean.astype(np.float32), [m.astype(np.float32) for m in y_means]
+        dev_moments = {p.name: Moments(D) for p in pivots}
+        for part, rows_of in _loaded_chunks(len(dev), chunk, loader(dev)):
+            guard_check("head")
+            estimates = [estimate(p, rows_of) for p in pivots]
+            for p, z in zip(pivots, estimates):
+                dev_moments[p.name].add(z)
+            decoder.add_dev(backend.total(estimates), [backend.put(y) for y in rows_of[name]])
+            del rows_of, estimates
+    weights, means, z_mean, best, results = decoder.solve(
+        alphas, [dev_moments[p.name] for p in pivots] if dev_moments else None)
     test_r2 = {}
-    for pivot in pivots if len(test) else ():
-        sse, y_sum, y_sq = 0.0, [np.zeros(w) for w in widths], 0.0
-        for part in chunks(len(test), chunk):
-            z = estimate(pivot, test[part]) - z_mean
-            for i, layer in enumerate(layers):
-                y = target_view.rows(kind, layer, spans.rows[name][test[part]])
-                sse += float(np.sum(np.square(y - (z @ weights[i] + means[i])), dtype=np.float64))
-                y_sum[i] += y.sum(axis=0, dtype=np.float64)
-                y_sq += float(np.sum(np.square(y.astype(np.float64))))
+    if len(test):
+        sse = {p.name: 0.0 for p in pivots}
+        y_sum, y_sq = [np.zeros(w) for w in widths], 0.0
+        for part, rows_of in _loaded_chunks(len(test), chunk, loader(test)):
+            guard_check("head")
+            ys = [backend.put(y) for y in rows_of[name]]
+            for i, y in enumerate(ys):
+                y_sum[i] += backend.col_sum64(y)
+                y_sq += backend.sq_sum64(y)
+            for pivot in pivots:
+                z = backend.sub(estimate(pivot, rows_of), z_mean)
+                for i, y in enumerate(ys):
+                    sse[pivot.name] += backend.sq_sum64(backend.minus(y, backend.add(backend.mm(z, weights[i]), means[i])))
+            del rows_of, ys
         total = y_sq - sum(float(np.sum(np.square(s))) for s in y_sum) / len(test)
-        test_r2[pivot.name] = float(1 - sse / max(total, 1e-30))
+        test_r2 = {p.name: float(1 - sse[p.name] / max(total, 1e-30)) for p in pivots}
     log(json.dumps({"stage": "head", "kind": kind, "model": name, "layers": layers, "alpha": best,
                     "dev_r2": {str(a): round(r, 4) for a, r in results.items()},
                     "test_r2": {p: round(r, 4) for p, r in test_r2.items()}}))
@@ -955,38 +1435,62 @@ def fit_head(base_kind, pivots, target_view, spans, kind, *, alphas=(1e-4, 1e-3,
 def evaluate(hub_kind, views, spans, kind, split="test", chunk=4096, involving=None, pairs=None):
     """Variance-weighted R^2 (about the split's own mean) of every ordered pair, all target layers;
     with `involving` (a model name) only the pairs that have it as source or target, with `pairs`
-    (an iterable of (source, target) names) only those pairs."""
+    (an iterable of (source, target) names) only those pairs. One pass over the split: each chunk's rows
+    are read once, each source encoded once for all its targets."""
+    backend = fit_backend.current()
     selected = spans.select(split)
-    by_name = {view.name: view for view in views}
     wanted = None if pairs is None else {tuple(pair) for pair in pairs}
-    results = {}
-    for source in views:
-        for target in views:
-            if involving is not None and involving not in (source.name, target.name):
-                continue
-            if wanted is not None and (source.name, target.name) not in wanted:
-                continue
-            layers = target.layers(kind)
-            sse = np.zeros(len(layers))
-            y_sum = [np.zeros(target.width(kind, l)) for l in layers]
-            y_sq = np.zeros(len(layers))
-            n = 0
-            for part in chunks(len(selected), chunk):
-                rows = selected[part]
-                z = hub_kind.encode(source.name, {layer: source.rows(kind, layer, spans.rows[source.name][rows])
-                                                  for layer in hub_kind.source_layers(source.name)})
-                ys = _gather_blocks(target, kind, spans.rows[target.name][rows])
+    todo = [(source, target) for source in views for target in views
+            if (involving is None or involving in (source.name, target.name))
+            and (wanted is None or (source.name, target.name) in wanted)]
+    if not todo:
+        return {}
+    sources = [v for v in views if any(s is v for s, _ in todo)]
+    targets = [v for v in views if any(t is v for _, t in todo)]
+
+    def load(part):
+        """{name: {layer: rows}} of every layer a source or target of this chunk needs."""
+        out = {}
+        for v in views:
+            needed = set(hub_kind.source_layers(v.name)) if any(s is v for s in sources) else set()
+            if any(t is v for t in targets):
+                needed |= set(v.layers(kind))
+            ordered = [layer for layer in v.layers(kind) if layer in needed]
+            if ordered:
+                out[v.name] = dict(zip(ordered, gather_layers(v, kind, ordered, spans.rows[v.name][selected[part]])))
+        return out
+
+    sse = {(s.name, t.name): np.zeros(len(t.layers(kind))) for s, t in todo}
+    y_sum = {t.name: [np.zeros(t.width(kind, layer)) for layer in t.layers(kind)] for t in targets}
+    y_sq = {t.name: np.zeros(len(t.layers(kind))) for t in targets}
+    n = 0
+    for part, rows_of in _loaded_chunks(len(selected), chunk, load):
+        guard_check("evaluate")
+        z = {s.name: _encode(backend, hub_kind, s.name, rows_of[s.name]) for s in sources}
+        for target in targets:
+            ys = [backend.put(rows_of[target.name][layer]) for layer in target.layers(kind)]
+            for index, y in enumerate(ys):
+                y_sum[target.name][index] += backend.col_sum64(y)
+                y_sq[target.name][index] += backend.sq_sum64(y)
+            for source in sources:
+                if (source.name, target.name) not in sse:
+                    continue
+                zc = backend.sub(z[source.name], hub_kind.decoder_z_mean[target.name])
                 for index, y in enumerate(ys):
-                    prediction = hub_kind.decode(target.name, z, index)
-                    sse[index] += float(np.sum(np.square(y - prediction), dtype=np.float64))
-                    y_sum[index] += y.sum(axis=0, dtype=np.float64)
-                    y_sq[index] += float(np.sum(np.square(y.astype(np.float64))))
-                n += len(rows)
-            total = np.asarray([y_sq[i] - np.sum(np.square(y_sum[i])) / n for i in range(len(layers))])
-            results[source.name, target.name] = {
-                "r2": float(1 - sse.sum() / total.sum()), "rows": int(n),
-                "per_layer": [float(1 - s / t) for s, t in zip(sse, total)]}
-    del by_name
+                    prediction = backend.add(backend.mm(zc, hub_kind.decoders[target.name][index]),
+                                             hub_kind.decoder_mean[target.name][index])
+                    sse[source.name, target.name][index] += backend.sq_sum64(backend.minus(y, prediction))
+            del ys
+        n += part.stop - part.start
+        del rows_of, z
+    results = {}
+    for source, target in todo:
+        total = np.asarray([y_sq[target.name][i] - np.sum(np.square(y_sum[target.name][i])) / n
+                            for i in range(len(target.layers(kind)))])
+        errors = sse[source.name, target.name]
+        results[source.name, target.name] = {
+            "r2": float(1 - errors.sum() / total.sum()), "rows": int(n),
+            "per_layer": [float(1 - s / t) for s, t in zip(errors, total)]}
     return results
 
 

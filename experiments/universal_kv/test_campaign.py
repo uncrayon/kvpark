@@ -21,6 +21,28 @@ from unittest import mock
 import numpy as np
 
 import campaign
+from test_resource_guard import FakeMachine
+
+_MODULE_PATCHES = []
+
+
+def setUpModule():
+    """Every command campaign.run starts runs under the resource guard: give it a cool fake machine
+    and a CPU lock of its own, so these tests neither wait for this machine to cool nor meet a real
+    job's lock."""
+    directory = tempfile.TemporaryDirectory()
+    fake = FakeMachine(directory.name)
+    _MODULE_PATCHES.extend([directory, mock.patch.dict(os.environ, fake.environ(KVPARK_GUARD_POLL_S="0.1")),
+                            mock.patch.object(campaign, "CPU_LOCK", fake.cpu_lock)])
+    for patcher in _MODULE_PATCHES[1:]:
+        patcher.start()
+
+
+def tearDownModule():
+    for patcher in reversed(_MODULE_PATCHES[1:]):
+        patcher.stop()
+    _MODULE_PATCHES.pop(0).cleanup()
+    _MODULE_PATCHES.clear()
 
 
 def statuses(**items):
@@ -224,6 +246,13 @@ class ModelFactsTest(unittest.TestCase):
         self.assertEqual(campaign.capture_mode("bailingmoe3"), "states")
         with self.assertRaisesRegex(ValueError, "deepseek4"):
             campaign.capture_mode("deepseek4")
+        # where: the Vulkan probe, except states captures and Gemma 4 (its Vulkan capture run differs
+        # from a plain run), which collect on the CPU probe
+        self.assertEqual(campaign.capture_device("lfm2"), "vulkan")
+        self.assertEqual(campaign.capture_device("bailingmoe3"), "cpu")
+        self.assertEqual((campaign.capture_mode("gemma4"), campaign.capture_device("gemma4")), ("collect", "cpu"))
+        self.assertTrue(all((mode, campaign.capture_device(arch)) in campaign.CAPTURE_SPEED
+                            for arch in ("lfm2", "gemma4", "bailingmoe3") for mode in [campaign.capture_mode(arch)]))
         self.assertIsNone(campaign.refusal("qwen35"))
         self.assertEqual(campaign.capture_ctx(2955), 5120)
         self.assertEqual(campaign.capture_ctx(5100), 5632)
@@ -561,6 +590,24 @@ class EvaluationTablesTest(unittest.TestCase):
         self.assertEqual((summary["documents"], summary["mapped_fraction"], summary["left_out"]), (2, 0.75, ["x" * 64]))
 
 
+def two_sides_bundle(directory):
+    """A format 2 manifest with sides of qwen38, m and other (file sizes in bytes as their names say)."""
+    directory.mkdir(parents=True)
+    sides = {}
+    for name, sizes in (("qwen38", (1, 2, 10, 20)), ("m", (100, 200, 30, 40)), ("other", (5000, 5000, 5000, 5000))):
+        for kind, (encoder, decoder) in (("k", sizes[0::2]), ("v", sizes[1::2])):
+            for role, size in (("encoder", encoder), ("decoder", decoder)):
+                files = {}
+                for dtype in ("f32", "f16"):
+                    file = f"{name}.{kind}.{role}.{dtype}.npy"
+                    (directory / file).write_bytes(b"x" * (size if dtype == "f32" else 7))
+                    files[dtype] = {"file": file, "sha256": "s"}
+                sides[f"{name}.{kind}.{role}"] = {"files": files}
+    (directory / "manifest.json").write_text(json.dumps({
+        "format_version": 2, "purpose": "universal_kv_hub", "models": {"qwen38": {}, "m": {}, "other": {}},
+        "sides": sides}))
+
+
 class RunnerTest(unittest.TestCase):
     """run_stages with stand-in stage functions: statuses, failures, resume, redo and cleaning."""
 
@@ -699,19 +746,126 @@ class RunnerTest(unittest.TestCase):
         self.assertFalse(camp.path("capture-plan.json").exists())
         campaign.clean_outputs(camp, "evaluate", redo=False)
         self.assertTrue(camp.path("eval", "a-to-b", "report.json").is_file())
-        self.assertFalse(camp.path("eval", "b-to-a").exists())
+        self.assertTrue(camp.path("eval", "b-to-a", "scores.log").is_file())      # unfinished: run_evaluation decides
         campaign.clean_outputs(camp, "evaluate", redo=True)
         self.assertFalse(camp.path("eval").exists())
         campaign.clean_outputs(camp, "capture", redo=True)
         self.assertFalse(camp.path("capture").exists())
 
-    def test_an_evaluation_asks_for_the_larger_model_and_the_hub_it_loads(self):
+    def test_the_onboarding_fits_on_the_fit_python_with_the_chosen_encoder(self):
+        camp = self.campaign(recurrent=False, hybrid=False)
+        base = self.root / "base"
+        base.mkdir()
+        (base / "manifest.json").write_text(json.dumps({"settings": {"view_dim": 64, "layer_rank": 8, "fit_rows": 100,
+                                                                     "hub_dim": 16}, "spans": {"dev": 10}}))
+        ran = []
+
+        def run(argv, **options):
+            ran.append((list(argv), options))
+            if options["label"] == "fit_hub":
+                camp.path("hub").mkdir(parents=True)
+                camp.path("hub", "evaluation.json").write_text(json.dumps({"k": {}, "v": {}}))
+                camp.path("hub.log.jsonl").write_text("\n".join(json.dumps(item) for item in (
+                    {"stage": "spans", "spans": {"train": 1}, "documents": 1, "rejected": 0},
+                    {"stage": "onboard", "kind": "k", "alpha": 0.1, "dev_r2": {}},
+                    {"stage": "fit-backend-done", "device": "gpu"})) + "\n")
+            return 1.0
+        rocm = self.root / "rocm-python"
+        rocm.write_text("")
+        spec = FakeSpec(["full"], {"k": (2, 4), "v": (2, 4)}, architecture="qwen3")
+        with mock.patch.object(campaign, "BASE_HUB", base), mock.patch.object(campaign, "FIT_PYTHON", rocm), \
+                mock.patch.object(campaign, "base_models", lambda: [("qwen38", [self.root / "c"], self.root / "r")]), \
+                mock.patch.object(campaign, "hub_bytes", lambda directory: 0), \
+                mock.patch.object(campaign, "own_files", lambda directory, name: {}), \
+                mock.patch.object(camp, "spec", lambda: spec), mock.patch.object(camp, "run", run), \
+                mock.patch.dict(os.environ, {"KVPARK_FIT_PYTHON": ""}):
+            result = campaign.stage_onboard(camp, self.args())
+        argv = ran[0][0]
+        self.assertEqual(argv[0], rocm)
+        import hub
+        self.assertEqual(campaign.ONBOARD_ENCODER, hub.DEFAULT_ONBOARD_ENCODER)
+        self.assertEqual(argv[argv.index("--onboard-encoder") + 1], campaign.ONBOARD_ENCODER)
+        self.assertEqual(argv[argv.index("--fit-device") + 1], "auto")
+        self.assertTrue(ran[0][1]["cpu"])
+        self.assertEqual((result["encoder"], result["fit_python"], result["fit_device"]),
+                         (campaign.ONBOARD_ENCODER, str(rocm), "gpu"))
+        with mock.patch.object(campaign, "FIT_PYTHON", self.root / "missing"):
+            self.assertEqual(campaign.fit_python({}), campaign.PYTHON)               # no torch venv: the CPU
+            self.assertEqual(campaign.fit_python({"KVPARK_FIT_PYTHON": "/x/python"}), Path("/x/python"))
+
+    def test_reencode_swaps_the_bundles_and_redoes_only_the_runs_out_of_the_model(self):
+        camp = self.campaign(recurrent=False, hybrid=False)
+        for stage in campaign.STAGES:
+            camp.stage(stage)["status"] = "skipped" if stage == "recurrent" else "done"
+        camp.stage("onboard")["result"] = {"encoder": "ridge", "alphas": {"k": {"alpha": 0.1}}, "spans": {}}
+        for name in ("hub", "hub-v2"):
+            camp.path(name).mkdir(parents=True)
+            (camp.path(name) / "old").write_text("old")
+        camp.path("hub.log.jsonl").write_text("{}\n")
+        for run in ("qwen38-to-m", "m-to-qwen38", "m-to-qwen38-server"):
+            camp.path("eval", run).mkdir(parents=True)
+            (camp.path("eval", run) / "report.json").write_text("{}")
+            camp.path("eval", f"{run}.command.json").write_text("{}")
+        camp.save()
+        ran = []
+
+        def run(argv, **options):
+            ran.append((list(argv), options))
+            output = Path(argv[-1]) if options["label"].startswith("fit_hub") else Path(argv[3])
+            output.mkdir()
+            if options["label"].startswith("fit_hub"):
+                (output / "evaluation.json").write_text(json.dumps({"k": {}, "v": {}}))
+                Path(str(output) + ".log.jsonl").write_text("\n".join(json.dumps(item) for item in (
+                    {"stage": "spans", "spans": {"train": 1}, "documents": 1, "rejected": 0},
+                    {"stage": "reencode", "kind": "k"}, {"stage": "fit-backend-done", "device": "cpu"})) + "\n")
+            return 2.0
+        with mock.patch.object(campaign, "base_models", lambda: [("qwen38", [self.root / "c"], self.root / "r")]), \
+                mock.patch.object(campaign, "hub_bytes", lambda directory: 0), \
+                mock.patch.object(campaign, "own_files", lambda directory, name: {"new": directory.name}), \
+                mock.patch.object(camp, "run", run):
+            result = campaign.reencode(camp, "consensus", stamp="t0")
+            with self.assertRaisesRegex(SystemExit, "already consensus"):
+                campaign.reencode(camp, "consensus")
+        argv, options = ran[0]
+        self.assertEqual(argv[argv.index("--base") + 1], camp.path("hub"))
+        self.assertIn("--reencode", argv)
+        self.assertEqual(argv[argv.index("--onboard-encoder") + 1], "consensus")
+        self.assertTrue(options["cpu"])
+        self.assertEqual(options["stage"], "onboard")
+        history = camp.path("history", "onboard-ridge-t0")
+        self.assertEqual((history / "hub" / "old").read_text(), "old")                 # the previous bundles kept
+        self.assertTrue((history / "eval" / "m-to-qwen38" / "report.json").is_file())
+        self.assertTrue((history / "eval" / "m-to-qwen38-server.command.json").is_file())
+        self.assertTrue(camp.path("eval", "qwen38-to-m", "report.json").is_file())   # into the model: kept
+        self.assertFalse(camp.path("eval", "m-to-qwen38").exists())
+        self.assertTrue(camp.path("hub").is_dir() and not camp.path("hub.reencode").exists())
+        self.assertEqual((result["encoder"], result["alphas"]), ("consensus", {"k": {"alpha": 0.1}}))
+        statuses = camp.statuses()
+        self.assertEqual((statuses["onboard"], statuses["tables"], statuses["evaluate"], statuses["report"]),
+                         ("done", "done", campaign.OUTDATED, campaign.OUTDATED))
+        self.assertEqual(campaign.plan_run(statuses, recurrent=False), ["evaluate", "report"])
+        campaign.clean_outputs(camp, "evaluate", redo=False)                            # how run_stages cleans it
+        self.assertTrue(camp.path("eval", "qwen38-to-m", "report.json").is_file())
+        # a reverse encoder fitted before the variance cap (none recorded) may be fitted again with it, once
+        camp.stage("onboard")["result"] = {**camp.stage("onboard")["result"], "encoder": "reverse", "variance_cap": None}
+        with mock.patch.object(campaign, "base_models", lambda: [("qwen38", [self.root / "c"], self.root / "r")]), \
+                mock.patch.object(campaign, "hub_bytes", lambda directory: 0), \
+                mock.patch.object(campaign, "own_files", lambda directory, name: {"new": directory.name}), \
+                mock.patch.object(camp, "run", run):
+            campaign.reencode(camp, "reverse", stamp="t1")
+            self.assertIn("--reencode", ran[-2][0])
+            camp.stage("onboard")["result"]["variance_cap"] = __import__("hub").ONBOARD_VARIANCE_CAP
+            with self.assertRaisesRegex(SystemExit, "already reverse"):
+                campaign.reencode(camp, "reverse")
+        camp.stage("onboard")["status"] = "failed"
+        with self.assertRaisesRegex(SystemExit, "is not onboarded"):
+            campaign.reencode(camp, "match")
+
+    def test_an_evaluation_asks_for_the_larger_model_and_the_sides_it_reads(self):
         camp = self.campaign(recurrent=False, hybrid=False)
         reference = self.root / "reference.gguf"
         reference.write_bytes(b"G" * 1000)
-        camp.path("hub-v2").mkdir(parents=True)
-        (camp.path("hub-v2") / "manifest.json").write_text("{}")
-        (camp.path("hub-v2") / "side.npy").write_bytes(b"x" * 300)
+        two_sides_bundle(camp.path("hub-v2"))
         asked = {}
 
         def evaluation(camp_, label, argv, output, memory_bytes):
@@ -722,14 +876,15 @@ class RunnerTest(unittest.TestCase):
                 mock.patch.object(campaign, "run_evaluation", evaluation), \
                 mock.patch.object(campaign, "run_baseline", lambda camp_: self.root / "baseline"):
             campaign.stage_evaluate(camp, self.args())
-        self.assertEqual(asked, {"qwen38-to-m": 1300, "m-to-qwen38": 1300})       # the manifest is not loaded
+        # qwen38's encoder sides (1 + 2) and m's decoder sides (30 + 40); m's encoders (100 + 200) and qwen38's
+        # decoders (10 + 20), the float16 copies and the other model are not read
+        self.assertEqual(asked, {"qwen38-to-m": 1000 + 73, "m-to-qwen38": 1000 + 300 + 30})
 
     def test_a_model_whose_server_renders_otherwise_is_evaluated_both_ways(self):
         camp = self.campaign(recurrent=False, hybrid=False)
         reference = self.root / "reference.gguf"
         reference.write_bytes(b"G" * 1000)
-        camp.path("hub-v2").mkdir(parents=True)
-        (camp.path("hub-v2") / "side.npy").write_bytes(b"x" * 300)
+        two_sides_bundle(camp.path("hub-v2"))
         differing = [{"conversation": "c1", "context": "server", "reproduced": True}]
         camp.state["stages"]["render"] = {"status": "done", "result": {"parity": {"records_differing": differing}}}
         commands = {}
@@ -767,6 +922,28 @@ class RunnerTest(unittest.TestCase):
                                                                       "sha256": campaign.command_digest(argv)})
         self.assertTrue(campaign.kept_run(output, argv))
         self.assertFalse(campaign.kept_run(output, argv + ["--recurrent", "zero"]))
+        self.assertTrue(campaign.kept_run(output, argv + ["--resume"]))     # a flag that changes no result
+
+    def test_an_unfinished_evaluation_resumes_only_for_the_same_command(self):
+        camp = self.campaign()
+        output = camp.path("eval", "a-to-b")
+        argv = ["python", "pair_eval.py", "--output", str(output), "--resume"]
+        self.assertEqual(campaign.eval_argv(("a", "a.gguf"), ("b", "b.gguf"), output, hub="h", tables="t",
+                                            recurrent=[])[-1], "--resume")
+        ran = []
+
+        def run(argv_, **options):
+            ran.append(sorted(p.name for p in output.iterdir()) if output.exists() else None)
+            return 1.0
+        output.mkdir(parents=True)
+        (output / "states-t").mkdir()                                          # a run the guard stopped
+        campaign.write_json(output.with_name("a-to-b.command.json"), {"argv": argv,
+                                                                      "sha256": campaign.command_digest(argv)})
+        with mock.patch.object(camp, "run", run):
+            campaign.run_evaluation(camp, "a-to-b", argv, output, 0)
+            self.assertEqual(ran[-1], ["states-t"])                            # kept for pair_eval --resume
+            campaign.run_evaluation(camp, "a-to-b", argv + ["--server-render"], output, 0)
+            self.assertIsNone(ran[-1])                                         # another command: removed
 
     def test_commands_are_logged_runnable_and_failures_raise(self):
         camp = self.campaign()
@@ -786,6 +963,40 @@ class RunnerTest(unittest.TestCase):
                      cwd=self.root)
         with self.assertRaises(campaign.CommandTimeout):
             camp.run(["sleep", "10"], stage="tables", label="slow", cwd=self.root, timeout=0.3)
+
+    def test_a_gpu_evaluation_runs_with_the_gpu_evaluation_guard_defaults(self):
+        """pair_eval runs (evaluate stage, baseline) stop at 85 C, continue at 65 C, 4 threads, unless
+        KVPARK_GUARD_* say otherwise; commands.sh reproduces them (exec --gpu-evaluation)."""
+        camp = self.campaign()
+        camp.save()
+        script = "import os; print('THREADS', os.environ['OPENBLAS_NUM_THREADS'])"
+        unset = {"KVPARK_GUARD_PAUSE_C": "", "KVPARK_GUARD_RESUME_C": "", "KVPARK_GUARD_THREADS": "",
+                 "OPENBLAS_NUM_THREADS": "8"}
+        with mock.patch.object(campaign, "GPU_LOCK", self.root / "gpu.lock"), \
+                mock.patch.object(campaign, "mem_available", lambda: 100 * campaign.GIB), \
+                mock.patch.dict(os.environ, unset):
+            camp.run([sys.executable, "-c", script], stage="evaluate", label="pair_eval-x", cwd=self.root,
+                     memory_bytes=10, cpu=True, gpu_evaluation=True)
+            camp.run([sys.executable, "-c", script], stage="tables", label="tables", cwd=self.root, memory_bytes=10)
+        self.assertIn("THREADS 4", camp.path("logs", "pair_eval-x.log").read_text())     # capped below the parent's 8
+        self.assertIn("THREADS 8", camp.path("logs", "tables.log").read_text())
+        commands = camp.path("commands.sh").read_text()
+        self.assertIn("campaign.py exec --memory-bytes 10 --cpu-lock --gpu-evaluation --guard-log", commands)
+        self.assertEqual(commands.count("--gpu-evaluation"), 1)
+        settings = {}
+        for label in ("pair_eval-x", "tables"):
+            for line in camp.path("logs", f"{label}.guard.jsonl").read_text().splitlines():
+                item = json.loads(line)
+                if item.get("event") == "watch":
+                    settings[label] = item["settings"]
+        self.assertEqual((settings["pair_eval-x"]["pause_c"], settings["pair_eval-x"]["resume_c"],
+                          settings["pair_eval-x"]["threads"]), (85.0, 65.0, 4))
+        self.assertEqual((settings["tables"]["pause_c"], settings["tables"]["threads"]), (90.0, 8))
+        ran = []
+        camp.path("eval").mkdir()
+        with mock.patch.object(camp, "run", lambda argv, **options: ran.append(options) or 1.0):
+            campaign.run_evaluation(camp, "a-to-b", ["python", "pair_eval.py"], camp.path("eval", "a-to-b"), 0)
+        self.assertTrue(ran[0]["gpu_evaluation"] and ran[0]["cpu"])
 
     def test_lock_waits_are_not_command_time(self):
         camp = self.campaign()
@@ -847,12 +1058,20 @@ class CaptureStageTest(unittest.TestCase):
         (render / "template.jinja").write_text("{{ x }}")
         self.identity = {"mode": "collect", "runtime_revision": "r1"}
         self.speed, self.load, self.timeout_chunk, self.interrupt_chunk = 10.0, 0.0, None, None
-        self.ran = []
+        self.ran, self.devices = [], set()
         spec = FakeSpec(("recurrent", "full"), {"k": (1, 2), "v": (1, 2)}, architecture="lfm2")    # 29 bytes per token
         self.per_token = campaign.bytes_per_token(spec)
         test = self
 
-        def fake_run(camp, argv, *, stage, label, memory_bytes=None, env=None, cwd=None, timeout=None):
+        def fake_run(camp, argv, *, stage, label, memory_bytes=None, env=None, cwd=None, timeout=None, cpu=False):
+            # a capture on the CPU probe (--mode states, CPU_CAPTURE_ARCHITECTURES) takes the CPU lock; a
+            # Vulkan capture does not
+            on_cpu = "--device" not in argv
+            self.assertEqual(cpu, on_cpu)
+            self.assertEqual(Path(argv[argv.index("--probe") + 1]), campaign.PROBE_CPU if on_cpu else campaign.PROBE_VULKAN)
+            self.assertEqual("--capture-spec" in argv, argv[argv.index("--mode") + 1] == "collect")
+            test.devices.add("cpu" if on_cpu else "vulkan")
+            self.assertEqual(argv[argv.index("--threads") + 1], 8)  # the guard's thread cap
             docs_path, output = Path(argv[argv.index("--docs") + 1]), Path(argv[argv.index("--output") + 1])
             name = output.name
             if name == test.interrupt_chunk:
@@ -895,6 +1114,19 @@ class CaptureStageTest(unittest.TestCase):
         plan = json.loads(self.camp.path("capture-plan.json").read_text())
         self.assertEqual(plan["limit"], "corpus")
         self.assertEqual(self.ran[0][2], "5120")
+        self.assertEqual((result["device"], plan["device"], self.devices), ("vulkan", "vulkan", {"vulkan"}))
+
+    def test_gemma4_collects_on_the_cpu_probe(self):
+        spec = FakeSpec(("sliding", "full"), {"k": (1, 2), "v": (1, 2)}, architecture="gemma4")
+        self.camp.state["architecture"] = "gemma4"
+        with mock.patch.object(campaign.Campaign, "spec", lambda camp, probe=None: spec):
+            result = campaign.stage_capture(self.camp, self.args())
+        plan = json.loads(self.camp.path("capture-plan.json").read_text())
+        self.assertEqual((result["mode"], result["device"], plan["device"]), ("collect", "cpu", "cpu"))
+        self.assertEqual(result["probe"], str(campaign.PROBE_CPU))
+        self.assertEqual(self.devices, {"cpu"})
+        self.assertEqual(plan["tokens_per_second"], round(1000 * campaign.CAPTURE_SPEED["collect", "cpu"], 1))
+        self.assertEqual(result["documents"], 12)
 
     def test_the_measured_speed_ends_the_capture_when_time_runs_out(self):
         # the forecast (1000 x 0.4 tokens/s, 120 s of load) says everything fits in 130 s; measured at
@@ -925,6 +1157,26 @@ class CaptureStageTest(unittest.TestCase):
                 self.assertLessEqual(captured + 2 * tokens, 1200)
             captured += tokens
         self.assertLessEqual(result["tokens"], 1200)
+
+    def test_a_budget_below_the_held_out_documents_fails_the_stage_with_what_they_take(self):
+        # 300 held-out tokens at 29 bytes each and 1000 x 0.4 tokens/s: 8,700 bytes, 120 s of load + 0.75 s
+        with self.assertRaisesRegex(campaign.StageError, r"dev and test documents alone .*take 0\.0 GB and 2 minutes"
+                                                         r" at 400\.0 tokens/s: give --budget-gb"):
+            campaign.stage_capture(self.camp, self.args(gigabytes=200 * self.per_token / 10 ** 9))
+        self.assertEqual(self.ran, [])
+        # 300 tokens of 10 MB at 1 token/s: 3 GB, (120 + 300) s
+        self.assertTrue(campaign.held_out_need(self.docs, bytes_per_token=10 ** 7, tokens_per_second=1).startswith(
+            "the held-out documents alone take 3.0 GB and 7 minutes at 1.0 tokens/s"))
+        # `plan` shows it instead of a traceback
+        args = types.SimpleNamespace(**vars(self.args(gigabytes=200 * self.per_token / 10 ** 9)), stages=None, redo=None)
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            campaign.show_plan(self.camp, args)
+        shown = json.loads(stdout.getvalue())
+        self.assertNotIn("capture_plan", shown)
+        self.assertIn("take 0.0 GB and 2 minutes at 400.0 tokens/s: give --budget-gb", shown["capture_plan_error"])
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            campaign.show_plan(self.camp, types.SimpleNamespace(**vars(self.args()), stages=None, redo=None))
+        self.assertEqual(json.loads(stdout.getvalue())["capture_plan"]["limit"], "corpus")
 
     def test_a_train_chunk_past_the_hard_limit_ends_the_capture(self):
         self.timeout_chunk = "chunk-02"
@@ -1065,12 +1317,34 @@ class AssembleEvaluateTest(unittest.TestCase):
                     "onboard": {"status": "done", "result": {"files": {
                         bundle: campaign.own_files(camp.path(bundle), name) for bundle in ("hub", "hub-v2")}}}}
                 camp.save()
+            children = []
+
+            def child(argv, *, settings, guard_log, label, events, environment, **options):
+                """assemble --evaluate's watched child, run in this process (the mocks hold) on the CPU backend"""
+                children.append({"argv": argv, "settings": settings, "environment": environment, **options})
+                argv = [item if item != "auto" else "cpu" for item in argv]
+                with mock.patch.dict(os.environ, {campaign.resource_guard.WATCHED: "1"}):
+                    code = campaign.main(argv[2:])
+                return types.SimpleNamespace(returncode=code, aborted=None, seconds=0.0, paused_s=0.0)
             with mock.patch.object(hub, "CaptureView", lambda name, captures, records: extra[name]), \
                     mock.patch.object(hub, "joint_spans", lambda chosen: spans), \
                     mock.patch.object(campaign, "GPU_LOCK", root / "gpu.lock"), \
-                    mock.patch.object(campaign, "mem_available", lambda: 10 ** 12):
+                    mock.patch.object(campaign, "CPU_LOCK", root / "cpu.lock"), \
+                    mock.patch.object(campaign, "guarded_child", child), \
+                    mock.patch.object(campaign, "mem_available", lambda: 10 ** 12), \
+                    mock.patch.dict(os.environ, {"KVPARK_GUARD_PAUSE_C": "", "KVPARK_GUARD_RESUME_C": "",
+                                                 "KVPARK_GUARD_THREADS": ""}):
                 result = campaign.assemble(root / "hub5", ["d", "e"], evaluate=True, base=root / "base",
                                            base_v2=root / "base-v2", campaign_dir=root / "campaign", log=silent)
+            # a child process on the fit Python's GPU backend, watched with the GPU-evaluation defaults
+            [call] = children
+            self.assertEqual(call["argv"][1:4], [str(campaign.HERE / "campaign.py"), "evaluate-onboarded", "--hub"])
+            self.assertEqual(call["argv"][0], str(campaign.fit_python()))
+            self.assertIn("auto", call["argv"])
+            self.assertEqual((call["settings"].pause_c, call["settings"].resume_c, call["settings"].threads),
+                             (85.0, 65.0, 4))
+            self.assertLessEqual(int(call["environment"]["OPENBLAS_NUM_THREADS"]), 4)
+            self.assertIn(campaign.resource_guard.CPU_LOCK_FD, call["environment"])
             self.assertEqual(sorted(result["models"]), ["a", "b", "d", "e"])
             evaluation = json.loads((root / "hub5" / "evaluation-onboarded.json").read_text())
             self.assertEqual(evaluation["pairs"], ["d->e", "e->d"])
@@ -1101,6 +1375,17 @@ def pair_rows(target_kl, floor_kl, ids, n_scored=256):
 
 class ReportTest(unittest.TestCase):
     """stage_report on a campaign directory holding stand-in stage results and pair_eval reports."""
+
+    def test_the_encoder_diagnostics_and_warnings_reach_the_report(self):
+        stats = {"k": {"full": {"min_r2": 0.012, "median_r2": 0.4, "min_ratio": 0.9, "max_ratio": 4.0, "capped": 3},
+                       "sub": {"min_r2": 0.2, "median_r2": 0.5, "min_ratio": 1.0, "max_ratio": 2.5, "capped": 0}},
+                 "v": {"full": {"min_r2": 0.1, "median_r2": 0.45, "min_ratio": 1.0, "max_ratio": 3.0, "capped": 0}}}
+        text = campaign.encoder_stats_markdown(stats, ["the variance cap (4 x the pivots') limited 3 dimension(s)"])
+        self.assertIn("K: per-dimension train R² from 0.012", text)
+        self.assertIn("3 dimension(s) capped", text)
+        self.assertIn("K (layer subset)", text)
+        self.assertIn("**Warnings:** the variance cap", text)
+        self.assertEqual(campaign.encoder_stats_markdown(None), "")
 
     def test_report_holds_every_section(self):
         quiet(self)
@@ -1159,8 +1444,9 @@ class ReportTest(unittest.TestCase):
                                        "limit": "corpus", "dropped": 0, "probe_seconds": 75.0, "waited_s": 0.0,
                                        "tokens_per_second": 2419.3, "speed_share_of_smoke": 0.698}},
                 "onboard": {"status": "done", "result": {"pivots": ["qwen38"], "spans": {"train": 1, "dev": 2, "test": 3},
-                                                         "documents": 248, "rejected": 0,
-                                                         "r2": {"k": {"m->qwen38": 0.7}, "v": {"m->qwen38": 0.5}}}},
+                                                         "documents": 248, "rejected": 0, "encoder": "reverse",
+                                                         "r2": {"k": {"m->qwen38": 0.7}, "v": {"m->qwen38": 0.5}}},
+                            "reencoded": [{"from": "ridge", "to": "reverse", "at": "2026-10-07T02:10:35-06:00"}]},
                 "tables": {"status": "done", "result": {}},
                 "recurrent": {"status": "skipped", "reason": "convolution taps only"},
                 "evaluate": {"status": "done", "result": {"runs": paths, "baseline": str(root / "baseline.json")}}}
@@ -1171,6 +1457,8 @@ class ReportTest(unittest.TestCase):
             campaign.stage_report(camp, types.SimpleNamespace())
             data = json.loads(camp.path("report.json").read_text())
             text = camp.path("report.md").read_text()
+        self.assertIn("Encoder `reverse`; fitted again from `ridge` on 2026-10-07", text)
+        self.assertEqual(data["onboard"]["reencoded"][0]["from"], "ridge")
         into = data["directions"]["qwen38-to-m"]
         self.assertEqual((into["runs"], into["documents"], into["duplicate_max_abs_diff"]),
                          (["qwen38-to-m", "qwen38-to-m-long"], 7, 0.0))

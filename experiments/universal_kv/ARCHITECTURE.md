@@ -163,7 +163,9 @@ as llama.cpp prints them and render each conversation exactly as llama-server do
   of the pairwise-aligned tokens remain hub spans (185,672 train spans).
 - **Two hubs, one per kind:** keys and values are translated separately (K from K, V from V),
   each through its own latent of D = 2,048–4,096 dimensions per token.
-- **Fitting (closed form, CPU, streaming float64 statistics over float32 chunks):**
+- **Fitting (closed form, streaming float64 statistics over float32 chunks; the chunks' projections
+  and Gram and cross products on the GPU in float16 with float32 accumulation, or on the CPU,
+  fit_backend.py; eigh and solves float64 on the CPU):**
   1. per model and layer: PCA of pre-RoPE K (or V) to ≤ 512 components;
   2. per model: PCA of the concatenated layers to the view dimension, whitened;
   3. multi-view CCA (MAXVAR) as a generalized eigenproblem: each view block is whitened with
@@ -174,11 +176,31 @@ as llama.cpp prints them and render each conversation exactly as llama-server do
      keep their global layers (sliding-window sources) get a second encoder from those
      layers alone;
   5. decoders: ridge from the pooled encoder estimates of all *other* models to every KV
-     layer of the model, so any source works at run time (ridge strength chosen on dev).
+     layer of the model, so any source works at run time (ridge strength chosen on dev). The
+     pooled statistics are formed without repeating the target rows per source (the cross
+     moments of the pooled estimates are those of their sum, the Gram pools per-model moments),
+     and the dev R² of every ridge strength comes in closed form from the dev Gram and cross
+     moments, so no alpha predicts the dev rows.
 - **Onboarding without refitting (hub.add_model_kind, `fit_hub.py --base`):** a new model
   needs only its own captures on the hub corpus plus one or more pivot models' captures; its
-  encoder regresses onto the pivots' latent estimates and its decoder from them. Existing
-  adapters are untouched (test_hub.py checks bit-identity).
+  decoder regresses its rows on the pivots' pooled latent estimates, as a jointly fitted model's
+  does, and its encoder regresses its view onto their mean estimate. Existing adapters are
+  untouched (test_hub.py checks bit-identity).
+- **The onboarded encoder (hub.solve_onboard_encoder, RESULTS.md section 9).** The pivots' mean
+  estimate of a span is the consensus shrunk by λ/M per dimension (M views, λ their summed canonical
+  correlations: the M estimates sum to λZ), and the new view explains only part of it, so a plain
+  ridge onto it (`ridge`, the first onboardings) gives encodings half as spread as a jointly fitted
+  model's. Their R² into other models stays close (they are nearly calibrated for squared error),
+  but the K rows they decode carry 0.55-0.61 of the native variance instead of 0.70-0.72, attention
+  flattens, and the pilots removed 3-11% of the floor's KL into Qwen3.8 against 30% for the jointly
+  fitted Qwen3-4B. The default is now `reverse`: the same regression rescaled per dimension so that
+  the encoding is unbiased given the target (var(target) / cov(target, encoding)), which removes 17%
+  and 24% for DeepSeek-V2-Lite and LFM2 at a held-out R² 0.03-0.05 lower. That scale is about 1 / R²
+  per dimension, so each dimension's variance is capped at 4 times the pooled pivot estimates'
+  (`hub.ONBOARD_VARIANCE_CAP`; it binds on none of the models onboarded so far, and the fit warns when it
+  does or a dimension's R² is below 0.05). Other methods (consensus, tls, match, cca, reverse_z) are
+  options; `fit_hub.py --reencode` / `campaign.py reencode` fit only an onboarded model's encoder again,
+  its transforms and decoders bit-identical.
 - **Growing the hub (campaign.py).** Every new model is onboarded against the same base
   (hub4-d4096, its four models as pivots), so its adapters depend on the base and its own
   captures only, never on another new model. Its bundle hard-links the base's files
@@ -189,9 +211,15 @@ as llama.cpp prints them and render each conversation exactly as llama-server do
   (a link there would be a copy). Two onboarded models translate between each other through the
   same latent; the onboarding tests each one against the pivots only, and `campaign.py assemble
   --evaluate` measures the pairs between onboarded models (they all capture the same dev and test
-  documents). An assembled hub is never changed: onboarding a model again (`--redo onboard`)
-  leaves it with the old adapters, which `campaign.py status` flags by sha256; the bridge moves
-  to a newly assembled directory.
+  documents). An assembled hub is never changed: onboarding or re-encoding a model again
+  (`--redo onboard`, `campaign.py reencode`) leaves it with the old adapters, which `campaign.py
+  status` flags by sha256; the bridge moves to a newly assembled directory. A joint refit of every
+  model instead would change every adapter, fit only on the spans all of them share (7 models:
+  87,426 train spans instead of 185,672, since DeepSeek-V2-Lite's template drops reasoning and
+  tools) and grow in memory with the square of the summed view dimensions (7 views of 4,096: an
+  estimated 36 GiB peak with scipy's float32 subset eigensolver, against 11-19 GiB for an onboarding;
+  attempted on October 7 next to a running model server, it was stopped mostly for heat and its memory
+  went to swap, RESULTS.md section 9).
 - **Other cache families in the same hub.** An MLA model's K view is its pre-RoPE row
   [c_kv | k_pe] and its V view is c_kv (the V that attention reads); into an MLA target only
   the K kind is decoded. A DSA model can carry an *indexer ridge* (`fit_hub.py --indexer-ridge
@@ -517,15 +545,18 @@ token's (a, s), so they cannot be rebuilt from the window, but they can be synth
   switches. The output itself is written whole from host memory (1.0–1.6 GB at 13K; about 19 GB
   for Qwen3.8 at 262K, estimated). Qwen3.8 (production, context 65,536), Muse and Qwen3-4B plus
   two engine daemons left 20–27 GB available.
-- **Fitting:** a 4-model hub takes ~2 h on the CPU (185K training spans), onboarding one model
-  ~15 min; capturing a model on the hub corpus takes ~15 min on the GPU for 4–9B models.
+- **Fitting:** a 4-model hub took ~2 h on the CPU (185K training spans, before the GPU fit backend);
+  onboarding one model (LFM2-2.6B) takes 5 min with the products on the GPU, 6.5 min on the CPU
+  (9 min before), under the thermal guard. A joint fit is bound by its float64/float32
+  eigendecompositions on the CPU (README "Fit placement"); capturing a model on the hub corpus
+  takes ~15 min on the GPU for 4–9B models.
 
 ## 12. Implementation map
 
 | Piece | Where |
 | --- | --- |
 | captures, state codec (every layout above, both pins, media slots, cuts), RoPE, chat rendering with llama-server's template context and jinja, template parity, llama.cpp's vocabularies, probe and state driver | experiments/linear_transfer (kv_probe.cpp, state_driver.cpp, vocab_tool.cpp, kvstate.py, chat.py, template_check.py, collect_v2.py, check_model_support.py) |
-| hub fit, onboarding, indexer ridges, DeepSeek V4 head kinds, evaluation; bundles (format 1 and 2) | experiments/universal_kv/hub.py, fit_hub.py, convert_hub.py, token_tables.py |
+| hub fit, onboarding, indexer ridges, DeepSeek V4 head kinds, evaluation; bundles (format 1 and 2) | experiments/universal_kv/hub.py, fit_hub.py, fit_backend.py (GPU or CPU products of the fits), convert_hub.py, token_tables.py |
 | generic translation (any supported source → any supported target, layout from a target template state) | experiments/universal_kv/translate.py, backends/, state_writer.py |
 | DeepSeek V4 targets | experiments/universal_kv/dsv4_pool.py, dsv4_target.py |
 | recurrent cell strategies and their measurement | experiments/universal_kv/recurrent_init.py, r0_experiments.py |
@@ -550,6 +581,11 @@ listed in section 2 are translated on fixtures. Open:
   loss-trained) maps are the next levers.
 - **Sources matter:** a small model's cache (Qwen3-4B) carries little of what a larger model
   needs (0–15% of the gap recovered); prefer the larger model as the source.
+- **Onboarded sources:** the onboarded encoder is now `reverse` (RESULTS.md section 9), which
+  removes 17-24% of the floor's KL into Qwen3.8 against 3-4% before; the jointly fitted Qwen3-4B
+  still removes 30%. Measured into Qwen3.8 only: translations from an onboarded model into Muse,
+  Qwen3-4B, Ornith or another onboarded model have held-out R² (lower with `reverse` than with
+  `ridge`, e.g. LFM2 → DeepSeek-V2-Lite K 0.427 vs 0.472) but no end-to-end measurement yet.
 - **Real models for the new families:** MLA, DSA, KDA hybrids, the other GQA hybrids, the GQA
   family (but Gemma 4's real saves) and DeepSeek V4 are validated on random-weight fixtures
   only. The local models are downloaded and smoke-tested (DeepSeek-V2-Lite, GLM-4.7-Flash,

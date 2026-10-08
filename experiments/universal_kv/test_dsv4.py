@@ -60,6 +60,7 @@ import fixtures_families as ff
 import hub as hub_module
 import state_writer
 import translate
+from test_resource_guard import guard_arguments
 from test_translate import StubSpans, StubView, random_hub
 
 HERE = Path(__file__).resolve().parent
@@ -766,7 +767,7 @@ class HubFitTests(Dsv4Case):
             stdout, sys.stdout = sys.stdout, quiet
             try:
                 fit_hub.main(arguments + ["--output", str(cls.bundle), "--hub-dim", "12", "--view-dim", "24",
-                                          "--layer-rank", "16", "--heads", "dsv4"])
+                                          "--layer-rank", "16", "--heads", "dsv4", *guard_arguments(root)])
             finally:
                 sys.stdout = stdout
         cls.record = next(r for r in records if r["split"] == "test")

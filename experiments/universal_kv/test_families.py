@@ -42,6 +42,7 @@ import fixtures_families as ff
 import hub as hub_module
 import state_writer
 import translate
+from test_resource_guard import guard_arguments
 from test_translate import StubSpans, StubView, kind_widths, random_hub
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "linear_transfer"))
@@ -570,7 +571,8 @@ class CrossFamilyTests(unittest.TestCase):
             try:
                 fit_hub.main(arguments + ["--output", str(cls.bundle), "--hub-dim", "12", "--view-dim", "24",
                                           "--layer-rank", "16", "--indexer-ridge", "deepseek32",
-                                          "--indexer-ridge", "dots3note", "--source-global", "dots3note"])
+                                          "--indexer-ridge", "dots3note", "--source-global", "dots3note",
+                                          *guard_arguments(cls.root)])
             finally:
                 sys.stdout = stdout
         cls.bundle2 = cls.root / "hub-v2"

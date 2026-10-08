@@ -1,4 +1,4 @@
-# Universal KV translator: results (October 2-4, 2026)
+# Universal KV translator: results (October 2-7, 2026)
 
 One shared latent ("hub") now translates attention caches between four local models of
 three architectures and three tokenizers, and a `kvpark bridge switch` moves real
@@ -33,6 +33,7 @@ machine shared with other work; the sections give the load and memory at each ru
 | DFlash2 after a translated restore | 37% of drafted tokens accepted against 41% natively; the aligned dummy alone: 43.4% against 43.7% with the real draft state | [6](#6-stage-2-live-october-3-2026-engine-daemon-the-production-qwen38-build-mtp-images) |
 | MTP after a translated restore | 48% against 61%; the empty head cache alone costs about 5 points (55% against 60%) | [6](#6-stage-2-live-october-3-2026-engine-daemon-the-production-qwen38-build-mtp-images) |
 | Images, Muse → Qwen3.8 (vision) | every switch reused exactly T0; an image in the newest message got the native answer; with an image in an earlier message the translated prefix changed the outcome in 3 of 3 conversations (the target's own cache restored the same way did not) | [6](#6-stage-2-live-october-3-2026-engine-daemon-the-production-qwen38-build-mtp-images) |
+| Onboarded models as sources (DeepSeek-V2-Lite, LFM2-2.6B, Qwen3.6-35B-A3B → Qwen3.8; 8 held-out chats) | the onboarded encoder shrank its latents to half a jointly fitted model's spread; the new default (`reverse`) removes 17% / 24% / 41% of the floor's KL instead of 3% / 4% / 11% (Qwen3-4B, fitted jointly: 30%), and 20% / 25% / 40% against 5% / 6% / 12% on 11 chats (lower than ridge on 10 of 11 each); GLM-4.7-Flash, onboarded with it, 38%; translations into them unchanged | [9](#9-onboarded-models-as-translation-sources-october-6-2026) |
 | Other cache families: MLA, DSA, KDA and GQA hybrids, DeepSeek V4 as a target | translated on random-weight fixtures and restored in llama.cpp; no such model downloaded, so no quality number | [8](#8-stage-4-october-4-2026-the-recurrent-mean-in-the-bridge-a-faster-assemble-deepseek-v4-switches), [ARCHITECTURE.md](ARCHITECTURE.md#what-the-translator-supports-today) |
 
 ## 1. One hub for four models (test tokens)
@@ -948,3 +949,280 @@ Evidence: `evidence/universal-kv/live-stage4-20261004/` (`options/`: run records
 `kept/`: the Qwen3-4B jobs; `bench-loaded/` and `bench-idle/`: the old/new replays with
 `summary.txt`; `rope/`: the RoPE and first-touch micro-benchmarks; `servers.json`,
 `run-options.sh`, `after.sh`).
+
+## 9. Onboarded models as translation sources (October 6, 2026)
+
+The first three onboarding campaigns (README "Onboarding campaign") translated well *into* the new
+models (Qwen3.8 → DeepSeek-V2-Lite, → Qwen3.6-35B-A3B, → LFM2-2.6B removed 37-47% of the floor's KL)
+but poorly *out of* them into Qwen3.8: 3% (DeepSeek-V2-Lite), 4% (LFM2) and 11% (Qwen3.6) of the floor's
+KL, against 30% for Qwen3-4B, a weaker model that was fitted jointly with the hub. This section finds
+why, compares onboarding encoders, and changes the default.
+
+Evidence: `evidence/universal-kv/onboard-encoders/` (`onboard_encoders.py`: the diagnosis and every
+method's encoder on the onboarding's own statistics, the bundles, held-out R² of assembled hubs;
+`e2e.py`, `e2e_table.py`: the end-to-end runs; `diag/`, `bundles/`, `assembled/`, `e2e/`).
+
+### Diagnosis
+
+Measured on each pilot's own spans (train for the statistics, test for the rest), with its onboarded
+bundle (the pilot's transform, decoders and ridge encoder; GPU products, guard on):
+
+- **The ridge target is shrunk by construction.** An onboarded encoder regressed the new view onto the
+  mean of the four pivots' estimates. In a MAXVAR hub the M views' estimates sum to λ·Z per dimension,
+  so that mean is (λ/M)·Z: λ runs from 1.35 to 3.99 (mean 2.33) of M = 4, and the mean's variance is
+  0.33 per dimension against 0.54 for a single pivot's estimate (what every decoder was fitted on) and
+  1.0 for Z. A unit test checks the identity exactly: with full-view pivots the ridge encoder is the
+  consensus encoder times λ/M.
+- **The new view then explains only part of that target.** The ridge encodings' per-dimension variance
+  is 4-6% of the pooled pivot estimates' in the weakest quarter of the hub dimensions (λ 1.35-1.67) and
+  51-58% in the strongest; Qwen3-4B's own estimates reach 101-140%. Their spread (square root of the
+  summed variances) is 0.51-0.54 of the pooled estimates' and 0.48-0.51 of Qwen3.8's own encoding;
+  Qwen3-4B's is 1.07. The per-dimension correlation with Z is 0.19-0.22 in the weakest quarter and
+  0.71-0.77 in the strongest (Qwen3-4B: 0.55-0.58 and 0.88-0.91): a jointly fitted view helped define
+  Z, an onboarded one did not.
+- **R² cannot see it.** The R²-optimal uniform gain on the ridge encodings decoded into Qwen3.8 is
+  1.03-1.06 (K), 1.11-1.15 (V): for squared error they are nearly calibrated. But the rows they decode
+  carry 0.55-0.61 of the native variance (K), against 0.70-0.72 from Qwen3-4B. Under-dispersed K rows
+  flatten attention, and that costs KL that a 0.1 gap in R² does not show.
+
+### Methods compared (hub.solve_onboard_encoder, `fit_hub.py --onboard-encoder`)
+
+All of them change only the new model's encoder: its transform and decoders, and every other model's
+adapters, stay bit-identical, so translations into the new model and between the base models do not
+change (held-out R² into each pilot: identical to the pilot's).
+
+| Encoder | What it is |
+| --- | --- |
+| ridge | the pilots': the ridge regression onto the mean of the pivots' estimates |
+| consensus | the ridge regression onto Z itself (Z = the summed full-view estimates of the four models the GCCA was fitted on, over λ), the estimand of a jointly fitted encoder |
+| tls | ridge, rescaled per dimension to the target's variance: the geometric mean of the forward and the inverted reverse slope, i.e. reduced-major-axis scaling (not orthogonal total least squares; the name stayed) |
+| match | ridge, rescaled per dimension to the pooled pivot estimates' variance (what the decoders were fitted on) |
+| reverse | ridge, rescaled per dimension by var(target) / cov(target, encoding): the inverted reverse regression, unbiased given the target instead of shrunk toward its mean |
+| cca | the CCA of the new view with Z, every canonical pair at unit gain (the encodings carry Z's covariance, not scaled like the base views' estimates: that variant, `ccam`, came with the review, below) |
+| match@z, tls@z, reverse@z | match, tls and reverse onto Z instead of the mean (reverse@z is `reverse_z`) |
+
+### Held-out (test spans of each pilot's onboarding)
+
+Decoded into Qwen3.8 (variance-weighted R² of K / V), spread of the K encodings against the pooled pivot
+estimates (the V spreads are within 0.04 of them: consensus 0.79-0.80, cca 1.44-1.49, reverse 1.28-1.45), and
+the decoded K rows' variance against the native rows':
+
+| Encoder | DS-V2-Lite R² K / V | LFM2 R² K / V | Qwen3.6 R² K / V | K spread DS / LFM2 / Q3.6 | decoded K variance DS / LFM2 / Q3.6 |
+| --- | --- | --- | --- | --- | --- |
+| ridge (pilots) | 0.604 / 0.454 | 0.577 / 0.455 | 0.694 / 0.537 | 0.53 / 0.51 / 0.54 | 0.57 / 0.55 / 0.61 |
+| consensus | 0.606 / 0.460 | 0.578 / 0.463 | 0.705 / 0.554 | 0.78 / 0.76 / 0.77 | 0.64 / 0.61 / 0.69 |
+| tls | 0.605 / 0.459 | 0.575 / 0.462 | 0.706 / 0.553 | 0.77 / 0.78 / 0.80 | 0.66 / 0.64 / 0.70 |
+| match | 0.596 / 0.452 | 0.563 / 0.453 | 0.702 / 0.552 | 0.97 / 1.01 / 1.02 | 0.71 / 0.69 / 0.76 |
+| **reverse** | 0.570 / 0.425 | 0.526 / 0.422 | 0.673 / 0.526 | 1.29 / 1.41 / 1.46 | 0.81 / 0.80 / 0.87 |
+| cca | 0.542 / 0.375 | 0.507 / 0.385 | 0.676 / 0.499 | 1.40 / 1.42 / 1.43 | 0.79 / 0.78 / 0.80 |
+| match@z | 0.599 / 0.455 | 0.566 / 0.456 | 0.703 / 0.553 | 0.97 / 1.01 / 1.02 | 0.70 / 0.68 / 0.75 |
+| tls@z | 0.576 / 0.429 | 0.540 / 0.429 | 0.682 / 0.533 | 1.35 / 1.40 / 1.41 | 0.77 / 0.75 / 0.84 |
+| reverse@z | 0.418 / 0.251 | 0.325 / 0.204 | 0.439 / 0.281 | 2.68 / 3.01 / 3.24 | 1.07 / 1.11 / 1.28 |
+| Qwen3-4B (jointly fitted, same spans) | 0.697 / 0.559 | 0.655 / 0.506 | 0.689 / 0.546 | 1.07 / 1.06 / 1.07 | 0.72 / 0.70 / 0.72 |
+
+Into the pilots (unchanged by any encoder): K 0.46-0.53 / V 0.44-0.49 into DeepSeek-V2-Lite, K
+0.70-0.76 / V 0.50-0.56 into LFM2, K 0.70-0.75 / V 0.58-0.65 into Qwen3.6. On the seven models' common
+spans (hub4 + the three pilots assembled, 8,884 test spans) the onboarded models into each other move the
+same way: LFM2 → DeepSeek-V2-Lite K 0.472 (ridge), 0.479 (consensus), 0.468 (match), 0.427 (reverse),
+0.103 (reverse@z). R² is flat from ridge to match (within 0.015) and falls beyond; spread and decoded
+variance rise steadily.
+
+### End to end (pair_eval, the pilots' own commands and chats)
+
+Each pilot's NAME → Qwen3.8 run again with the very command campaign.py ran (the eight fixed chats,
+templates' rendering, Qwen3.8's token tables and recurrent mean, native prompt start), every method's
+bundle as an `--extra-hub` condition in the same run: the same documents, states, native scores and
+floors, so the encoders compare paired. The rerun's own conditions equal the pilot's to the last digit
+(also with 8 instead of 16 probe threads, and each document scored by its own probe run), and its floors
+equal the Qwen3-4B → Qwen3.8 baseline's. Share of the floor's KL removed (document-bootstrap 95% CI), and
+the paired KL difference against Qwen3-4B → Qwen3.8 (positive: worse than Qwen3-4B; lower on n of 8):
+
+| Encoder | DS-V2-Lite → Qwen3.8 | vs Qwen3-4B | LFM2 → Qwen3.8 | vs Qwen3-4B |
+| --- | --- | --- | --- | --- |
+| ridge (pilots) | 2.9% [1.1%, 3.6%] | +0.0182 [+0.0058, +0.0334], 1/8 | 4.0% [2.6%, 5.3%] | +0.0175 [+0.0052, +0.0332], 1/8 |
+| consensus | 6.0% [3.7%, 7.3%] | +0.0161 [+0.0049, +0.0299], 1/8 | 8.2% [3.0%, 12.8%] | +0.0146 [+0.0044, +0.0277], 1/8 |
+| match | 11.3% [5.9%, 16.1%] | +0.0125 [+0.0036, +0.0235], 1/8 | 14.4% [6.7%, 22.5%] | +0.0105 [+0.0017, +0.0208], 1/8 |
+| **reverse** | **16.9% [9.0%, 22.7%]** | +0.0087 [+0.0020, +0.0166], 1/8 | **23.5% [13.3%, 31.1%]** | +0.0043 [+0.0001, +0.0097], 3/8 |
+| reverse@z | 25.6% [15.4%, 31.6%] | +0.0029 [−0.0008, +0.0072], 2/8 | 16.3% [−0.5%, 28.9%] | +0.0091 [+0.0016, +0.0193], 2/8 |
+| Qwen3-4B → Qwen3.8 (baseline) | 29.8% [17.0%, 36.2%] | | 29.8% [17.0%, 36.2%] | |
+
+- Against the pilots' ridge, reverse lowers KL by −0.0095 [−0.0179, −0.0025] (DS-V2-Lite, lower on
+  7/8) and −0.0132 [−0.0251, −0.0036] (LFM2, 6/8), and ΔNLL against the floor by −0.0147 [−0.0321,
+  −0.0023] and −0.0190 [−0.0376, −0.0032] nats/token.
+- KL falls steadily with the spread from ridge to reverse in both runs, on the chats where the floor
+  is large (the replies that draw on the earlier context: 2ddc2137, b19deab5, f2eef633), from 2-5% to
+  13-38% of their floor removed. On the two chats whose floor is already small (f3fcee86, 1749e42d), the
+  encoders from ridge to reverse all stay within 0.0025 KL of the floor.
+- reverse@z, a variance up to 40 times the pooled estimates' in the weak dimensions, helps
+  DeepSeek-V2-Lite further (25.6%) but hurts LFM2 (16.3%, its CI reaching below 0; −36% and −45% on
+  the two small-floor chats). Its held-out R² collapses (0.42 / 0.25 into Qwen3.8, 0.10 LFM2 →
+  DeepSeek-V2-Lite). Paired against it, reverse is significantly worse on DeepSeek-V2-Lite and
+  significantly better on LFM2:
+
+| KL, reverse − reverse@z | DS-V2-Lite → Qwen3.8 | LFM2 → Qwen3.8 |
+| --- | --- | --- |
+| paired difference, lower on n of 8 | +0.0059 [+0.0016, +0.0104], 2/8 | −0.0048 [−0.0116, −0.0007], 7/8 |
+| share of the floor's KL removed | 16.9% against 25.6% | 23.5% against 16.3% |
+
+  Averaged over the two runs they are even (reverse 20.2%, reverse@z 21.0%).
+
+**Choice: `reverse`**, now `hub.DEFAULT_ONBOARD_ENCODER`, fit_hub.py's `--onboard-encoder` default and
+campaign.py's `ONBOARD_ENCODER`. It is a choice for robustness, not the best result in each run:
+reverse@z removes as much on average but swings by source (9 points better on DeepSeek-V2-Lite, 7 worse
+on LFM2, where it does worse than the floor on two chats by 36% and 45% of their small floors; reverse's
+worst chat in either run is −14% of a floor of 0.017, where ridge and match are also below the floor),
+and it gives up 0.19-0.27 of held-out K R² where reverse gives up 0.03-0.05 (K) and 0.03-0.04 (V) against
+the best encoder. Against ridge, reverse removes about 6 times the floor's KL in both runs and closes most
+of the gap to the jointly fitted Qwen3-4B (+0.0087 and +0.0043 KL, from +0.0182 and +0.0175). Its
+per-dimension variance is 1.0-3.75 times the pooled pivot estimates' on the train spans (median
+1.9-2.4; up to 4.2 on the test spans), which the cap below keeps it to. The decoders do not depend on
+it, so translations into onboarded models and between the base models are unchanged. Translations
+between two onboarded models lose some R² (LFM2 → DeepSeek-V2-Lite K 0.472 → 0.427); their end-to-end
+effect was not measured. All of this was chosen and measured on the same eight chats, into Qwen3.8 only;
+the review's follow-up below checks it on other chats.
+
+### The pilots re-encoded, through campaign.py
+
+`campaign.py reencode deepseek-v2-lite lfm2-2.6b qwen3.6-35b-a3b` fitted each encoder again with
+`reverse` (`fit_hub.py --reencode` on the GPU: 137-175 s each), then `campaign.py run` evaluated the
+directions out of each model again and wrote its report; the runs into each model read decoder sides
+whose sha256 did not change and were kept. The previous bundles and runs are in each campaign's
+`history/onboard-ridge-20261007T*/`. Against the pilots' own runs (same chats, identical floors):
+
+| Direction | ridge (pilot) | reverse | KL, reverse − ridge | ΔNLL, reverse − ridge |
+| --- | --- | --- | --- | --- |
+| DeepSeek-V2-Lite → Qwen3.8 | 2.9% | 16.9% [9.0%, 22.7%] | −0.0095 [−0.0179, −0.0025], 7/8 | −0.0118 [−0.0211, −0.0034] |
+| LFM2 → Qwen3.8 | 4.0% | 23.7% [13.0%, 32.2%] | −0.0133 [−0.0257, −0.0033], 7/8 | −0.0144 [−0.0266, −0.0035] |
+| Qwen3.6 → Qwen3.8 (templates) | 11.3% | 41.0% [19.6%, 53.6%] | −0.0201 [−0.0387, −0.0046], 7/8 | −0.0143 [−0.0296, −0.0020] |
+| Qwen3.6 → Qwen3.8 (as the servers render) | 17.5% | 49.8% [33.4%, 59.6%] | −0.0218 [−0.0394, −0.0069], 7/8 | −0.0164 [−0.0307, −0.0032] |
+
+Against Qwen3-4B → Qwen3.8 (30%): DeepSeek-V2-Lite +0.0087 [+0.0020, +0.0166] KL, LFM2 +0.0042
+[−0.0003, +0.0097] (not clearly different: within the numeric jitter below), Qwen3.6 −0.0076 [−0.0157,
+−0.0008] (better, on 5 of 8 chats). The campaign's re-fitted encoders give the end-to-end comparison's
+numbers to within 0.2 points (LFM2 23.7% against 23.5%: the GPU fit's float16 products).
+
+**Numeric jitter.** The DeepSeek-V2-Lite and Qwen3.6 encoders campaign.py re-fitted are bit-identical to
+the diagnosis's; LFM2's differs by 4.9e-6 (relative Frobenius norm). That alone moves its per-chat KL by
+up to ±0.0021 (5% of a chat's KL), while the eight-chat pooled difference is −0.0002 [−0.0009, +0.0006]
+KL (ΔNLL −0.0010 [−0.0024, +0.0004]): differences of a few 0.001 KL per chat, or a CI bound within
+±0.001 of 0, are within what a refit's rounding moves. The directions into the models
+are the pilots' runs: 47%, 37%, 39% (templates) and 45% (servers) of the floor's KL removed.
+
+### GLM-4.7-Flash, onboarded with reverse, and hub5
+
+GLM-4.7-Flash (MLA, 47 layers; captured whole on October 5) went through `campaign.py run` with the new
+default: K R² 0.66-0.75 out of it and 0.60-0.65 into it. GLM-4.7-Flash → Qwen3.8 removes 38.1% [22.7%,
+46.3%] of the floor's KL (lower on 8/8), better than Qwen3-4B (−0.0056 [−0.0107, −0.0014], 7/8), and
+48.1% [35.4%, 55.4%] as the servers render; Qwen3.8 → GLM-4.7-Flash removes 78.5% [74.9%, 82.4%] (13
+chats, with the native prompt start: without it GLM's `[gMASK]` attention sink makes the translation
+collapse) and 81.0% [77.6%, 84.7%] as the servers render.
+
+`hub5-20261006` (`-v2` for the bridge) holds hub4-d4096's four models and the four onboarded ones, all
+with `reverse` encoders. Between the onboarded models (8,973 test spans): K 0.43-0.71, V 0.41-0.61,
+into DeepSeek-V2-Lite the weakest (K 0.43-0.49).
+
+| Source → Qwen3.8 (8 fixed chats) | templates' rendering | as the servers render |
+| --- | --- | --- |
+| Qwen3-4B (jointly fitted) | 29.8% [17.0%, 36.2%] | |
+| DeepSeek-V2-Lite | 16.9% [9.0%, 22.7%] | |
+| LFM2-2.6B | 23.7% [13.0%, 32.2%] | |
+| Qwen3.6-35B-A3B | 41.0% [19.6%, 53.6%] | 49.8% [33.4%, 59.6%] |
+| GLM-4.7-Flash | 38.1% [22.7%, 46.3%] | 48.1% [35.4%, 55.4%] |
+
+**The joint refit (all seven models) was not run on October 6.** `fit_hub.py --estimate` put its peak at
+46.2 GiB of anonymous memory, so the guard's fit check needed 71.2 GiB of MemAvailable, and the
+kvpark.service llama-server (the production Qwen3.8 with its 262,144-token cache, running since
+2026-10-06 18:02) held 46 GiB of GPU memory all night (MemAvailable 30.3-72.9 GiB). That estimate was
+too high, and its attempt on October 7 is in the review follow-up below. It would also fit every model on
+the 87,426 train spans the seven share (DeepSeek-V2-Lite's template drops reasoning and tools) instead
+of hub4's 185,672, and change every adapter, the base pairs' included.
+
+On those seven models' common spans (8,884 test spans), hub4 with the three pilots assembled gives the
+pairs out of the onboarded models K / V R² into Qwen3.8 of 0.604 / 0.454 (DeepSeek-V2-Lite), 0.619 / 0.503
+(LFM2), 0.702 / 0.550 (Qwen3.6) with ridge and 0.571 / 0.425, 0.575 / 0.475, 0.684 / 0.543 with reverse
+(`assembled/hub7-*.json`); the base pairs are the base's.
+
+### Review follow-up (October 7)
+
+A review of this section re-derived its numbers from the evidence and found the main result sound, the
+choice's justification overstated (corrected above: reverse against reverse@z, the R² gaps, the variance
+range) and a few gaps. Evidence: `onboard-encoders/` (`long/`, `e2e-c/`, `capcheck/`, `heldout/`,
+`joint7/`, `review_tables.py` and its `review_tables.json`).
+
+**A cap on reverse's scale.** reverse scales hub dimension d by var(target) / cov(target, encoding), about
+1 / R²_d, which has no bound as R²_d → 0: a view that barely predicts a dimension (the layer-subset
+encoder of a sliding-window model is the likely case) would be inflated a hundredfold, the regime where
+reverse@z lost on LFM2's small-floor chats. Each dimension's variance is now capped at 4 times the pooled
+pivot estimates' (`hub.ONBOARD_VARIANCE_CAP`; the scale at most twice match's; `fit_hub.py
+--onboard-variance-cap`, 0 for none), the largest the end-to-end comparison covered. The fit logs each
+encoder's smallest per-dimension R², its variance ratios and the dimensions capped, and warns when the cap
+binds or a dimension's R² is below 0.05. Fitted again with it (`fit_hub.py --reencode`, as campaign.py
+runs it; `capcheck/`), the four onboarded models' encoders reach at most 2.38-3.75 times the pooled
+variance (DeepSeek-V2-Lite 2.38 / 2.45 K / V, LFM2 2.95 / 3.07, Qwen3.6 3.71 / 3.75, GLM-4.7-Flash 3.49 /
+3.68; medians 1.9-2.3), with smallest per-dimension R² 0.09-0.14: the cap binds on no dimension, and the
+DeepSeek-V2-Lite, Qwen3.6 and GLM-4.7-Flash encoders come out bit-identical to the campaigns' (LFM2's
+again 4.9e-6 apart, its GPU fit's float16 accumulation order). Their bundles, hub5's included, are what
+the capped default fits.
+
+**The longer set.** Each pilot's NAME → Qwen3.8 ran again on the campaign's longer set (the `-long`
+command: pair_eval's pick of every chat Qwen3.8 renders 6,144-16,384 tokens before the final message)
+with its `reverse` bundle and its pilot `ridge` bundle as `--extra-hub`, paired. That set is the eight
+fixed chats plus the three other chats of the corpus's two chat sources in that range (b6ca4d01, 6529e2d7
+and a5add943, the reply that rewrites the earlier answer); the corpus holds no more. On the eight, every
+condition reproduced the campaign's runs to the last digit, so the new information is in the three:
+
+| Source → Qwen3.8, 11 chats | reverse | ridge | KL, reverse − ridge | ΔNLL, reverse − ridge | the three chats outside the eight: reverse, ridge, KL difference |
+| --- | --- | --- | --- | --- | --- |
+| DeepSeek-V2-Lite | 19.5% [14.9%, 22.6%] | 4.6% [2.9%, 6.1%] | −0.0146 [−0.0233, −0.0066], 10/11 | −0.0178 [−0.0287, −0.0081] | 22.2%, 6.4%, −0.0281 [−0.0449, −0.0193], 3/3 |
+| LFM2-2.6B | 24.7% [19.1%, 29.8%] | 6.0% [4.0%, 8.4%] | −0.0183 [−0.0291, −0.0081], 10/11 | −0.0189 [−0.0293, −0.0085] | 25.7%, 8.1%, −0.0314 [−0.0462, −0.0140], 3/3 |
+| Qwen3.6-35B-A3B | 39.5% [30.2%, 48.5%] | 11.9% [9.2%, 14.6%] | −0.0270 [−0.0424, −0.0121], 10/11 | −0.0217 [−0.0345, −0.0090] | 38.0%, 12.5%, −0.0455 [−0.0626, −0.0258], 3/3 |
+
+On each of the three new chats reverse removes 2-5 times ridge's share (a5add943: 23%, 23% and 33% against
+5-9%). The one chat per model where ridge does better is a small-floor chat (1749e42d, floor KL 0.017, for
+DeepSeek-V2-Lite and LFM2, where both are below the floor; 08e28e45, 0.032, for Qwen3.6), differences
+of 0.0007-0.0012 KL, within the jitter above. Qwen3-4B → Qwen3.8 was not run on the three new chats, so
+"against Qwen3-4B" stays an eight-chat statement.
+
+**Three more encoders on the eight fixed chats** (`e2e-c/`, `make_bundles.py`): `revK` (reverse on K, the
+pilot's ridge on V: does the gain come from K, as the diagnosis's flattened attention says?), `cca` (run end
+to end for the first time) and `ccam`, the CCA scaled like the base views' estimates (each hub dimension's
+variance set to the pooled pivot estimates': the spec's option (b); the cca encoder times
+sqrt(pooled_var / var(Z))). Each pilot's campaign command again, with them as `--extra-hub`; its own
+conditions reproduced the campaign's runs to the last digit, and its floors are the pilot runs' and the
+baseline's, so the table pairs them with ridge and reverse@z from the runs above:
+
+| Encoder | DS-V2-Lite → Qwen3.8 | KL against reverse | LFM2 → Qwen3.8 | KL against reverse | held-out K / V R² into Qwen3.8, DS / LFM2 |
+| --- | --- | --- | --- | --- | --- |
+| reverse | 16.9% [9.0%, 22.7%] | | 23.7% [13.0%, 32.2%] | | 0.570 / 0.425, 0.526 / 0.422 |
+| revK | 13.0% [7.1%, 19.0%] | +0.0027 [+0.0004, +0.0055], lower on 2/8 | 17.2% [9.2%, 25.2%] | +0.0044 [+0.0012, +0.0081], 1/8 | 0.570 / 0.454, 0.526 / 0.455 |
+| cca | 12.4% [5.6%, 19.7%] | +0.0031 [+0.0004, +0.0063], 2/8 | 19.1% [11.6%, 27.5%] | +0.0031 [+0.0002, +0.0069], 3/8 | 0.542 / 0.375, 0.507 / 0.385 |
+| ccam | 8.7% [3.8%, 13.5%] | +0.0056 [+0.0018, +0.0105], 2/8 | 14.5% [8.2%, 20.6%] | +0.0062 [+0.0014, +0.0118], 2/8 | 0.573 / 0.419, 0.541 / 0.426 |
+| ridge (pilots) | 2.9% | +0.0095 [+0.0025, +0.0179], 1/8 | 4.0% | +0.0133 [+0.0033, +0.0257], 1/8 | 0.604 / 0.454, 0.577 / 0.455 |
+
+- **K carries most of it, V the rest.** Rescaling K alone gives 72% (DeepSeek-V2-Lite) and 67% (LFM2) of
+  reverse's gain over ridge; rescaling V as well adds a significant remainder (ΔNLL +0.0023 [+0.0001,
+  +0.0050] and +0.0032 [+0.0001, +0.0068] for revK against reverse), although it costs V 0.03 of R². The
+  spread, not R², decides on V too.
+- **Neither CCA beats reverse**, in either run: at unit gain (Z's covariance) it removes 12% / 19%, scaled
+  like the base views' estimates 9% / 15%, though ccam has the best held-out K R² of the rescaled encoders.
+  The `reverse` default stands. ccam is not an option of `fit_hub.py`.
+
+**The joint refit: estimate corrected, attempted, pending.** The 46.2 GiB estimate counted numpy's float64
+`eigh` for the GCCA (6.1 P² float64 with what is held). The fit goes through `fit_backend.top_eig`'s float32
+subset solver (scipy, in the ROCm venv the fits run in), measured at 1.16-1.41 P² of float64 beyond its
+input (`fit_hub.eigh_bytes`, README "Fit memory"): the GCCA phase is 21.5 GiB and the peak is the decoder
+phase, 35.6 GiB in all, which needs 60.6 GiB of MemAvailable (a reduced-row refit would lower that phase,
+which grows with the dev spans; the review was right that "the same peak" did not follow). That check
+passed at 18:46 on October 7 with kvpark.service still running (68.3 GiB available). The refit ran 61
+minutes (`joint7/attempt-20261007/`): the seven K views in 30, its anonymous memory at most 22.2 GiB, within
+the estimate; then the K GCCA, under the GPU-evaluation guard settings (85/65 °C, 4 threads), which kept it
+stopped 70% of the time. While stopped, its memory went to swap until swap was 99% full with MemAvailable at
+47 GiB; the guard could not let a job continue then (that needed swap use below 80%, and the job's pages
+only come back when it runs), so it was ended by hand. Swap use now counts only while MemAvailable is below
+24 GiB (`resource_guard` `swap_ignore_gib`, README "Running heavy jobs safely"). Pending, and unblocked once the model servers are
+stopped: `window_c.py --steps joint,e2e` runs it with the CPU guard defaults (90/80 °C, 8 threads) and then
+the end-to-end comparison with the joint hub as one more `--extra-hub` (README "Onboarding campaign").
+
+**Not tested.** A decoder-side calibration (a variance or temperature correction of the decoded K rows,
+which would also help the jointly fitted Qwen3-4B, whose decoded K variance is 0.70-0.72 of the native),
+onboarded → onboarded pairs end to end, and every target other than Qwen3.8.

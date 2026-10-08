@@ -4,6 +4,8 @@
     campaign.py plan --name NAME [--catalog-id ID]   (statuses, what a run would do, the capture forecast; loads no model)
     campaign.py status [NAME ...]       (and assembled hubs an onboarding has outdated since)
     campaign.py assemble --output DIR [--evaluate] NAME [NAME ...]
+    campaign.py evaluate-onboarded --hub DIR NAME [NAME ...]   (assemble --evaluate's R^2 again, e.g. after a guard stop)
+    campaign.py reencode [--encoder METHOD] NAME [NAME ...]   (fit onboarded models' encoders again, nothing else)
     campaign.py exec --memory-bytes N [--timeout S] -- COMMAND ...   (one command under the GPU/memory lock)
 
 One model per `run`. NAME is the model's name in the hub and, by default, its id in
@@ -17,11 +19,12 @@ and the stage outputs:
   render     the hub corpus (corpus v2 + v3-train: the 248 conversations hub4-d4096 was fitted on)
              rendered with the model's own chat template, chat.py corpus mode -> render/records.jsonl
              and template.jinja. Parity with llama.cpp on a sample (two conversations per corpus
-             source) through template_check's server mode on a tokenizer twin (ports 18690-18699):
-             the sample's prompts (the final assistant message left out) under every option set,
-             and its whole conversations as the records hold them (no generation prompt). Every
-             whole conversation must match with no server error, and every prompt but the server's
-             refusals of option sets named with --parity-tolerate (none by default), at least one.
+             source) through template_check's server mode on a tokenizer twin (ports 18690-18699,
+             KVPARK_TWIN_PORT moves them): the sample's prompts (the final assistant message left
+             out) under every option set, and its whole conversations as the records hold them (no
+             generation prompt). Every whole conversation must match with no server error, and every
+             prompt but the server's refusals of option sets named with --parity-tolerate (none by
+             default), at least one.
              A record that differs from the server's own whole-conversation bytes (a server context
              such as Qwen3.6's, which keeps earlier reasoning) is recorded with that context and the
              first difference, not refused. Then the probe tokenizes every record -> render/tokens.json.
@@ -29,17 +32,22 @@ and the stage outputs:
              round-robin over the corpus sources, until the size or time budget: 60 GB, one hour, by
              the model's cache width and 0.4 of its smoke prefill speed) -> capture-plan.json; then
              the capture in chunks (collect_v2.py; the Vulkan probe, or --mode states on the CPU probe
-             for STATES_ARCHITECTURES, whose graphs name no pre-RoPE key): chunk 0 the dev and test
+             for STATES_ARCHITECTURES, whose graphs name no pre-RoPE key, or collect on the CPU probe
+             for CPU_CAPTURE_ARCHITECTURES, whose Vulkan capture runs differ from plain runs): chunk 0 the dev and test
              documents, then train chunks in the forecast's order while the measured speed (rows per
              probe second, lock waits excluded) and the bytes so far say the next one fits (a states
              chunk counts twice: its state files and its rows exist together). Every chunk is killed
              at 1.5 x the time budget of probe time; a train chunk that is, ends the capture there.
              -> capture/chunk-NN/ (+ .docs.jsonl, .json), capture-docs.jsonl (all captured documents)
   onboard    fit_hub.py --base hub4-d4096 with every base model as a pivot, --link-base (the base's
-             files are read-only hard links, checked against the arrays in memory first) and
-             --evaluate new -> hub/ (format 1: held-out R^2 per kind against each pivot in
-             hub/evaluation.json), then convert_hub.py --reuse hub4-d4096-v2 -> hub-v2/ (only the
-             new model's sides are converted); the new model's files' sha256 go to state.json
+             files are read-only hard links, checked against the arrays in memory first),
+             --onboard-encoder ONBOARD_ENCODER and --evaluate new, run with FIT_PYTHON (torch with
+             ROCm: the fit's products on the GPU, fit_hub --fit-device auto) -> hub/ (format 1: held-out
+             R^2 per kind against each pivot in hub/evaluation.json), then convert_hub.py --reuse
+             hub4-d4096-v2 -> hub-v2/ (only the new model's sides are converted); the new model's
+             files' sha256, its encoder, the reverse family's variance cap (hub.ONBOARD_VARIANCE_CAP) and
+             the encoders' train diagnostics (the smallest per-dimension R^2, the variance ratios, the
+             dimensions capped, any warning) go to state.json and the report
   tables     token_tables.py on the onboarding's spans (the model and the pivots, --only the
              model) -> token-tables/NAME.npz
   recurrent  hybrids whose recurrent cell holds a state (S rows: SSM, delta rule, WKV, lightning):
@@ -59,7 +67,9 @@ and the stage outputs:
              reasoning), both directions run again with both models rendered as their servers
              render them (pair_eval --server-render; -server), what a live switch holds.
              -> eval/<source>-to-<target>[-server][-long]/, each with <dir>.command.json (a finished
-             direction is kept only for the same command)
+             direction is kept only for the same command; an unfinished one of the same command, e.g.
+             one the resource guard ended, continues: pair_eval --resume keeps its saved states and
+             scored documents)
   report     report.json and report.md: wall time (and the command time of every attempt since the
              stage last started over, from log.jsonl), lock waits, disk and peak RSS per stage, the
              capture, R^2, ΔNLL / KL / top-1 with document-bootstrap 95% CIs, paired differences
@@ -80,6 +90,29 @@ logged). Every command's peak anonymous memory (its process group's RssAnon) and
 held while it runs even if campaign.py dies; it runs in its own process group, which campaign.py
 kills on SIGINT, SIGTERM, SIGHUP or a timeout. render loads no model (a tokenizer twin).
 
+Resource guard (resource_guard.py; after 2026-10-05's thermal shutdown): every command runs with
+BLAS/OpenMP threads capped at 8 unless set (the probe with --threads 8), starts only once the CPU is
+at most 75 C (after its locks), and runs under a Watch that samples it every 2 s into
+logs/<label>.guard.jsonl, stops its process group at 90 C, at 85% swap use or below 8 GiB
+MemAvailable, continues it at 80 C with memory recovered, and ends it at 95 C on two samples in a
+row or when the sensors are lost for 60 s (the stage fails: GuardStop). Pauses count neither toward
+a command's seconds nor its timeout. The CPU-heavy commands (fit_hub, token_tables, r0 calibrate,
+pair_eval, a capture on the CPU probe) also hold the CPU lock,
+/tmp/kvpark-campaign-cpu.lock, taken after the GPU/memory lock and inherited like it
+(KVPARK_CPU_LOCK_FD): one CPU-heavy job at a time, hand-run fits (fit_hub.py takes it too)
+included. The GPU evaluations (the evaluate stage's pair_eval runs and the baseline, assemble
+--evaluate) run with resource_guard.GPU_EVALUATION's defaults: stopped at 85 C, continued at 65 C,
+4 BLAS and probe threads (commands.sh: exec --gpu-evaluation). KVPARK_GUARD_* change the thresholds
+(KVPARK_GUARD=off disables pausing and aborting, with a warning).
+
+Re-encoding: `campaign.py reencode [--encoder METHOD] NAME ...` fits an onboarded model's encoder again
+with another onboarding encoder (fit_hub.py --reencode: its view transforms and decoders, and every other
+model's adapters, stay exactly as they are), swaps hub/ and hub-v2/ (the previous ones, the fit log and
+the evaluation runs out of the model go to history/onboard-<encoder>-<time>/), and marks evaluate and
+report "outdated": the next `run` evaluates only the directions out of the model again (the runs into it
+read unchanged sides and are kept) and reports. The same method again is refused, except that a reverse
+or reverse_z encoder fitted before the variance cap existed (none recorded) may be fitted again with it.
+
 Resume: a stage runs when it is not done; --redo STAGE runs it again with every stage that depends
 on it. A stage that failed or was interrupted is cleaned and run again, except that each published
 capture chunk whose documents, probe build and settings match is adopted (collect_v2's manifest),
@@ -95,14 +128,20 @@ filesystem, no disk, any order), in both formats: DIR and DIR-v2, and records it
 assembled.json; `status` flags an assembled hub whose files are no longer the model's onboarding
 (after --redo onboard). Adding a model later means assembling a new directory with one more name; a
 hub the bridge reads is never modified. `assemble --evaluate` also measures held-out R^2 between
-the onboarded models (they all captured the same dev and test documents) -> DIR/evaluation-onboarded.json.
+the onboarded models (they all captured the same dev and test documents) -> DIR/evaluation-onboarded.json:
+as a child process (`campaign.py evaluate-onboarded`, FIT_PYTHON: its products on the GPU) under the
+GPU/memory and CPU locks and a Watch with the GPU-evaluation defaults, which can stop it at any moment (an
+in-process evaluation on the CPU could be paused only between chunks: on 2026-10-07 the package went from
+82 C to 98 C within one). `campaign.py evaluate-onboarded --hub DIR NAME ...` runs it again (after a guard
+stop, the assembled directory is kept).
 """
 
 import os
 
+import resource_guard
+
 if __name__ == "__main__":
-    for _name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
-        os.environ.setdefault(_name, "8")
+    resource_guard.cap_threads(os.environ)
 
 import argparse
 import contextlib
@@ -172,24 +211,43 @@ PROBE_VULKAN = ROOT / "runtime-kvtools" / "kvpark-kv-probe-vulkan" / "kvpark-kv-
 PROBE_CPU = ROOT / "runtime-kvtools" / "kvpark-kv-probe" / "kvpark-kv-probe"
 LLAMA_SERVER = ROOT / "runtime" / "build" / "bin" / "llama-server"
 PYTHON = HERE.parent / "linear_transfer" / ".venv" / "bin" / "python"      # a venv: never resolve symlinks
-GPU_LOCK = Path("/tmp/kvpark-campaign-gpu.lock")
+# fit_hub's Python: torch with ROCm runs the fit's products on the GPU (fit_backend.py; README.md "Fit placement":
+# the LFM2-2.6B onboarding in 1.8x less wall time and 2.5x less energy, held-out R^2 within 1e-5 of the CPU fit's);
+# $KVPARK_FIT_PYTHON names another; without either the experiment venv fits on the CPU (fit_hub --fit-device auto)
+FIT_PYTHON = Path.home() / "venvs" / "rocm" / "bin" / "python"
+# how an onboarded model's encoder is fitted (fit_hub.py --onboard-encoder, hub.solve_onboard_encoder): the hub's
+# default (hub.DEFAULT_ONBOARD_ENCODER, chosen end to end in RESULTS.md section 9; the pilots used "ridge")
+ONBOARD_ENCODER = "reverse"
+GPU_LOCK = Path(resource_guard.GPU_LOCK)
+CPU_LOCK = Path(resource_guard.CPU_LOCK)   # CPU-heavy commands, taken after GPU_LOCK
 GIB = 1024 ** 3
 GPU_MARGIN = 25 * GIB
 GPU_POLL_S = 60
 CHILD_POLL_S = 0.2
 MEMORY_SAMPLE_S = 1.0           # how often a command's anonymous memory is sampled
 STOP_GRACE_S = 30
-TWIN_PORTS = range(18690, 18700)
+# the render stage's tokenizer-twin servers (KVPARK_TWIN_PORT moves the ten ports, as in template_check)
+_TWIN_PORT = int(os.environ.get("KVPARK_TWIN_PORT", "18690"))
+TWIN_PORTS = range(_TWIN_PORT, _TWIN_PORT + 10)
 # graphs that name no pre-RoPE key: their captures come from f32 state saves (collect_v2 --mode states, CPU)
 STATES_ARCHITECTURES = {"kimi-k3", "bailingmoe3", "hy_v4", "hy_v3", "glm5-next"}
+# graphs whose Vulkan capture run and a plain run differ by more than rounding (the eval callback splits
+# the graph; linear_transfer/README.md, Gemma 4): Gemma-4 26B-A4B's full layers hold V exactly in 2% of
+# the values, K up to 0.075 off, and a state rebuilt from the captures scores KL 0.014 against the saved
+# one. Collected on the CPU probe, where the two agree (V exact, K within 0.7 ulp, rebuilt = saved).
+CPU_CAPTURE_ARCHITECTURES = {"gemma4"}
 REFUSED_ARCHITECTURES = {"deepseek4": "DeepSeek V4 needs fit_hub.py --heads and a split GGUF the probe cannot load"}
 BUDGET_BYTES = 60 * 10 ** 9
 BUDGET_SECONDS = 3600
 LOAD_SECONDS = 120              # model load and tokenization, outside the per-token rate
 # capture tokens/s as a share of the catalog's smoke prefill (ROCm, flash attention, f16 cache): the
 # hub4 captures (Vulkan, f32 cache, flash attention off, rows written out) ran Ornith at 0.49 of it
-# and Qwen3-4B at 0.33, LFM2 at 0.72; --mode states runs on the CPU (a guess until measured)
-CAPTURE_SPEED = {"collect": 0.4, "states": 0.05}
+# and Qwen3-4B at 0.33, LFM2 at 0.72; --mode states runs on the CPU (a guess until measured); collect
+# on the CPU probe: Gemma-4 26B-A4B's capture ran 80 tokens/s of probe time with 8 threads (0.062 of its
+# smoke prefill; a short trial with 4 threads, 45), 2026-10-06, guard pauses excluded: it reaches 90 C
+# within 2 s of running and was paused half of the time
+CPU_COLLECT_SPEED = 0.06
+CAPTURE_SPEED = {("collect", "vulkan"): 0.4, ("collect", "cpu"): CPU_COLLECT_SPEED, ("states", "cpu"): 0.05}
 # disk a chunk holds at its peak per byte of rows: states mode keeps every state file of the chunk
 # until its rows are written (collect_v2.run_states)
 PEAK_FACTOR = {"collect": 1, "states": 2}
@@ -197,7 +255,7 @@ CAPTURE_CHUNKS = 6              # train chunks of the forecast budget: the speed
 CHUNK_MIN_TOKENS = 16384
 HARD_FACTOR = 1.5               # probe time limit of the whole capture, x the time budget
 CAPTURE_BATCH = 512
-CAPTURE_THREADS = 16
+CAPTURE_THREADS = resource_guard.DEFAULT_THREADS   # the probe's CPU threads (16 until the 2026-10-05 shutdown)
 CAPTURE_CTX = 5120
 PROBE_MAX_CTX = 32768           # kv_probe refuses a larger context
 PARITY_PER_SOURCE = 2
@@ -237,6 +295,10 @@ class StageError(RuntimeError):
 
 class CommandTimeout(StageError):
     """A command ran past its timeout and was stopped (its whole process group)."""
+
+
+class GuardStop(StageError):
+    """The resource guard ended a command: too hot, sensors lost or a pause that never cleared."""
 
 
 class Terminated(BaseException):
@@ -346,6 +408,14 @@ def capture_mode(architecture):
     return "states" if architecture in STATES_ARCHITECTURES else "collect"
 
 
+def capture_device(architecture):
+    """Where the capture runs: "cpu" (the CPU probe) for --mode states and CPU_CAPTURE_ARCHITECTURES,
+    else "vulkan"."""
+    if capture_mode(architecture) == "states" or architecture in CPU_CAPTURE_ARCHITECTURES:
+        return "cpu"
+    return "vulkan"
+
+
 def recurrent_cell(spec):
     """What a model's recurrent cell holds and whether a hybrid target needs its recurrent mean:
     {"layers", "r_bytes", "s_bytes", "mean", "reason"} (bytes per layer row, kvstate's
@@ -416,6 +486,15 @@ def capture_plan(documents, *, bytes_per_token, tokens_per_second, budget_bytes=
             "bytes": int(total * bytes_per_token), "seconds": round(load_seconds + total / tokens_per_second, 1),
             "budget_tokens": budget, "limit": limit, "by_split": by_split,
             "train_fraction": round(train_tokens / train_total, 4) if train_total else None}
+
+
+def held_out_need(documents, *, bytes_per_token, tokens_per_second, load_seconds=LOAD_SECONDS):
+    """What the dev and test documents alone take, for a budget that cannot hold them (a wide model:
+    Gemma-4 31B's 1.8 MB per token puts them at 76 GB, past the default 60)."""
+    tokens = sum(d["tokens"] for d in documents if d["split"] in ("dev", "test"))
+    return (f"the held-out documents alone take {tokens * bytes_per_token / 10 ** 9:.1f} GB and "
+            f"{(load_seconds + tokens / tokens_per_second) / 60:.0f} minutes at {tokens_per_second:.1f} tokens/s: give "
+            "--budget-gb and --budget-minutes above that, with room for the training documents")
 
 
 def chunk_tokens_for(budget_tokens):
@@ -744,7 +823,9 @@ def gpu_lock(memory_bytes, log, *, path=GPU_LOCK, margin=GPU_MARGIN, poll=GPU_PO
     wait is logged. Yields a namespace: `stream` (the locked file; a command given its descriptor,
     pass_fds, holds the lock too), `free` (the MemAvailable found) and `waited` (seconds). The lock
     belongs to the open file: leaving the block closes this process's descriptor, so the lock is
-    free once no command that inherited it still runs."""
+    free once no command that inherited it still runs. Never taken while this process holds the CPU
+    lock (resource_guard.LockOrderError): the GPU/memory lock comes first."""
+    resource_guard.check_lock_order()
     started = time.monotonic()
     while True:
         stream = open(path, "a")
@@ -779,14 +860,16 @@ def _reap(child, block):
 
 
 def stop_group(child, grace=STOP_GRACE_S):
-    """End a command and its process group: SIGTERM, then SIGKILL to whatever is left after `grace`
-    seconds; the command is reaped."""
+    """End a command and its process group: SIGTERM (and SIGCONT: a group the resource guard
+    stopped handles it only once continued), then SIGKILL to whatever is left after `grace` seconds;
+    the command is reaped."""
     def signal_group(number):
         try:
             os.killpg(child.pid, number)
         except ProcessLookupError:
             pass
     signal_group(signal.SIGTERM)
+    signal_group(signal.SIGCONT)
     deadline = time.monotonic() + grace
     while child.returncode is None and time.monotonic() < deadline:
         if _reap(child, block=False) is None:
@@ -819,37 +902,79 @@ def group_anon_bytes(pgid, proc="/proc"):
 
 
 def run_child(argv, *, cwd=None, env=None, output=None, keep_fds=(), timeout=None, poll=CHILD_POLL_S,
-              sample=MEMORY_SAMPLE_S):
+              sample=MEMORY_SAMPLE_S, watch=None):
     """Run a command in its own session (process group) with the descriptors keep_fds inherited, and
     wait for it; on a timeout, or when this process is interrupted (KeyboardInterrupt, Terminated),
-    its whole group is stopped. Returns a namespace: returncode, seconds, max_rss (bytes, wait4's
-    ru_maxrss of the command or the largest descendant it waited for: file pages it touched
-    included), max_anon (the group's peak RssAnon, sampled every `sample` seconds: what it needs
-    resident), timed_out."""
+    its whole group is stopped. watch: a resource_guard.Watch attached to the group and stepped while
+    it runs (it stops and continues the group); its pauses count neither toward the timeout nor the
+    seconds, and when it ends the command (GuardAbort) the group is stopped and `aborted` says why.
+    Returns a namespace: returncode, seconds, max_rss (bytes, wait4's ru_maxrss of the command or the
+    largest descendant it waited for: file pages it touched included), max_anon (the group's peak
+    RssAnon, sampled every `sample` seconds: what it needs resident), timed_out, paused_s, aborted
+    and guard (the Watch's summary)."""
     started = time.perf_counter()
     child = subprocess.Popen([str(item) for item in argv], cwd=cwd, env=env, stdout=output,
                              stderr=subprocess.STDOUT if output is not None else None, pass_fds=tuple(keep_fds),
                              start_new_session=True)
-    usage, timed_out, max_anon, sampled = None, False, 0, 0.0
+    usage, timed_out, max_anon, sampled, aborted = None, False, 0, 0.0, None
     try:
+        if watch is not None:
+            watch.attach(child.pid)
         while True:
             usage = _reap(child, block=False)
             if usage is not None:
                 break
+            if watch is not None:
+                watch.step()
             elapsed = time.perf_counter() - started
-            if timeout is not None and elapsed > timeout:
+            if timeout is not None and elapsed - (watch.paused_seconds() if watch is not None else 0.0) > timeout:
                 stop_group(child)
                 timed_out = True
                 break
             if elapsed - sampled >= sample:
                 max_anon, sampled = max(max_anon, group_anon_bytes(child.pid)), elapsed
             time.sleep(poll)
+    except resource_guard.GuardAbort as error:
+        stop_group(child)
+        aborted = str(error)
     except BaseException:
         stop_group(child)
+        if watch is not None:
+            watch.close()
         raise
-    return types.SimpleNamespace(returncode=child.returncode, seconds=time.perf_counter() - started,
+    guard = watch.close() if watch is not None else None
+    paused = guard["paused_s"] if guard else 0.0
+    return types.SimpleNamespace(returncode=child.returncode, seconds=time.perf_counter() - started - paused,
                                  max_rss=None if usage is None else usage.ru_maxrss * 1024, max_anon=max_anon,
-                                 timed_out=timed_out)
+                                 timed_out=timed_out, paused_s=paused, aborted=aborted, guard=guard)
+
+
+@contextlib.contextmanager
+def guarded_locks(memory_bytes, log, *, cpu=False, label=None):
+    """The locks of one command, in order: the GPU/memory lock (when memory_bytes is not None), then
+    the CPU lock (cpu). Yields (gpu lock namespace or None, the descriptors the command inherits, its
+    environment additions: KVPARK_CPU_LOCK_FD)."""
+    with contextlib.ExitStack() as stack:
+        held = stack.enter_context(gpu_lock(memory_bytes, log, path=GPU_LOCK, poll=GPU_POLL_S,
+                                            available=mem_available)) if memory_bytes is not None else None
+        fds, extra = [] if held is None else [held.stream.fileno()], {}
+        if cpu:
+            locked = stack.enter_context(resource_guard.cpu_lock(CPU_LOCK, log=log, label=label))
+            if locked.fd is not None:
+                fds.append(locked.fd)
+                extra[resource_guard.CPU_LOCK_FD] = str(locked.fd)
+        yield held, fds, extra
+
+
+def guarded_child(argv, *, settings, guard_log, label, events, environment, **options):
+    """run_child under the resource guard (the locks already held): wait_cool, then a Watch logging
+    to guard_log; the child's environment says it is watched. Returns run_child's namespace with
+    cool_wait_s."""
+    cooled = resource_guard.wait_cool(settings, log=resource_guard.JsonLog(guard_log, label, events))
+    watch = resource_guard.Watch(settings, log_path=guard_log, label=label, events=events)
+    outcome = run_child(argv, env={**environment, resource_guard.WATCHED: "1"}, watch=watch, **options)
+    outcome.cool_wait_s = cooled
+    return outcome
 
 
 def disk_usage(paths):
@@ -995,48 +1120,69 @@ class Campaign:
                 fcntl.flock(stream, fcntl.LOCK_UN)
 
     # commands
-    def command_line(self, argv, *, cwd, env, memory_bytes, timeout):
+    def command_line(self, argv, *, cwd, env, memory_bytes, timeout, cpu=False, guard_log=None, gpu_evaluation=False):
         """The command as commands.sh holds it: a model-loading command through `campaign.py exec`,
-        which takes the GPU/memory lock and checks memory as the run does."""
+        which takes the GPU/memory lock (and the CPU lock: cpu), checks memory and runs it under the
+        resource guard as the run does (with the GPU-evaluation defaults: gpu_evaluation)."""
         if memory_bytes is not None:
             argv = [str(PYTHON), str(HERE / "campaign.py"), "exec", "--memory-bytes", str(int(memory_bytes))] \
-                + (["--timeout", str(int(timeout))] if timeout is not None else []) + ["--", *argv]
+                + (["--timeout", str(int(timeout))] if timeout is not None else []) \
+                + (["--cpu-lock"] if cpu else []) + (["--gpu-evaluation"] if gpu_evaluation else []) \
+                + (["--guard-log", str(guard_log)] if guard_log else []) + ["--", *argv]
         extra = " ".join(f"{key}={shlex.quote(value)}" for key, value in sorted((env or {}).items()))
         return f"(cd {shlex.quote(str(cwd))} && {extra + ' ' if extra else ''}{shlex.join(argv)})"
 
-    def run(self, argv, *, stage, label, memory_bytes=None, env=None, cwd=HERE, timeout=None):
+    def run(self, argv, *, stage, label, memory_bytes=None, env=None, cwd=HERE, timeout=None, cpu=False,
+            gpu_evaluation=False):
         """Run one command with its output in logs/<label>.log; under the GPU/memory lock when it
-        loads a model or a hub (memory_bytes: what it loads), which the command itself holds while it
-        runs. Recorded in commands.sh and the stage's state entry (with git HEAD and the sha256 of the
-        scripts it runs), so it can be run again by hand. Returns the command's own seconds (lock and
-        memory waits excluded); a timeout stops its process group and raises CommandTimeout."""
+        loads a model or a hub (memory_bytes: what it loads), and the CPU lock after it when it is
+        CPU-heavy (cpu), both of which the command itself holds while it runs; under the resource
+        guard (BLAS threads capped, wait_cool, a Watch logging to logs/<label>.guard.jsonl; for a GPU
+        evaluation, gpu_evaluation, with resource_guard.GPU_EVALUATION's defaults). Recorded
+        in commands.sh and the stage's state entry (with git HEAD and the sha256 of the scripts it
+        runs), so it can be run again by hand. Returns the command's own seconds (lock, memory and
+        cooling waits and guard pauses excluded); a timeout stops its process group and raises
+        CommandTimeout, the guard ending it GuardStop."""
         argv = [str(item) for item in argv]
+        settings = resource_guard.Settings.from_env(
+            defaults=resource_guard.GPU_EVALUATION if gpu_evaluation else None)
         logs = self.dir / "logs"
         logs.mkdir(parents=True, exist_ok=True)
-        shell = self.command_line(argv, cwd=cwd, env=env, memory_bytes=memory_bytes, timeout=timeout)
+        guard_log = logs / f"{label}.guard.jsonl"
+        shell = self.command_line(argv, cwd=cwd, env=env, memory_bytes=memory_bytes, timeout=timeout, cpu=cpu,
+                                  guard_log=guard_log, gpu_evaluation=gpu_evaluation)
         with open(self.dir / "commands.sh", "a", encoding="utf-8") as stream:
             stream.write(f"# {now()} {self.name} {stage}: {label}\n{shell}\n")
         entry = self.stage(stage).setdefault("commands", [])
         entry.append({"label": label, "argv": argv, "cwd": str(cwd), "env": env or {}, "gpu_lock": memory_bytes is not None,
-                      "memory_bytes": memory_bytes, "timeout": timeout, "log": str(logs / f"{label}.log"),
-                      "git": git_state(), "scripts": script_hashes(argv)})
+                      "cpu_lock": bool(cpu), "memory_bytes": memory_bytes, "timeout": timeout,
+                      "log": str(logs / f"{label}.log"), "guard_log": str(guard_log), "git": git_state(),
+                      "scripts": script_hashes(argv)})
         self.save()
-        environment = {**os.environ, **(env or {})}
-        lock = gpu_lock(memory_bytes, lambda item: self.log({**item, "stage": stage, "label": label}), path=GPU_LOCK,
-                        poll=GPU_POLL_S, available=mem_available) if memory_bytes is not None else contextlib.nullcontext()
-        with lock as held:
+        environment = resource_guard.thread_env({**os.environ, **(env or {})}, settings.threads)
+        entry[-1]["threads"] = environment["OPENBLAS_NUM_THREADS"]
+
+        def events(item):
+            self.log({**item, "stage": stage, "label": label})
+        with guarded_locks(memory_bytes, events, cpu=cpu, label=f"campaign {self.name} {label}") as (held, fds, extra):
             self.log({"event": "command", "stage": stage, "label": label, "command": shell})
             with open(logs / f"{label}.log", "a", encoding="utf-8") as output:
-                outcome = run_child(argv, cwd=cwd, env=environment, output=output,
-                                    keep_fds=() if held is None else (held.stream.fileno(),), timeout=timeout)
+                outcome = guarded_child(argv, settings=settings, guard_log=guard_log, label=label, events=events,
+                                        environment={**environment, **extra}, cwd=cwd, output=output, keep_fds=fds,
+                                        timeout=timeout)
         entry[-1].update(seconds=round(outcome.seconds, 1), waited_s=0.0 if held is None else round(held.waited, 1),
-                         returncode=outcome.returncode, timed_out=outcome.timed_out,
+                         cool_wait_s=round(outcome.cool_wait_s, 1), paused_s=outcome.paused_s,
+                         returncode=outcome.returncode, timed_out=outcome.timed_out, guard_abort=outcome.aborted,
+                         max_c=(outcome.guard or {}).get("max_c"),
                          max_rss_gib=None if outcome.max_rss is None else round(outcome.max_rss / GIB, 2),
                          max_anon_gib=round(outcome.max_anon / GIB, 2))
         self.save()
         self.log({"event": "command-done", "stage": stage, "label": label, "seconds": round(outcome.seconds, 1),
                   "returncode": outcome.returncode, "timed_out": outcome.timed_out, "max_rss_gib": entry[-1]["max_rss_gib"],
-                  "max_anon_gib": entry[-1]["max_anon_gib"]})
+                  "max_anon_gib": entry[-1]["max_anon_gib"], "paused_s": outcome.paused_s, "max_c": entry[-1]["max_c"],
+                  "guard_abort": outcome.aborted})
+        if outcome.aborted:
+            raise GuardStop(f"{label} was ended by the resource guard: {outcome.aborted} (samples in {guard_log})")
         if outcome.timed_out:
             raise CommandTimeout(f"{label} ran past its {timeout:.0f} s timeout and was stopped")
         if outcome.returncode != 0:
@@ -1129,6 +1275,25 @@ def base_models(base=BASE_HUB):
 def hub_bytes(directory):
     """Bytes of a hub bundle's files (what loading it whole reads into memory)."""
     return file_bytes([p for p in Path(directory).iterdir() if p.name != "manifest.json"])
+
+
+def sides_bytes(directory, source, target):
+    """Bytes of what a translation source -> target reads from a format 2 bundle (pair_eval and the engine
+    read it lazily): the source's encoder sides, the target's decoder sides and indexer ridge (float32),
+    and the target's head kinds; a format 1 bundle: both models' files."""
+    import hub
+    manifest = hub.read_manifest(directory)
+    names = []
+    for (table, key), entry in hub._bundle_entries(manifest).items():
+        owner = hub._owner(key, manifest["models"])
+        role = key[len(owner) + 1:].split(".") if owner else []
+        if table == "sides" and ((owner == source and role[-1] == "encoder")
+                                 or (owner == target and role[-1] in ("decoder", "ridge"))):
+            names.append(entry["files"]["f32"]["file"])
+        elif table == "files" and (owner == target or (owner == source and manifest["format_version"] == hub.FORMAT)):
+            if manifest["format_version"] == hub.FORMAT or role[-1] not in hub.KINDS:
+                names.append(entry["file"])
+    return file_bytes([Path(directory) / name for name in names])
 
 
 def model_argument(name, captures, records):
@@ -1278,10 +1443,10 @@ def _normalized(value):
     return json.loads(json.dumps(value, sort_keys=True, default=str))
 
 
-def capture_identity(campaign, probe, mode, ctx, spec_file):
+def capture_identity(campaign, probe, mode, ctx, spec_file, device):
     """What a published capture chunk's manifest must say to be adopted (besides its documents):
     the mode, the model's sha256, the probe's runtime revision and build (collect.verify_runtime),
-    collect_v2.py's sha256, the capture spec and the probe settings."""
+    collect_v2.py's sha256, the capture spec and the probe settings (device: capture_device)."""
     import collect
     import collect_v2
     revision, identity, _ = collect.verify_runtime(Path(probe).resolve())
@@ -1290,7 +1455,7 @@ def capture_identity(campaign, probe, mode, ctx, spec_file):
             "wrapper_sha256": sha256_file(HERE.parent / "linear_transfer" / "collect_v2.py"),
             "capture_spec": None if spec_file is None else collect_v2.read_capture_spec(spec_file),
             "settings": {"ctx": ctx, "batch": CAPTURE_BATCH, "threads": CAPTURE_THREADS,
-                         "device": "vulkan" if mode == "collect" else "cpu"}}
+                         "device": device}}
 
 
 def adopt_chunk(directory, docs, expected):
@@ -1323,22 +1488,26 @@ def remove_chunks(out, start):
 
 def stage_capture(campaign, args):
     spec = campaign.spec()
-    mode = capture_mode(spec.architecture)
-    probe = PROBE_VULKAN if mode == "collect" else PROBE_CPU
+    mode, device = capture_mode(spec.architecture), capture_device(spec.architecture)
+    probe = PROBE_VULKAN if device == "vulkan" else PROBE_CPU
     documents = json.loads(campaign.path("render", "tokens.json").read_text(encoding="utf-8"))["documents"]
     tokens_of = {d["document_id"]: d["tokens"] for d in documents}
     smoke = ((campaign.state.get("catalog") or {}).get("smoke") or {}).get("prefill_tps")
-    tps = args.capture_tps or (smoke * CAPTURE_SPEED[mode] if smoke else None)
+    tps = args.capture_tps or (smoke * CAPTURE_SPEED[mode, device] if smoke else None)
     if not tps:
         raise StageError(f"no prefill speed for {campaign.name} in the catalog: give --capture-tps")
     per_token, peak = bytes_per_token(spec), PEAK_FACTOR[mode]
     budget_bytes, budget_seconds = int(args.budget_gb * 10 ** 9), args.budget_minutes * 60
     chunk_tokens = chunk_tokens_for(min(budget_bytes // per_token, (budget_seconds - LOAD_SECONDS) * tps))
-    plan = capture_plan(documents, bytes_per_token=per_token, tokens_per_second=tps, budget_bytes=budget_bytes,
-                        budget_seconds=budget_seconds, reserve_tokens=(peak - 1) * chunk_tokens)
+    try:
+        plan = capture_plan(documents, bytes_per_token=per_token, tokens_per_second=tps, budget_bytes=budget_bytes,
+                            budget_seconds=budget_seconds, reserve_tokens=(peak - 1) * chunk_tokens)
+    except ValueError as error:
+        raise StageError(f"{error}: {held_out_need(documents, bytes_per_token=per_token, tokens_per_second=tps)}") \
+            from None
     hard_limit = HARD_FACTOR * budget_seconds
-    plan.update(mode=mode, probe=str(probe), bytes_per_token=per_token, tokens_per_second=round(tps, 1),
-                speed_source="--capture-tps" if args.capture_tps else f"catalog smoke {smoke} x {CAPTURE_SPEED[mode]}",
+    plan.update(mode=mode, device=device, probe=str(probe), bytes_per_token=per_token, tokens_per_second=round(tps, 1),
+                speed_source="--capture-tps" if args.capture_tps else f"catalog smoke {smoke} x {CAPTURE_SPEED[mode, device]}",
                 attention_layers=[l for l in spec.attention_layers if spec.layer_types[l] != "nextn"],
                 budget_gb=args.budget_gb, budget_minutes=args.budget_minutes, chunk_tokens=chunk_tokens,
                 peak_factor=peak, hard_limit_seconds=hard_limit)
@@ -1357,7 +1526,7 @@ def stage_capture(campaign, args):
 
     def identity(ctx):
         if ctx not in identities:
-            identities[ctx] = capture_identity(campaign, probe, mode, ctx, spec_file)
+            identities[ctx] = capture_identity(campaign, probe, mode, ctx, spec_file, device)
         return identities[ctx]
     pending, chunks, dropped = list(plan["order"]), [], []
     probe_seconds = waited = 0.0
@@ -1407,12 +1576,14 @@ def stage_capture(campaign, args):
                 "--ctx", ctx, "--batch", CAPTURE_BATCH, "--threads", CAPTURE_THREADS, "--chat-template",
                 campaign.path("render", "template.jinja"), "--hash-cache", CAMPAIGN_DIR / "model-hashes.json"]
         if mode == "collect":
-            argv += ["--capture-spec", spec_file, "--device", "vulkan"]
+            argv += ["--capture-spec", spec_file]
+        if device == "vulkan":
+            argv += ["--device", "vulkan"]
         commands_before = len(campaign.stage("capture").get("commands", []))
         try:
             seconds = campaign.run(argv, stage="capture", label=f"collect-{name}",
                                    memory_bytes=campaign.gguf.stat().st_size, cwd=HERE.parent / "linear_transfer",
-                                   timeout=max(60.0, hard_limit - probe_seconds))
+                                   timeout=max(60.0, hard_limit - probe_seconds), cpu=device == "cpu")
         except CommandTimeout:
             remove_chunks(out, index)
             if index == 0:
@@ -1444,7 +1615,7 @@ def stage_capture(campaign, args):
     speed = rows / probe_seconds if probe_seconds > 0 else None
     return {"captures": [str(out / chunk["name"]) for chunk in chunks], "chunks": chunks, "documents": len(captured),
             "tokens": captured_tokens, "rows": rows, "bytes": rows * per_token, "limit": limit, "dropped": len(dropped),
-            "mode": mode, "probe": str(probe), "probe_seconds": round(probe_seconds, 1), "waited_s": round(waited, 1),
+            "mode": mode, "device": device, "probe": str(probe), "probe_seconds": round(probe_seconds, 1), "waited_s": round(waited, 1),
             "tokens_per_second": None if speed is None else round(speed, 1),
             "speed_share_of_smoke": None if speed is None or not smoke else round(speed / smoke, 3),
             "adopted": bool(chunks) and all(chunk["adopted"] for chunk in chunks),
@@ -1467,11 +1638,22 @@ def own_files(directory, name):
     return out
 
 
+def fit_python(environ=None):
+    """The Python fit_hub.py runs with: $KVPARK_FIT_PYTHON, else FIT_PYTHON (torch with ROCm) when it exists,
+    else the experiment venv (no torch: fit_hub's --fit-device auto then fits on the CPU)."""
+    named = (os.environ if environ is None else environ).get("KVPARK_FIT_PYTHON")
+    if named:
+        return Path(named)
+    return FIT_PYTHON if FIT_PYTHON.is_file() else PYTHON
+
+
 def stage_onboard(campaign, args):
     spec = campaign.spec()
     base = json.loads((BASE_HUB / "manifest.json").read_text(encoding="utf-8"))
     settings = base["settings"]
-    argv = [PYTHON, HERE / "fit_hub.py", "--base", BASE_HUB, "--link-base", "--evaluate", "new",
+    python = fit_python()
+    argv = [python, HERE / "fit_hub.py", "--base", BASE_HUB, "--link-base", "--evaluate", "new",
+            "--onboard-encoder", ONBOARD_ENCODER, "--fit-device", "auto",
             "--model", model_argument(campaign.name, campaign.captures(), campaign.path("render", "records.jsonl"))]
     for name, captures, records in base_models():
         argv += ["--model", model_argument(name, captures, records)]
@@ -1481,24 +1663,120 @@ def stage_onboard(campaign, args):
         argv += ["--source-global", campaign.name]
     if spec.indexer is not None:
         argv += ["--indexer-ridge", campaign.name]
-    fit_seconds = campaign.run(argv, stage="onboard", label="fit_hub", env={"OPENBLAS_NUM_THREADS": "16"},
+    fit_seconds = campaign.run(argv, stage="onboard", label="fit_hub", cpu=True,
                                memory_bytes=hub_bytes(BASE_HUB) + fit_hub_extra(
                                    spec, settings["layer_rank"], dev_spans=base["spans"]["dev"],
                                    pivots=len(base_models()), hub_dim=settings["hub_dim"]))
     convert_seconds = campaign.run([PYTHON, HERE / "convert_hub.py", campaign.path("hub"), campaign.path("hub-v2"),
                                     "--reuse", BASE_HUB_V2], stage="onboard", label="convert_hub")
+    return {**onboard_result(campaign, ONBOARD_ENCODER, python), "source_global": sliding(spec),
+            "fit_seconds": round(fit_seconds, 1), "convert_seconds": round(convert_seconds, 1)}
+
+
+def onboard_result(campaign, encoder, python):
+    """The onboard stage's result from its bundles and fit_hub's log: spans, held-out R^2 per kind against
+    each pivot, the decoders' alphas, the encoder, where the fit ran, and the sha256 of the model's files."""
     evaluation = json.loads(campaign.path("hub", "evaluation.json").read_text(encoding="utf-8"))
     log = [json.loads(line) for line in campaign.path("hub.log.jsonl").read_text(encoding="utf-8").splitlines()]
     spans = next(item for item in log if item.get("stage") == "spans")
     r2 = {kind: {pair: round(item["r2"], 4) for pair, item in evaluation[kind].items()} for kind in ("k", "v")}
     alphas = {item["kind"]: {"alpha": item["alpha"], "dev_r2": item["dev_r2"]} for item in log
               if item.get("stage") == "onboard"}
+    backend = next((item for item in log if item.get("stage") == "fit-backend-done"), {})
+    manifest = campaign.path("hub", "manifest.json")
+    settings = (json.loads(manifest.read_text(encoding="utf-8")).get("settings") or {}) if manifest.is_file() else {}
+    # the encoders' train diagnostics (hub.solve_onboard_encoder): per kind and transform, the last fit's
+    encoder_stats = {}
+    for item in log:
+        if item.get("stage") == "onboard-encoder":
+            encoder_stats.setdefault(item["kind"], {})[item["transform"]] = {
+                key: value for key, value in item.items() if key not in ("stage", "kind", "model", "transform")}
     return {"spans": spans["spans"], "documents": spans["documents"], "rejected": spans["rejected"],
             "r2": r2, "alphas": alphas, "pivots": [name for name, _, _ in base_models()],
-            "source_global": sliding(spec), "fit_seconds": round(fit_seconds, 1),
-            "convert_seconds": round(convert_seconds, 1),
+            "encoder": encoder, "variance_cap": settings.get("onboard_variance_cap"),
+            "encoder_stats": encoder_stats or None, "warnings": [item["warning"] for item in log
+                                                                 if item.get("stage") == "onboard-warning"],
+            "fit_python": str(python), "fit_device": backend.get("device"),
             "files": {"hub": own_files(campaign.path("hub"), campaign.name),
                       "hub-v2": own_files(campaign.path("hub-v2"), campaign.name)}}
+
+
+REENCODE_EXTRA = 2 * GIB        # a re-encode's statistics beyond FIT_HUB_BASE and the bundle it loads
+OUTDATED = "outdated"           # a stage status: not done, its finished parts kept (no stale wipe)
+
+
+def reencode(campaign, encoder=None, *, stamp=None):
+    """Fit the onboarded model's encoder again with `encoder` (default ONBOARD_ENCODER; fit_hub.py --reencode:
+    its view transforms and decoders stay exactly as they are) into hub/ and hub-v2/, under the GPU/memory
+    and CPU locks and the guard. The previous bundles, fit log and the evaluation runs out of the model
+    (the only ones whose translations change) move to history/onboard-<encoder>-<stamp>/; evaluate and
+    report become "outdated": the next `run` evaluates the directions out of the model again, keeps the
+    runs into it (kept_run: the same command; their hub sides are unchanged), and reports. Assembled
+    hubs keep the old adapters (`status` flags them). Returns the onboard stage's new result."""
+    encoder = encoder or ONBOARD_ENCODER
+    import hub
+    if encoder not in hub.ONBOARD_ENCODERS:
+        raise SystemExit(f"unknown onboarding encoder {encoder} (one of {', '.join(hub.ONBOARD_ENCODERS)})")
+    onboard = campaign.state["stages"].get("onboard", {})
+    if onboard.get("status") != "done":
+        raise SystemExit(f"{campaign.name} is not onboarded (campaign.py run --name {campaign.name})")
+    previous = (onboard.get("result") or {}).get("encoder") or "ridge"
+    # an encoder fitted before the reverse family's variance cap existed records none: fitting it again with the
+    # cap is a change (it is bit-identical where the cap does not bind)
+    capped = encoder in ("reverse", "reverse_z")
+    previous_cap = (onboard.get("result") or {}).get("variance_cap") if capped else None
+    if previous == encoder and previous_cap == (hub.ONBOARD_VARIANCE_CAP if capped else None):
+        raise SystemExit(f"{campaign.name}'s encoder is already {encoder}")
+    new, new_v2 = campaign.path("hub.reencode"), campaign.path("hub-v2.reencode")
+    for leftover in (new, new_v2, campaign.path("hub.reencode.log.jsonl"), campaign.path("hub.reencode.guard.jsonl")):
+        if leftover.is_dir():
+            shutil.rmtree(leftover)
+        elif leftover.exists():
+            leftover.unlink()
+    python = fit_python()
+    argv = [python, HERE / "fit_hub.py", "--base", campaign.path("hub"), "--reencode", "--link-base", "--evaluate", "new",
+            "--onboard-encoder", encoder, "--fit-device", "auto",
+            "--model", model_argument(campaign.name, campaign.captures(), campaign.path("render", "records.jsonl"))]
+    for name, captures, records in base_models():
+        argv += ["--model", model_argument(name, captures, records)]
+    argv += ["--output", new]
+    entry = onboard.setdefault("reencoded", [])
+    fit_seconds = campaign.run(argv, stage="onboard", label=f"fit_hub-reencode-{encoder}", cpu=True,
+                               memory_bytes=hub_bytes(campaign.path("hub")) + FIT_HUB_BASE + REENCODE_EXTRA)
+    convert_seconds = campaign.run([PYTHON, HERE / "convert_hub.py", new, new_v2, "--reuse", BASE_HUB_V2],
+                                   stage="onboard", label=f"convert_hub-reencode-{encoder}")
+    history = campaign.path("history", f"onboard-{previous}-{stamp or time.strftime('%Y%m%dT%H%M%S')}")
+    history.mkdir(parents=True)
+    moved = []
+    for name in ("hub", "hub-v2", "hub.log.jsonl", "hub.guard.jsonl"):
+        if campaign.path(name).exists():
+            campaign.path(name).rename(history / name)
+            moved.append(name)
+    out_of = [p for p in campaign.path("eval").glob(f"{campaign.name}-to-*")] if campaign.path("eval").is_dir() else []
+    if out_of:
+        (history / "eval").mkdir()
+        for path in out_of:
+            path.rename(history / "eval" / path.name)
+            moved.append(f"eval/{path.name}")
+    new.rename(campaign.path("hub"))
+    new_v2.rename(campaign.path("hub-v2"))
+    for suffix in ("log.jsonl", "guard.jsonl"):
+        if campaign.path(f"hub.reencode.{suffix}").exists():
+            campaign.path(f"hub.reencode.{suffix}").rename(campaign.path(f"hub.{suffix}"))
+    record = {"from": previous, "to": encoder, "at": now(), "history": str(history), "moved": moved,
+              "fit_seconds": round(fit_seconds, 1), "convert_seconds": round(convert_seconds, 1)}
+    entry.append(record)
+    result = {**onboard.get("result"), **onboard_result(campaign, encoder, python),
+              "alphas": (onboard.get("result") or {}).get("alphas")}     # the decoders are the onboarding's
+    onboard["result"] = result
+    for stage in ("evaluate", "report"):
+        item = campaign.state["stages"].get(stage)
+        if item and item.get("status") == "done":
+            item.update(status=OUTDATED, reason=f"the encoder was fitted again ({previous} -> {encoder}): "
+                                                "the directions out of the model run again")
+    campaign.save()
+    campaign.log({"event": "reencoded", "from": previous, "to": encoder, "history": str(history), "moved": moved})
+    return result
 
 
 def stage_tables(campaign, args):
@@ -1507,8 +1785,7 @@ def stage_tables(campaign, args):
     for name, captures, records in base_models():
         argv += ["--model", model_argument(name, captures, records)]
     argv += ["--output", campaign.path("token-tables"), "--only", campaign.name]
-    campaign.run(argv, stage="tables", label="token_tables", env={"OPENBLAS_NUM_THREADS": "16"},
-                 memory_bytes=TABLES_MEMORY)
+    campaign.run(argv, stage="tables", label="token_tables", memory_bytes=TABLES_MEMORY, cpu=True)
     path = campaign.path("token-tables", f"{campaign.name}.npz")
     with np.load(path, allow_pickle=False) as npz:
         unique = int(len(npz["token_id"]))
@@ -1521,7 +1798,7 @@ def stage_recurrent(campaign, args):
     for corpus in reversed(HUB_CORPUS):
         argv += ["--corpus", corpus]
     argv += ["--probe", PROBE_VULKAN, "--output", campaign.path("recurrent")]
-    campaign.run(argv, stage="recurrent", label="calibrate", memory_bytes=campaign.gguf.stat().st_size)
+    campaign.run(argv, stage="recurrent", label="calibrate", memory_bytes=campaign.gguf.stat().st_size, cpu=True)
     report = json.loads(campaign.path("recurrent", "report.json").read_text(encoding="utf-8"))
     return {"npz": report["npz"], "npz_bytes": report["npz_bytes"], "documents": report["documents"],
             "saves": report["saves"], "probe_seconds": report["probe_seconds"],
@@ -1559,7 +1836,7 @@ def eval_argv(source, target, output, *, hub, tables, recurrent, fixed=True, ser
         argv += ["--limit", LONG_LIMIT, "--min-prefix", LONG_MIN_PREFIX]
     argv += ["--max-prefix", EVAL_PREFIX[1], "--hub", hub, "--source", f"{source[0]}={source[1]}",
              "--target", f"{target[0]}={target[1]}", "--probe", PROBE_VULKAN, "--tables", tables,
-             "--output", output, *recurrent] + (["--server-render"] if server_render else [])
+             "--output", output, *recurrent] + (["--server-render"] if server_render else []) + ["--resume"]
     return [str(item) for item in argv]
 
 
@@ -1572,8 +1849,14 @@ def server_renders_differently(render_result):
     return bool(differing) and all(item.get("reproduced") and item.get("context") == "server" for item in differing)
 
 
+RESULT_NEUTRAL = ("--resume",)       # pair_eval flags that do not change a run's results
+
+
 def command_digest(argv):
-    return hashlib.sha256(json.dumps([str(item) for item in argv]).encode("utf-8")).hexdigest()
+    """sha256 of a command, without the flags that do not change its results (a run made before pair_eval
+    had --resume is the same run)."""
+    kept = [str(item) for item in argv if str(item) not in RESULT_NEUTRAL]
+    return hashlib.sha256(json.dumps(kept).encode("utf-8")).hexdigest()
 
 
 def kept_run(output, argv):
@@ -1585,16 +1868,21 @@ def kept_run(output, argv):
 
 
 def run_evaluation(campaign, label, argv, output, memory_bytes):
-    """pair_eval into `output`, unless it holds a finished run of this very command."""
+    """pair_eval into `output`, unless it holds a finished run of this very command; an unfinished run of
+    this command (the guard stopped it) continues (pair_eval --resume), any other output is removed."""
     output = Path(output)
     if kept_run(output, argv):
         campaign.log({"event": "evaluation-kept", "run": label})
         return
     record = output.with_name(output.name + ".command.json")
-    if output.exists():
+    same = record.is_file() and json.loads(record.read_text(encoding="utf-8")).get("sha256") == command_digest(argv)
+    if output.exists() and not same:
         shutil.rmtree(output)
+    if same and output.exists():
+        campaign.log({"event": "evaluation-resumed", "run": label})
     write_json(record, {"argv": argv, "sha256": command_digest(argv), "written": now()})
-    campaign.run(argv, stage="evaluate", label=f"pair_eval-{label}", memory_bytes=memory_bytes)
+    campaign.run(argv, stage="evaluate", label=f"pair_eval-{label}", memory_bytes=memory_bytes, cpu=True,
+                 gpu_evaluation=True)
 
 
 def baseline_label():
@@ -1612,7 +1900,8 @@ def run_baseline(campaign):
     with open(BASELINE_DIR / ".lock", "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         run_evaluation(campaign, f"baseline-{baseline_label()}", argv, output,
-                       max(BASELINE_GGUF.stat().st_size, REFERENCE_GGUF.stat().st_size) + hub_bytes(BASE_HUB_V2))
+                       max(BASELINE_GGUF.stat().st_size, REFERENCE_GGUF.stat().st_size)
+                       + sides_bytes(BASE_HUB_V2, BASELINE_SOURCE, REFERENCE))
     return output
 
 
@@ -1630,8 +1919,9 @@ def stage_evaluate(campaign, args):
             label += variant
             tables = campaign.path("token-tables") if into_new else REFERENCE_TABLES
             recurrent = target_recurrent(campaign, into_new)
-            # the larger model (the probe runs one at a time) and the hub, which pair_eval holds whole
-            memory = max(Path(s_gguf).stat().st_size, Path(t_gguf).stat().st_size) + hub_bytes(campaign.path("hub-v2"))
+            # the larger model (the probe runs one at a time) and the two hub sides pair_eval reads
+            memory = (max(Path(s_gguf).stat().st_size, Path(t_gguf).stat().st_size)
+                      + sides_bytes(campaign.path("hub-v2"), s_name, t_name))
             argv = eval_argv((s_name, s_gguf), (t_name, t_gguf), out / label, hub=campaign.path("hub-v2"),
                              tables=tables, recurrent=recurrent, server_render=bool(variant))
             run_evaluation(campaign, label, argv, out / label, memory)
@@ -1710,7 +2000,9 @@ def stage_report(campaign, args):
               "render": stages["render"]["result"], "capture": stages["capture"]["result"],
               "capture_plan": {k: v for k, v in json.loads(campaign.path("capture-plan.json").read_text(
                   encoding="utf-8")).items() if k not in ("documents", "order", "held_out")},
-              "onboard": stages["onboard"]["result"], "tables": stages["tables"]["result"],
+              "onboard": {**stages["onboard"]["result"],
+                          "reencoded": stages["onboard"].get("reencoded") or stages["onboard"]["result"].get("reencoded")},
+              "tables": stages["tables"]["result"],
               "recurrent": recurrent.get("result"), "recurrent_status": recurrent.get("status"),
               "evaluate": evaluation, "directions": summary, "baseline": baseline,
               "notes": ["Floors into Qwen3.8 here start its recurrent cell from its recurrent mean (calibrated with "
@@ -1771,6 +2063,25 @@ def direction_markdown(item):
     return lines
 
 
+def encoder_stats_markdown(stats, warnings=None):
+    """One sentence of the encoders' train diagnostics (onboard_result's encoder_stats) and any warnings."""
+    if not stats:
+        return ""
+    parts = []
+    for kind in sorted(stats):
+        for key, item in sorted(stats[kind].items()):
+            text = (f"{kind.upper()}{'' if key == 'full' else ' (layer subset)'}: per-dimension train R² from "
+                    f"{item['min_r2']:.3f} (median {item['median_r2']:.3f}), variance {item['min_ratio']:.2f}-"
+                    f"{item['max_ratio']:.2f}x the pivots' estimates'")
+            if item.get("capped"):
+                text += f", {item['capped']} dimension(s) capped"
+            parts.append(text)
+    out = " " + "; ".join(parts) + "."
+    if warnings:
+        out += " **Warnings:** " + "; ".join(warnings) + "."
+    return out
+
+
 def report_markdown(report):
     """The report as markdown: stages, render and capture, R^2, end-to-end tables, the comparison
     with the baseline source, the recurrent cell, settings and notes."""
@@ -1826,7 +2137,11 @@ def report_markdown(report):
     lines += ["", "## Onboarding (held-out R², test spans)", "",
               f"Pivots {', '.join(onboard['pivots'])}; spans train {onboard['spans']['train']:,}, dev "
               f"{onboard['spans']['dev']:,}, test {onboard['spans']['test']:,} ({onboard['documents']} documents, "
-              f"{onboard['rejected']} rejected).", "",
+              f"{onboard['rejected']} rejected). Encoder `{onboard.get('encoder') or 'ridge'}`"
+              + (f" (variance cap {onboard['variance_cap']:g})" if onboard.get("variance_cap") else "")
+              + "".join(f"; fitted again from `{item['from']}` on {item['at'][:10]} (campaign.py reencode: the "
+                        "transforms and decoders are the onboarding's)" for item in onboard.get("reencoded") or [])
+              + "." + encoder_stats_markdown(onboard.get("encoder_stats"), onboard.get("warnings")), "",
               "| Pair | K R² | V R² |", "| --- | ---: | ---: |"]
     for pair in onboard["r2"]["k"]:
         lines.append(f"| {pair} | {onboard['r2']['k'][pair]:.3f} | {onboard['r2']['v'][pair]:.3f} |")
@@ -1948,10 +2263,7 @@ def clean_outputs(campaign, stage, *, redo):
         if not redo and stage == "capture" and name == "capture":
             continue
         if not redo and stage == "evaluate":
-            for part in path.iterdir():
-                if part.is_dir() and not (part / "report.json").is_file():
-                    shutil.rmtree(part)
-            continue
+            continue        # finished runs are kept (kept_run), unfinished ones resume or start over (run_evaluation)
         if path.is_dir():
             shutil.rmtree(path)
         else:
@@ -2065,22 +2377,89 @@ def check_member(campaign):
     return campaign.path("hub"), campaign.path("hub-v2")
 
 
-def evaluate_onboarded(output, campaigns, log=print):
+def onboarded_evaluation(output, campaigns, log=print):
     """Held-out R^2 (test spans) of every ordered pair of the onboarded models in an assembled hub
-    (format 1), from their captures: they all captured the same dev and test documents. Runs under
-    the GPU/memory lock (the whole hub is loaded); returns {kind: {"a->b": {"r2", "rows"}}}."""
+    (format 1), from their captures: they all captured the same dev and test documents. Computed in this
+    process on the current fit backend (fit_backend.current()); `campaign.py evaluate-onboarded` runs it as
+    the watched child of evaluate_onboarded. Returns {"pairs", "spans", kind: {"a->b": {"r2", "rows"}}}."""
     import hub
     views = [hub.CaptureView(camp.name, camp.captures(), camp.path("render", "records.jsonl")) for camp in campaigns]
     spans = hub.joint_spans(views)
     names = [camp.name for camp in campaigns]
     pairs = [(a, b) for a in names for b in names if a != b]
-    with gpu_lock(hub_bytes(output), log, path=GPU_LOCK, poll=GPU_POLL_S, available=mem_available):
-        hubs, _ = hub.load_hub(output)
-        result = {kind: {f"{s}->{t}": {"r2": round(item["r2"], 4), "rows": item["rows"]}
-                         for (s, t), item in hub.evaluate(hubs[kind], views, spans, kind, pairs=pairs).items()}
-                  for kind in hub.KINDS}
+    hubs, _ = hub.load_hub(output)
+    result = {}
+    for kind in hub.KINDS:
+        started = time.perf_counter()
+        result[kind] = {f"{s}->{t}": {"r2": round(item["r2"], 4), "rows": item["rows"]}
+                        for (s, t), item in hub.evaluate(hubs[kind], views, spans, kind, pairs=pairs).items()}
+        log({"event": "evaluated", "kind": kind, "seconds": round(time.perf_counter() - started, 1)})
     return {"pairs": [f"{a}->{b}" for a, b in pairs],
             "spans": {split: int(len(spans.select(split))) for split in ("train", "dev", "test")}, **result}
+
+
+def evaluate_onboarded(output, campaigns, log=print, *, campaign_dir=CAMPAIGN_DIR, python=None):
+    """onboarded_evaluation of an assembled hub as a child process, `campaign.py evaluate-onboarded` with
+    fit_python() (its products on the GPU, --fit-device auto), under the GPU/memory lock (the whole hub is
+    loaded), the CPU lock and the resource guard with the GPU-evaluation defaults (resource_guard.GPU_EVALUATION),
+    whose Watch can stop the child's process group at any moment (evaluating in this process on the CPU, a Guard
+    could pause only between chunks: on 2026-10-07 the package went from 82 C to 98 C within one). Its output in
+    output/evaluation-onboarded.log, guard samples in output/evaluation-onboarded.guard.jsonl. GuardStop when the
+    guard ended it, StageError when it failed; returns its result (onboarded_evaluation's)."""
+    output = Path(output)
+    result_path = output / "evaluation-onboarded.json"
+    argv = [str(python or fit_python()), str(HERE / "campaign.py"), "evaluate-onboarded", "--hub", str(output),
+            "--campaign-dir", str(campaign_dir), "--fit-device", "auto", *[camp.name for camp in campaigns]]
+    settings = resource_guard.Settings.from_env(defaults=resource_guard.GPU_EVALUATION)
+    environment = resource_guard.thread_env(os.environ, settings.threads)
+    guard_log = output / "evaluation-onboarded.guard.jsonl"
+    log_path = output / "evaluation-onboarded.log"
+    result_path.unlink(missing_ok=True)
+    with guarded_locks(hub_bytes(output), log, cpu=True, label="campaign assemble --evaluate") as (held, fds, extra):
+        log({"event": "command", "label": "evaluate-onboarded", "command": shlex.join(argv)})
+        with open(log_path, "a", encoding="utf-8") as stream:
+            outcome = guarded_child(argv, settings=settings, guard_log=guard_log, label="assemble-evaluate", events=log,
+                                    environment={**environment, **extra}, cwd=HERE, output=stream, keep_fds=fds)
+    log({"event": "command-done", "label": "evaluate-onboarded", "returncode": outcome.returncode,
+         "seconds": round(outcome.seconds, 1), "paused_s": outcome.paused_s, "guard_abort": outcome.aborted})
+    if outcome.aborted:
+        raise GuardStop(f"the evaluation of {output} was ended by the resource guard: {outcome.aborted} (samples "
+                        f"in {guard_log}); run it again: campaign.py evaluate-onboarded --hub {output} "
+                        + " ".join(camp.name for camp in campaigns))
+    if outcome.returncode != 0 or not result_path.is_file():
+        tail = log_path.read_text(encoding="utf-8", errors="replace")[-3000:] if log_path.is_file() else ""
+        raise StageError(f"the evaluation of {output} exited with {outcome.returncode}; the end of its log:\n{tail}")
+    return json.loads(result_path.read_text(encoding="utf-8"))
+
+
+def evaluate_onboarded_command(args):
+    """`campaign.py evaluate-onboarded --hub DIR NAME ...`: held-out R^2 between the onboarded models of an
+    assembled hub -> DIR/evaluation-onboarded.json. Run by hand it is evaluate_onboarded (the locks and a watched
+    child); as that child (KVPARK_GUARD_WATCHED: also under `campaign.py exec`) onboarded_evaluation on the fit
+    backend of --fit-device."""
+    import fit_backend
+    campaigns = []
+    for name in args.names:
+        if not (Path(args.campaign_dir) / name / "state.json").is_file():
+            raise SystemExit(f"{name} has no campaign in {args.campaign_dir}")
+        campaigns.append(Campaign(name, directory=Path(args.campaign_dir) / name, catalog=None))
+
+    def log(item):
+        print(json.dumps({"time": now(), **item}), flush=True)
+    if os.environ.get(resource_guard.WATCHED) != "1":
+        try:
+            evaluate_onboarded(args.hub, campaigns, log=log, campaign_dir=args.campaign_dir)
+        except (StageError, resource_guard.GuardError) as error:
+            raise SystemExit(f"evaluate-onboarded: {error}") from None
+        return 0
+    device = fit_backend.resolve(args.fit_device)
+    with fit_backend.using(fit_backend.make(device, log=lambda line: log({"event": "fit-backend", "line": line}))) \
+            as backend:
+        log({"event": "fit-backend", "device": device})
+        result = onboarded_evaluation(args.hub, campaigns, log=log)
+        log({"event": "fit-backend-done", "device": device, **backend.stats()})
+    write_json(Path(args.hub) / "evaluation-onboarded.json", {**result, "fit_device": device})
+    return 0
 
 
 def assemble(output, names, *, evaluate=False, base=BASE_HUB, base_v2=BASE_HUB_V2, campaign_dir=CAMPAIGN_DIR,
@@ -2089,7 +2468,7 @@ def assemble(output, names, *, evaluate=False, base=BASE_HUB, base_v2=BASE_HUB_V
     members' filesystem), recorded in each model's assembled.json; no run of a member may be active.
     evaluate: also R^2 between the onboarded models -> output/evaluation-onboarded.json."""
     import hub
-    output = Path(output).absolute()
+    output = Path(os.path.normpath(Path(output).absolute()))
     output_v2 = output.with_name(output.name + "-v2")
     for path in (output, output_v2):
         if path.exists():
@@ -2118,8 +2497,7 @@ def assemble(output, names, *, evaluate=False, base=BASE_HUB, base_v2=BASE_HUB_V
             if len(campaigns) < 2:
                 result["evaluation"] = "one onboarded model: its pairs with the base are in its hub/evaluation.json"
             else:
-                evaluation = evaluate_onboarded(output, campaigns, log=lambda item: log(json.dumps(item)))
-                write_json(output / "evaluation-onboarded.json", evaluation)
+                evaluate_onboarded(output, campaigns, log=lambda item: log(json.dumps(item)), campaign_dir=campaign_dir)
                 result["evaluation"] = str(output / "evaluation-onboarded.json")
     return result
 
@@ -2138,19 +2516,26 @@ def show_plan(campaign, args):
         out["todo_error"] = str(error)
     spec = campaign.spec()
     out["capture_mode"] = mode = capture_mode(spec.architecture)
+    out["capture_device"] = device = capture_device(spec.architecture)
     out["bytes_per_token"] = per_token = bytes_per_token(spec)
     tokens_path = campaign.path("render", "tokens.json")
     if tokens_path.is_file():
         smoke = ((campaign.state.get("catalog") or {}).get("smoke") or {}).get("prefill_tps")
-        tps = args.capture_tps or (smoke * CAPTURE_SPEED[mode] if smoke else None)
+        tps = args.capture_tps or (smoke * CAPTURE_SPEED[mode, device] if smoke else None)
         if tps:
             budget_bytes, budget_seconds = int(args.budget_gb * 10 ** 9), args.budget_minutes * 60
             chunk_tokens = chunk_tokens_for(min(budget_bytes // per_token, (budget_seconds - LOAD_SECONDS) * tps))
-            plan = capture_plan(json.loads(tokens_path.read_text(encoding="utf-8"))["documents"],
-                                bytes_per_token=per_token, tokens_per_second=tps, budget_bytes=budget_bytes,
-                                budget_seconds=budget_seconds, reserve_tokens=(PEAK_FACTOR[mode] - 1) * chunk_tokens)
-            out["capture_plan"] = {k: v for k, v in plan.items() if k not in ("documents", "order", "held_out")}
-            out["capture_plan"].update(documents=len(plan["documents"]), chunk_tokens=chunk_tokens)
+            documents = json.loads(tokens_path.read_text(encoding="utf-8"))["documents"]
+            try:
+                plan = capture_plan(documents, bytes_per_token=per_token, tokens_per_second=tps,
+                                    budget_bytes=budget_bytes, budget_seconds=budget_seconds,
+                                    reserve_tokens=(PEAK_FACTOR[mode] - 1) * chunk_tokens)
+            except ValueError as error:
+                out["capture_plan_error"] = (f"{error}: "
+                                             f"{held_out_need(documents, bytes_per_token=per_token, tokens_per_second=tps)}")
+            else:
+                out["capture_plan"] = {k: v for k, v in plan.items() if k not in ("documents", "order", "held_out")}
+                out["capture_plan"].update(documents=len(plan["documents"]), chunk_tokens=chunk_tokens)
     out["memory_need_gib"] = round((campaign.gguf.stat().st_size + GPU_MARGIN) / GIB, 1)
     print(json.dumps(out, indent=1))
 
@@ -2176,7 +2561,9 @@ def show_status(names):
 
 
 def exec_command(args):
-    """`campaign.py exec`: one command under the GPU/memory lock, which it inherits; its exit status."""
+    """`campaign.py exec`: one command under the GPU/memory lock (and the CPU lock, --cpu-lock), which
+    it inherits, and the resource guard (--guard-log: its samples); its exit status
+    (resource_guard.ABORT_EXIT when the guard ended it)."""
     command = list(args.argv)
     if command[:1] == ["--"]:
         command = command[1:]
@@ -2185,11 +2572,17 @@ def exec_command(args):
 
     def log(item):
         print(json.dumps({"time": now(), **item}), file=sys.stderr, flush=True)
-    with gpu_lock(args.memory_bytes, log, path=GPU_LOCK, poll=GPU_POLL_S, available=mem_available) as held:
-        outcome = run_child(command, keep_fds=(held.stream.fileno(),), timeout=args.timeout)
+    settings = resource_guard.Settings.from_env(defaults=resource_guard.GPU_EVALUATION if args.gpu_evaluation else None)
+    environment = resource_guard.thread_env(os.environ, settings.threads)
+    with guarded_locks(args.memory_bytes, log, cpu=args.cpu_lock, label="campaign exec") as (held, fds, extra):
+        outcome = guarded_child(command, settings=settings, guard_log=args.guard_log, label="exec", events=log,
+                                environment={**environment, **extra}, keep_fds=fds, timeout=args.timeout)
     log({"event": "exec-done", "returncode": outcome.returncode, "seconds": round(outcome.seconds, 1),
          "timed_out": outcome.timed_out, "max_rss_gib": None if outcome.max_rss is None else round(outcome.max_rss / GIB, 2),
-         "max_anon_gib": round(outcome.max_anon / GIB, 2)})
+         "max_anon_gib": round(outcome.max_anon / GIB, 2), "paused_s": outcome.paused_s,
+         "guard_abort": outcome.aborted})
+    if outcome.aborted:
+        return resource_guard.ABORT_EXIT
     if outcome.timed_out:
         return 124
     return outcome.returncode if outcome.returncode >= 0 else 128 - outcome.returncode
@@ -2217,20 +2610,59 @@ def main(argv=None):
     sub.add_argument("--output", type=Path, required=True)
     sub.add_argument("--evaluate", action="store_true", help="also R^2 between the onboarded models (loads the hub)")
     sub.add_argument("names", nargs="+")
+    sub = commands.add_parser("reencode", help="fit onboarded models' encoders again with another method")
+    sub.add_argument("--encoder", default=None, help=f"the onboarding encoder (default {ONBOARD_ENCODER})")
+    sub.add_argument("names", nargs="+")
+    sub = commands.add_parser("evaluate-onboarded", help="held-out R^2 between the onboarded models of an assembled "
+                              "hub (what assemble --evaluate runs: the locks, then a watched child on the GPU)")
+    sub.add_argument("--hub", type=Path, required=True, help="the assembled hub (format 1)")
+    sub.add_argument("--campaign-dir", type=Path, default=CAMPAIGN_DIR)
+    sub.add_argument("--fit-device", default="auto", choices=("auto", "cpu", "gpu"))
+    sub.add_argument("names", nargs="+")
     sub = commands.add_parser("exec", help="run one command under the GPU/memory lock (commands.sh uses it)")
     sub.add_argument("--memory-bytes", type=int, required=True, help="what the command loads")
     sub.add_argument("--timeout", type=float, help="stop the command's process group after this many seconds")
+    sub.add_argument("--cpu-lock", action="store_true", help="also hold the CPU lock (a CPU-heavy command)")
+    sub.add_argument("--gpu-evaluation", action="store_true",
+                     help="a GPU evaluation: the guard's defaults are resource_guard.GPU_EVALUATION (stop at 85 C, "
+                     "continue at 65 C, 4 threads) where KVPARK_GUARD_* do not set them")
+    sub.add_argument("--guard-log", type=Path, help="the resource guard's JSONL samples of the command")
     sub.add_argument("argv", nargs=argparse.REMAINDER, metavar="-- COMMAND ...")
     args = parser.parse_args(argv)
     if args.command == "status":
         show_status(args.names)
         return 0
+    if args.command == "evaluate-onboarded":
+        return evaluate_onboarded_command(args)
     signal.signal(signal.SIGTERM, _terminate)
     signal.signal(signal.SIGHUP, _terminate)
     if args.command == "exec":
-        return exec_command(args)
+        try:
+            return exec_command(args)
+        except resource_guard.GuardError as error:
+            raise SystemExit(f"exec: {error}") from None
     if args.command == "assemble":
-        print(json.dumps(assemble(args.output, args.names, evaluate=args.evaluate)))
+        try:
+            print(json.dumps(assemble(args.output, args.names, evaluate=args.evaluate)))
+        except (StageError, resource_guard.GuardError) as error:
+            raise SystemExit(f"assemble: {error}") from None
+        except Terminated as error:
+            raise SystemExit(f"assemble: stopped ({error})") from None
+        return 0
+    if args.command == "reencode":
+        for name in args.names:
+            if not (CAMPAIGN_DIR / name / "state.json").is_file():
+                raise SystemExit(f"{name} has no campaign in {CAMPAIGN_DIR}")
+            camp = Campaign(name, catalog=None)
+            with camp.exclusive():
+                try:
+                    result = reencode(camp, args.encoder)
+                except (StageError, resource_guard.GuardError) as error:
+                    raise SystemExit(f"{name}: {error}") from None
+                except Terminated as error:
+                    raise SystemExit(f"{name}: stopped ({error})") from None
+            print(json.dumps({"name": name, "encoder": result["encoder"], "r2": result["r2"]}))
+        show_status(args.names)
         return 0
     try:
         campaign = Campaign(args.name, gguf=args.gguf, catalog_id=args.catalog_id)
@@ -2244,7 +2676,7 @@ def main(argv=None):
         campaign.save()
         try:
             run_stages(campaign, args)
-        except StageError as error:
+        except (StageError, resource_guard.GuardError) as error:
             raise SystemExit(f"{campaign.name}: {error}") from None
         except Terminated as error:
             raise SystemExit(f"{campaign.name}: stopped ({error})") from None

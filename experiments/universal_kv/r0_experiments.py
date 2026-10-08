@@ -38,13 +38,20 @@ bounded; a finished chunk is skipped by --resume.
 Memory guard: before each probe run of a model file over 8 GB, MemAvailable must reach the
 model's size + 25 GB (polled every 60 s for up to 90 min; waits are logged). Probe runs are
 sequential, so one model is loaded at a time.
+
+Resource guard (resource_guard.py): BLAS threads and the probe's --threads are capped at 8; run by
+hand, every probe run waits until the CPU is at most 75 C and runs under a Watch (paused at 90 C,
+ended at 95 C on two samples in a row; samples in <output>/.../<step>.guard.jsonl); inside a campaign
+command (calibrate) the campaign's Watch covers the whole process group instead. --guard KEY=VALUE
+changes a setting.
 """
 
 import os
 
+import resource_guard
+
 if __name__ == "__main__":
-    for _name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
-        os.environ.setdefault(_name, "8")
+    resource_guard.cap_threads(os.environ)
 
 import argparse
 import hashlib
@@ -120,22 +127,25 @@ def wait_for_memory(model, log, *, margin=GUARD_MARGIN, poll=GUARD_POLL_S, limit
 
 
 def probe(args, artifacts, mode, model, records, output, *, extra=()):
-    """One kv_probe run (Vulkan, f16 cache, flash attention, batch 512) behind the memory guard;
-    returns (parsed report or results JSON, seconds)."""
+    """One kv_probe run (Vulkan, f16 cache, flash attention, batch 512, --threads the resource guard's
+    cap) behind the memory guard and under the resource guard (resource_guard.run: samples in
+    <output>.guard.jsonl); returns (parsed report or results JSON, seconds: guard pauses excluded)."""
+    guard = resource_guard.Settings.from_args(args)
     path = output.parent / (output.name + ".input.jsonl")
     path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records), encoding="utf-8")
     wait_for_memory(model, args.log)
     command = [str(args.probe), "--mode", mode, "--model", str(model), "--input", str(path), "--output", str(output),
-               "--ctx", str(args.ctx), "--batch", str(BATCH), "--threads", "16", "--cache-type", "f16",
+               "--ctx", str(args.ctx), "--batch", str(BATCH), "--threads", str(guard.threads), "--cache-type", "f16",
                "--flash-attn", "on", "--device", args.device, *extra]
-    started = time.perf_counter()
     log_line(args.log, {"event": "probe", "mode": mode, "model": Path(model).name, "documents": len(records),
                         "available_gib": round(mem_available() / GIB, 1), "load": os.getloadavg()[0]})
     with open(output.parent / (output.name + ".log"), "w") as stream:
-        subprocess.run(command, check=True, stdout=stream, stderr=subprocess.STDOUT,
-                       env=collect_v2.probe_environment(artifacts))
-    seconds = time.perf_counter() - started
-    log_line(args.log, {"event": "probe-done", "mode": mode, "seconds": round(seconds, 1)})
+        outcome = resource_guard.run(command, settings=guard, log_path=output.parent / (output.name + ".guard.jsonl"),
+                                     label=f"probe {mode} {Path(model).name}", stdout=stream,
+                                     stderr=subprocess.STDOUT, env=collect_v2.probe_environment(artifacts), check=True)
+    seconds = outcome.seconds
+    log_line(args.log, {"event": "probe-done", "mode": mode, "seconds": round(seconds, 1),
+                        "paused_s": outcome.paused_s, "cool_wait_s": round(outcome.cool_wait_s, 1)})
     return json.loads((output / ("report.json" if mode == "save-state" else "results.json")).read_text()), seconds
 
 
@@ -769,6 +779,7 @@ def main(argv=None):
         sub.add_argument("--ctx", type=int, default=32768)
         sub.add_argument("--chunk", type=int, default=3, help="documents per probe run")
         sub.add_argument("--output", type=Path, required=True)
+        resource_guard.add_arguments(sub)
         if resumable:
             sub.add_argument("--resume", action="store_true",
                              help="continue an output directory (finished chunks kept)")
@@ -818,8 +829,15 @@ def main(argv=None):
     sub.add_argument("--json", help="also write the summary JSON here")
     sub.set_defaults(func=summarize)
     args = parser.parse_args(argv)
+    try:
+        resource_guard.Settings.from_args(args)
+    except ValueError as error:
+        parser.error(str(error))
     return args.func(args)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except resource_guard.GuardError as error:
+        sys.exit(f"r0_experiments: {error}")

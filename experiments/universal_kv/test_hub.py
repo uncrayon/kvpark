@@ -175,6 +175,224 @@ class HubTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already in the hub"):
             hub.add_model_kind(base, views[2], views[:2], spans, "k", log=lambda line: None)
 
+    def test_onboarding_encoders_and_the_shrinkage_of_the_ridge(self):
+        # four noisy base views (canonical correlations well below 1: eigenvalues lambda < M) and a fifth to onboard
+        rng = np.random.default_rng(5)
+        n = 6000
+        latent = {kind: rng.standard_normal((n, 6)).astype(np.float32) for kind in hub.KINDS}
+        views = [FakeView(name, latent, dims, seed, noise=3.0) for name, dims, seed in
+                 (("a", [16, 16], 1), ("b", [8] * 4, 2), ("c", [24], 3), ("d", [12, 12], 4), ("e", [10, 10], 6))]
+        documents = n // 100
+        spans = hub.Spans([f"d{i}" for i in range(documents)], ["train"] * (documents - 10) + ["dev"] * 5 + ["test"] * 5,
+                          np.repeat(np.arange(documents), 100), {v.name: np.arange(n) for v in views})
+        quiet = lambda line: None  # noqa: E731
+        fitted = {}
+        for encoder in ("ridge", "consensus", "match", "cca"):
+            kind = hub.fit_hub_kind(views[:4], spans, "k", layer_rank=8, view_dim=12, hub_dim=6, chunk=1000, log=quiet)
+            hub.add_model_kind(kind, views[4], views[:4], spans, "k", layer_rank=8, view_dim=12, chunk=1000, log=quiet,
+                               encoder=encoder, consensus=["a", "b", "c", "d"])
+            self.assertEqual(kind.alphas["e"]["encoder"], encoder)
+            fitted[encoder] = kind
+        lam = fitted["ridge"].eigenvalues
+        self.assertTrue(np.all(lam < 3.9) and np.all(lam > 1.0))
+        rows = spans.select("test")
+        blocks = {layer: views[4].rows("k", layer, rows) for layer in views[4].layers("k")}
+        z = {encoder: kind.encode("e", blocks).astype(np.float64) for encoder, kind in fitted.items()}
+        var = {encoder: values.var(axis=0) for encoder, values in z.items()}
+        # the ridge regresses onto the mean of the pivots' estimates: in a MAXVAR hub the estimates of its M views
+        # sum to lambda Z, so (every pivot giving its full view) the ridge is the consensus encoder times lambda / M
+        ridge, consensus = fitted["ridge"].encoders["e"], fitted["consensus"].encoders["e"]
+        self.assertLess(np.abs(ridge - consensus * (lam / 4)).max() / np.abs(ridge).max(), 1e-3)
+        np.testing.assert_allclose(var["ridge"].sum() / var["consensus"].sum(), np.mean((lam / 4) ** 2), rtol=0.1)
+        pivot = fitted["ridge"].encode("a", {layer: views[0].rows("k", layer, rows) for layer in views[0].layers("k")})
+        self.assertGreater(var["match"].sum() / pivot.var(axis=0).sum(), 0.8)             # spread like a pivot
+        self.assertLess(var["ridge"].sum() / pivot.var(axis=0).sum(), 0.6)
+        self.assertGreater(var["cca"].sum(), var["consensus"].sum())                       # unit gain on every pair
+        r2 = {encoder: hub.evaluate(kind, views, spans, "k", pairs=[("e", "a"), ("a", "e")])
+              for encoder, kind in fitted.items()}
+        for encoder in fitted:
+            self.assertGreater(r2[encoder]["e", "a"]["r2"], 0.1, encoder)
+            self.assertEqual(r2[encoder]["a", "e"], r2["ridge"]["a", "e"])               # the decoder is the same
+        with self.assertRaisesRegex(ValueError, "every model the hub latent was fitted on"):
+            hub.add_model_kind(fitted["ridge"], FakeView("f", latent, [8], 7), views[:3], spans, "k", log=quiet,
+                               encoder="consensus", consensus=["a", "b", "c", "d"])
+        with self.assertRaisesRegex(ValueError, "needs the models the hub latent was fitted on"):
+            hub.add_model_kind(fitted["ridge"], FakeView("f", latent, [8], 7), views[:4], spans, "k", log=quiet,
+                               encoder="cca")
+        with self.assertRaisesRegex(ValueError, "unknown onboarding encoder"):
+            hub.add_model_kind(fitted["ridge"], FakeView("f", latent, [8], 7), views[:4], spans, "k", log=quiet,
+                               encoder="nope")
+
+    def test_reencoding_changes_only_the_encoders(self):
+        views, spans, _ = make_views()
+        quiet = lambda line: None  # noqa: E731
+        fits = {}
+        for encoder in ("ridge", "match"):
+            kind = hub.fit_hub_kind(views[:2], spans, "k", layer_rank=8, view_dim=12, hub_dim=6, chunk=1000, log=quiet)
+            hub.add_model_kind(kind, views[2], views[:2], spans, "k", layer_rank=8, view_dim=12, chunk=700, log=quiet,
+                               encoder=encoder, source_layers=[0])
+            fits[encoder] = kind
+        kind = fits["ridge"]
+        decoders = {name: [d.copy() for d in kind.decoders[name]] for name in kind.names}
+        transform, sub = kind.transforms["c"], kind.source_transforms["c"]
+        logs = []
+        hub.reencode_model_kind(kind, views[2], views[:2], spans, "k", encoder="match", chunk=700, log=logs.append)
+        for name in kind.names:                                          # every decoder exactly as it was
+            for before, after in zip(decoders[name], kind.decoders[name]):
+                np.testing.assert_array_equal(before, after)
+        self.assertIs(kind.transforms["c"], transform)
+        self.assertIs(kind.source_transforms["c"], sub)
+        # the same encoders as onboarding with that method (the same transforms and statistics)
+        np.testing.assert_allclose(kind.encoders["c"], fits["match"].encoders["c"], rtol=1e-4, atol=1e-5)
+        np.testing.assert_allclose(kind.source_encoders["c"], fits["match"].source_encoders["c"], rtol=1e-4, atol=1e-5)
+        self.assertEqual((kind.alphas["c"]["encoder"], kind.alphas["c"]["reencoded_from"]), ("match", "ridge"))
+        self.assertEqual(json.loads(logs[-1])["stage"], "reencode")
+        with self.assertRaisesRegex(ValueError, "not in the hub"):
+            stranger = FakeView("x", {k: np.zeros((3000, 6)) for k in hub.KINDS}, [4], 1)
+            hub.reencode_model_kind(kind, stranger, views[:2], spans, "k",
+                                    encoder="match")
+        with self.assertRaisesRegex(ValueError, "not other models"):
+            hub.reencode_model_kind(kind, views[2], views, spans, "k", encoder="match")
+
+    def test_onboarding_encoder_algebra(self):
+        rng = np.random.default_rng(3)
+        n, p, d = 20000, 8, 5
+        u = rng.standard_normal((n, p)) @ rng.standard_normal((p, p))
+        target = u @ rng.standard_normal((p, d)) * 0.3 + rng.standard_normal((n, d)) * np.arange(1, d + 1)
+        u, target = u - u.mean(axis=0), target - target.mean(axis=0)
+        cov_u, cross, target_cov = u.T @ u / n, u.T @ target / n, target.T @ target / n
+        pooled_var = np.linspace(0.5, 2.0, d)
+        solve = lambda method: hub.solve_onboard_encoder(method, cov_u, cross, target_cov, pooled_var,  # noqa: E731
+                                                         ridge=1e-9, variance_cap=0).astype(np.float64)
+        ridge = solve("ridge")
+        np.testing.assert_allclose(ridge, np.linalg.lstsq(u, target, rcond=None)[0], rtol=1e-4, atol=1e-5)
+        np.testing.assert_array_equal(solve("consensus"), ridge)          # the same solve; its target differs
+        variance = lambda weight: (u @ weight).var(axis=0)  # noqa: E731
+        np.testing.assert_allclose(variance(solve("match")), pooled_var, rtol=1e-4)
+        np.testing.assert_allclose(variance(solve("tls")), np.diag(target_cov), rtol=1e-4)
+        encoded = u @ ridge
+        slope = np.diag(target_cov) / np.einsum("ij,ij->j", encoded, target) * n
+        np.testing.assert_allclose(solve("reverse"), ridge * slope, rtol=1e-4)
+        np.testing.assert_array_equal(solve("reverse_z"), solve("reverse"))   # the same solve onto the consensus
+        # cca: every canonical pair at unit gain, so the encodings carry the target's covariance
+        cca = u @ solve("cca")
+        np.testing.assert_allclose(cca.T @ cca / n, target_cov, rtol=1e-3, atol=1e-3)
+        with self.assertRaisesRegex(ValueError, "unknown onboarding encoder"):
+            solve("nope")
+
+    def test_the_reverse_variance_cap(self):
+        """reverse scales dimension d by about 1 / R^2_d: a dimension the view barely predicts would be inflated
+        ~200x; the cap holds its variance at variance_cap x the pooled pivot estimates' (sqrt(cap) x match's scale)
+        and leaves the others exactly as they were; the diagnostics say so."""
+        rng = np.random.default_rng(11)
+        n, p, d = 40000, 8, 4
+        u = rng.standard_normal((n, p))
+        signal = u @ rng.standard_normal((p, d))
+        target = signal * np.array([1.0, 1.0, 1.0, 0.07]) + rng.standard_normal((n, d))    # R^2 of d=3 ~ 0.03
+        u, target = u - u.mean(axis=0), target - target.mean(axis=0)
+        cov_u, cross, target_cov = u.T @ u / n, u.T @ target / n, target.T @ target / n
+        pooled_var = np.diag(target_cov) * 1.4
+        variance = lambda weight: (u @ weight.astype(np.float64)).var(axis=0)  # noqa: E731
+        infos = {}
+
+        def solve(method, cap):
+            infos[method, cap] = {}
+            return hub.solve_onboard_encoder(method, cov_u, cross, target_cov, pooled_var, ridge=1e-9,
+                                             variance_cap=cap, info=infos[method, cap])
+        free, capped = solve("reverse", 0), solve("reverse", 4.0)
+        ratio = variance(free) / pooled_var
+        self.assertGreater(ratio[3], 10)                                 # 1 / R^2 inflation of the weak dimension
+        self.assertTrue(np.all(ratio[:3] < 4))
+        np.testing.assert_array_equal(capped[:, :3], free[:, :3])        # the others: bit-identical
+        np.testing.assert_allclose(variance(capped)[3], 4.0 * pooled_var[3], rtol=1e-4)
+        match = solve("match", 4.0)
+        np.testing.assert_allclose(capped[:, 3], 2.0 * match[:, 3], rtol=1e-5)   # sqrt(4) x match's scale
+        info = infos["reverse", 4.0]
+        self.assertEqual((info["capped"], info["cap"]), (1, 4.0))
+        self.assertAlmostEqual(info["max_ratio"], 4.0, places=3)
+        self.assertGreater(info["max_ratio_uncapped"], 10)
+        self.assertLess(info["min_r2"], 0.05)
+        self.assertEqual(infos["reverse", 0]["capped"], 0)
+        warnings = hub.encoder_warnings(info)
+        self.assertEqual(len(warnings), 2)
+        self.assertIn("limited 1 dimension", warnings[0])
+        self.assertIn("barely predicts", warnings[1])
+        np.testing.assert_array_equal(solve("reverse_z", 4.0), capped)    # the same solve onto its target
+        for method in ("ridge", "consensus", "match", "tls", "cca"):     # the cap is the reverse family's
+            np.testing.assert_array_equal(solve(method, 4.0), solve(method, 0))
+            self.assertIsNone(infos[method, 4.0]["cap"])
+        self.assertEqual(hub.encoder_warnings({"min_r2": 0.5, "capped": 0}), [])
+
+    def test_onboarding_through_every_encoder_and_reencoding_into_each(self):
+        """reverse, reverse_z, tls (and the rest) through add_model_kind and reencode_model_kind, a pivot that
+        encodes from a layer subset (as Muse does, --source-global) among the pivots: the same encoders both
+        ways; reverse spreads at least as far as match; the consensus target reads every pivot's full view."""
+        rng = np.random.default_rng(5)
+        n = 6000
+        latent = {kind: rng.standard_normal((n, 6)).astype(np.float32) for kind in hub.KINDS}
+        views = [FakeView(name, latent, dims, seed, noise=3.0) for name, dims, seed in
+                 (("a", [16, 16], 1), ("b", [8] * 4, 2), ("c", [24], 3), ("e", [10, 10], 6))]
+        documents = n // 100
+        spans = hub.Spans([f"d{i}" for i in range(documents)], ["train"] * (documents - 10) + ["dev"] * 5 + ["test"] * 5,
+                          np.repeat(np.arange(documents), 100), {v.name: np.arange(n) for v in views})
+        logs = []
+        quiet = lambda line: logs.append(line)  # noqa: E731
+
+        def base(subset):
+            return hub.fit_hub_kind(views[:3], spans, "k", layer_rank=8, view_dim=12, hub_dim=6, chunk=1000, log=quiet,
+                                    source_layers={"b": [1, 3]} if subset else None)
+        onboarded = {}
+        for encoder in hub.ONBOARD_ENCODERS:
+            kind = base(subset=True)
+            hub.add_model_kind(kind, views[3], views[:3], spans, "k", layer_rank=8, view_dim=12, chunk=1000, log=quiet,
+                               encoder=encoder, consensus=["a", "b", "c"])
+            stats = kind.alphas["e"]["encoder_stats"]["full"]
+            self.assertEqual((stats["method"], kind.alphas["e"]["encoder"]), (encoder, encoder))
+            onboarded[encoder] = kind
+        self.assertTrue(any(json.loads(line)["stage"] == "onboard-encoder" for line in logs))
+        reencoded = base(subset=True)               # onboarded with ridge, then fitted again with every other
+        hub.add_model_kind(reencoded, views[3], views[:3], spans, "k", layer_rank=8, view_dim=12, chunk=1000,
+                           log=quiet, encoder="ridge")
+        for encoder in hub.ONBOARD_ENCODERS:
+            if encoder == "ridge":
+                continue
+            hub.reencode_model_kind(reencoded, views[3], views[:3], spans, "k", encoder=encoder, chunk=700, log=quiet,
+                                    consensus=["a", "b", "c"])
+            np.testing.assert_allclose(reencoded.encoders["e"], onboarded[encoder].encoders["e"], rtol=2e-3, atol=2e-4,
+                                       err_msg=encoder)
+            self.assertEqual(reencoded.alphas["e"]["encoder_stats"]["full"]["method"], encoder)
+        rows = spans.select("test")
+        blocks = {layer: views[3].rows("k", layer, rows) for layer in views[3].layers("k")}
+        spread = {encoder: kind.encode("e", blocks).astype(np.float64).var(axis=0).sum()
+                  for encoder, kind in onboarded.items()}
+        self.assertGreater(spread["reverse"], spread["match"])
+        self.assertGreater(spread["match"], spread["ridge"])
+        self.assertGreater(spread["reverse_z"], spread["consensus"])
+        # the consensus target is the latent the base was fitted as: the full views of every pivot, so a pivot
+        # that also encodes from a layer subset changes nothing (the mean-of-estimates target does change)
+        plain = base(subset=False)
+        hub.add_model_kind(plain, views[3], views[:3], spans, "k", layer_rank=8, view_dim=12, chunk=1000, log=quiet,
+                           encoder="consensus", consensus=["a", "b", "c"])
+        np.testing.assert_allclose(plain.encoders["e"], onboarded["consensus"].encoders["e"], rtol=1e-4, atol=1e-5)
+        ridge_plain = base(subset=False)
+        hub.add_model_kind(ridge_plain, views[3], views[:3], spans, "k", layer_rank=8, view_dim=12, chunk=1000,
+                           log=quiet, encoder="ridge")
+        self.assertGreater(np.abs(ridge_plain.encoders["e"] - onboarded["ridge"].encoders["e"]).max(), 1e-3)
+
+    def test_consensus_views_of_a_bundle(self):
+        manifests = {"/base": {"models": {"a": {}, "b": {}}, "settings": {"base": None}},
+                     "/onboarded": {"models": {"a": {}, "b": {}, "c": {}}, "settings": {"base": "/base"}},
+                     "/assembled": {"models": {"a": {}, "b": {}, "c": {}, "e": {}}, "settings": {"base": None},
+                                    "assembled_base": "/base"},
+                     "/recorded": {"models": {"a": {}, "b": {}, "c": {}}, "settings": {"consensus_views": ["a", "b"]}}}
+        read = lambda path: manifests[str(path)]  # noqa: E731
+        with mock.patch.object(Path, "is_file", lambda self: str(self.parent) in manifests):
+            self.assertEqual(hub.consensus_views(manifests["/base"], read=read), ["a", "b"])
+            self.assertEqual(hub.consensus_views(manifests["/onboarded"], read=read), ["a", "b"])
+            self.assertEqual(hub.consensus_views(manifests["/assembled"], read=read), ["a", "b"])
+        self.assertEqual(hub.consensus_views(manifests["/recorded"]), ["a", "b"])
+        self.assertIsNone(hub.consensus_views({"models": {"c": {}}, "settings": {"base": "/missing/base"}}))
+
     def test_save_and_load_round_trip(self):
         views, spans, _ = make_views(n=1200)
         hubs = {kind: hub.fit_hub_kind(views, spans, kind, layer_rank=8, view_dim=12, hub_dim=6,
