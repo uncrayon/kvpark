@@ -494,8 +494,11 @@ static const std::vector<arch_def> arch_table = {
     {"minimax-01", layer_rule::hybrid_recurrent, true, {k_qkv, v_cur, q_qkv}, false, 8},
     {"jamba", layer_rule::kv_heads, false, {k_qkv, v_cur, q_qkv}},
     {"granitehybrid", layer_rule::kv_heads, false, {k_qkv, v_cur, q_qkv}},
-    {"nemotron_h", layer_rule::nemotron, false, {k_qkv, v_cur, q_qkv}},
-    {"nemotron_h_moe", layer_rule::nemotron, false, {k_qkv, v_cur, q_qkv}},
+    // nemotron-h's nextn (MTP) block is not a trunk layer (nemotron-h.cpp:204 runs n_layer(); the MoE's
+    // draft graph runs the block, nemotron-h-moe.cpp:3-18) and sits in neither cache when its
+    // feed_forward_length is the MoE width, as the converter writes it (inspect_model checks; kvstate too)
+    {"nemotron_h", layer_rule::nemotron, true, {k_qkv, v_cur, q_qkv}},
+    {"nemotron_h_moe", layer_rule::nemotron, true, {k_qkv, v_cur, q_qkv}},
     // falcon-h1.cpp:139-150: the V reshape is renamed "Vcur-post-rope"
     {"falcon-h1", layer_rule::parallel, false, {k_qkv, {"v", {"Vcur-post-rope", key_op::reshape_or_view, false}}, q_qkv}},
     // lfm2.cpp:136-142 (lfm2moe runs the same attention block): the stored key is the k_layernorm
@@ -627,6 +630,16 @@ static model_info inspect_model(const fs::path & path) {
         if (id >= 0 && gguf_get_kv_type(m, id) == GGUF_TYPE_ARRAY) { return integer(m, key, -1, il); }
         return integer(m, key, fallback);
     };
+    // nemotron's memory filters (src/llama-model.cpp:2698-2704) cache an attention layer with n_ff == 0:
+    // a nextn block written that way would sit in the attention cache next to the trunk's
+    if (info.arch->rule == layer_rule::nemotron) {
+        for (int il = int(info.n_layer); il < blocks; ++il) {
+            if (per_layer(prefix + "feed_forward_length", 0, il) == 0) {
+                throw std::runtime_error(info.architecture + " with nextn_predict_layers > 0 is not supported "
+                                         "(nextn layers would sit in the attention cache)");
+            }
+        }
+    }
     // only lfm2 reads attention.sliding_window among the kv_heads architectures (lfm2.cpp:26; kvstate.py)
     const bool swa = info.architecture == "lfm2" && integer(m, prefix + "attention.sliding_window", 0) > 0;
     // DSA indexer layers: deepseek32 every trunk layer, the others attention.indexer.types (glm-dsa without

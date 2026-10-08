@@ -24,7 +24,7 @@ import numpy as np
 import kvstate
 from captures import Capture
 from tiny_fixture import YARN_V2, _gguf_module, copy_with_metadata, create_fixture, create_gemma_fixture, \
-    create_mla_fixture, fuse_qkv, llama_archs_model
+    create_mla_fixture, create_nemotron_mtp_fixture, fuse_qkv, llama_archs_model
 
 
 PROBE = os.environ.get("KVPARK_KV_PROBE")
@@ -1250,6 +1250,28 @@ class KvProbeFamilyTests(ProbeStateMixin, unittest.TestCase):
                 result, _ = self.probe("collect", model, [{"document_id": document_id(ASCII), "text": ASCII}])
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("capture key k is only defined for", result.stderr)
+
+    @unittest.skipUnless(LLAMA_ARCHS, "set KVPARK_LLAMA_ARCHS for the test-llama-archs hybrids")
+    def test_nemotron_mtp_block_is_no_trunk_layer(self):
+        # a Nemotron-3 MoE with its MTP head as the converter writes it (Nemotron-3.5 GGUFs): the nextn
+        # block's feed_forward_length is the MoE width, so it is neither captured nor cached
+        out = self.workdir()
+        source = copy_with_byte_vocabulary(llama_archs_model(LLAMA_ARCHS, "nemotron_h_moe", out),
+                                           out / "nemotron_h_moe.vocab.gguf")
+        model = out / "nemotron_h_moe-mtp.gguf"
+        create_nemotron_mtp_fixture(source, model)
+        spec = kvstate.ModelSpec.from_gguf(model)
+        self.assertEqual(spec.n_layer_trunk, 3)
+        capture, state = self.capture_and_state(model, spec, ASCII)
+        self.check_against_state(spec, capture, state)
+        # with n_ff == 0 it would sit in the attention cache next to the trunk's: refused, as kvstate does
+        n_ff = [int(x) for x in _gguf_module().GGUFReader(model).get_field("nemotron_h_moe.feed_forward_length")
+                .contents()]
+        cached = out / "nemotron_h_moe-mtp-cached.gguf"
+        copy_with_metadata(model, cached, values={"nemotron_h_moe.feed_forward_length": n_ff[:-1] + [0]})
+        result, _ = self.probe("tokenize", cached, [{"document_id": document_id(ASCII), "text": ASCII}])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("nextn layers would sit in the attention cache", result.stderr)
 
 
 # GQA models (kvstate.GQA_ARCHITECTURES) the probe captures: gguf-py Gemma models (both pins), then
