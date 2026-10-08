@@ -35,6 +35,8 @@ AUTO_SAVE = os.environ.get("KVPARK_AUTO_SAVE", "0") == "1"
 TTL_DAYS = float(os.environ.get("KVPARK_TTL_DAYS", "7"))
 MAX_ARCHIVE_GB = float(os.environ.get("KVPARK_MAX_GB", "32"))
 CHAT_PATHS = {"/v1/chat/completions", "/chat/completions"}
+# A snapshot is reusable for a request with the same system prompt, tools and template settings.
+PREFIX_FIELDS = ("system", "tools", "render_settings")
 GENERATION_PATHS = CHAT_PATHS
 CONTROL_PREFIX = "/_kvpark/"
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -71,21 +73,38 @@ def conversation_key(req: dict) -> str | None:
 
 
 def prompt_signature(req):
+    def encode(value):
+        return json.dumps(value, sort_keys=True, ensure_ascii=False).encode()
     def digest(value):
-        return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        return hashlib.sha256(encode(value)).hexdigest()
     messages = req.get("messages") or []
     if not isinstance(messages, list) or any(not isinstance(m, dict) for m in messages):
         return None
+    system = [m for m in messages if m.get("role") in ("system", "developer")]
     return {
         "role": req.get("slot_archive_role", "unverified"),
-        "system": digest([m for m in messages if m.get("role") in ("system", "developer")]),
+        "system": digest(system),
         "tools": digest(req.get("tools")),
         "render_settings": digest({k: req.get(k) for k in
             ("model", "reasoning_effort", "chat_template_kwargs", "chat_template")}),
         "reasoning_effort": req.get("reasoning_effort"),
         "messages": [digest(m) for m in messages],
         "message_count": len(messages),
+        # Size of the system prompt and tools: about four bytes per token, for seed() to weigh
+        # a restore against prefilling them.
+        "prefix_bytes": len(encode(system)) + len(encode(req.get("tools"))),
     }
+
+
+def continues(saved, current):
+    """Whether the request signature `current` continues the conversation that a snapshot saved
+    with signature `saved` holds: the same system prompt, tools and settings, and the saved
+    request's messages at its start. Otherwise the snapshot is out of date (a new date in the
+    system prompt, a changed tool list, compaction) and is replaced on the next save."""
+    if not saved or not current or any(saved.get(field) != current.get(field) for field in PREFIX_FIELDS):
+        return False
+    old = saved.get("messages") or []
+    return (current.get("messages") or [])[:len(old)] == old
 
 
 def atomic_json(path: Path, data: dict) -> None:
@@ -117,6 +136,7 @@ class Archive:
         self.runtime_error = None
         self.maintenance_until = time.monotonic() + 300 if os.environ.get("KVPARK_UPDATE_START") == "1" else 0
         self.displaced = {}
+        self.rates = {}  # measured restore (bytes/s) and prefill (tokens/s) speeds; see seed()
         self._snapshot = {}
         self.entries = {}
         ARCHIVE.mkdir(parents=True, exist_ok=True)
@@ -205,7 +225,7 @@ class Archive:
             for name in (meta["filename"], meta["filename"] + ".resume"):
                 (ARCHIVE / name).unlink(missing_ok=True)
 
-    def save(self, key, force=False):
+    def save(self, key, force=False, auto=False):
         if not self.current_prompt or self.current_prompt.get("role") != "foreground":
             raise ValueError("no verified foreground prompt is resident; configure foreground session metadata and send a message first")
         tokens = int(self.slot().get("n_prompt_tokens", 0))
@@ -213,9 +233,14 @@ class Archive:
             raise RuntimeError("no populated KV state is available to save")
         previous = self.entries.get(key)
         if not force:
-            if not previous and (not AUTO_SAVE or tokens < MIN_ARCHIVE_TOKENS):
+            # `auto`: the client asked for this conversation to be saved automatically
+            # (slot_archive_autosave), as KVPARK_AUTO_SAVE does for every conversation.
+            if not previous and (not (AUTO_SAVE or auto) or tokens < MIN_ARCHIVE_TOKENS):
                 return
-            if previous and tokens - previous["tokens"] < RESAVE_GROWTH_TOKENS:
+            # An out-of-date snapshot of this model is replaced whatever the growth: restore() would
+            # skip it, or load a conversation that compaction or an edit has since rewritten.
+            stale = previous and previous["identity"] == self.identity and not continues(previous.get("prompt"), self.current_prompt)
+            if previous and not stale and tokens - previous["tokens"] < RESAVE_GROWTH_TOKENS:
                 return
         self.set_activity("saving", key)
         t0 = time.monotonic()
@@ -274,13 +299,22 @@ class Archive:
         if saved.get("role") != "foreground":
             self.record("restore-skipped", key, reason="archive has no verified foreground identity; park again")
             return
-        changed = [field for field in ("system", "tools", "render_settings")
-                   if incoming and saved.get(field) != incoming.get(field)]
+        changed = [field for field in PREFIX_FIELDS if incoming and saved.get(field) != incoming.get(field)]
         if changed:
             self.record("restore-skipped", key, reason="prompt prefix changed: " + ", ".join(changed),
                         saved_effort=saved.get("reasoning_effort"), incoming_effort=incoming.get("reasoning_effort"))
             return
         self.set_activity("restoring", key)
+        t0 = time.monotonic()
+        result = self.load(meta)
+        meta["last_used"] = time.time()
+        atomic_json(ARCHIVE / f"{key}.meta", meta)
+        self.record("restored", key, tokens=result["n_restored"],
+                    gib=round(meta["bytes"] / 1024**3, 3), seconds=round(time.monotonic() - t0, 3))
+        log.info("restored %s; cache reuse must be checked on the next completion", key)
+        return True
+
+    def load(self, meta):
         t0 = time.monotonic()
         try:
             result = self.request("POST", "/slots/0?action=restore", {"filename": meta["filename"]})
@@ -291,11 +325,46 @@ class Archive:
             except Exception as exc:
                 raise UnsafeRestoreError("restore failed and backend state could not be erased; restart the backend") from exc
             raise
-        meta["last_used"] = time.time()
-        atomic_json(ARCHIVE / f"{key}.meta", meta)
-        self.record("restored", key, tokens=result["n_restored"],
-                    gib=round(meta["bytes"] / 1024**3, 3), seconds=round(time.monotonic() - t0, 3))
-        log.info("restored %s; cache reuse must be checked on the next completion", key)
+        seconds = time.monotonic() - t0
+        if meta["bytes"] >= 64 * 1024**2 and seconds > 0:
+            self.rates["restore"] = meta["bytes"] / seconds  # bytes per second, for seed()
+        return result
+
+    def measured(self, metrics):
+        """Remember the server's prefill speed from a completion's timings, for seed()."""
+        tokens, ms = metrics.get("processed_tokens") or 0, metrics.get("prefill_ms") or 0
+        if tokens >= 256 and ms > 0:
+            self.rates["prefill"] = tokens / (ms / 1000)  # tokens per second
+
+    def seed(self, key, incoming):
+        """Start a new conversation from the smallest saved one with the same system prompt, tools and
+        settings: the server reuses that shared prefix and drops the rest. The source is unchanged.
+
+        Skipped when this server has been measured to prefill the system prompt and tools faster
+        than it restores that snapshot (a fast GPU, a slow disk, a large snapshot)."""
+        now = time.time()
+        matches = [(meta["tokens"], -meta["last_used"], other) for other, meta in self.entries.items()
+                   if other != key and meta["identity"] == self.identity
+                   and (meta.get("prompt") or {}).get("role") == "foreground"
+                   and all((meta.get("prompt") or {}).get(field) == incoming.get(field) for field in PREFIX_FIELDS)
+                   and not self.retention.expired(meta, now)]
+        if not matches:
+            return
+        source = min(matches)[2]
+        meta = self.entries[source]
+        restore_rate, prefill_rate = self.rates.get("restore"), self.rates.get("prefill")
+        if restore_rate and prefill_rate and incoming.get("prefix_bytes"):
+            restore_s = meta["bytes"] / restore_rate
+            prefill_s = incoming["prefix_bytes"] / 4 / prefill_rate
+            if restore_s > prefill_s:
+                self.record("seed-skipped", key, source=source, restore_seconds=round(restore_s, 3),
+                            prefill_seconds=round(prefill_s, 3))
+                return
+        self.set_activity("seeding", key)
+        t0 = time.monotonic()
+        result = self.load(meta)
+        self.record("seeded", key, source=source, tokens=result["n_restored"], seconds=round(time.monotonic() - t0, 3))
+        log.info("seeded %s from %s; the shared prefix is reused on the next completion", key, source)
 
     def switch(self, key, thread=None, incoming=None, role=None):
         self.runtime()
@@ -305,19 +374,30 @@ class Archive:
             self.current_key = self.current_thread = None
         if key == self.current_key:
             return
+        resident = self.current_prompt if state.get("n_prompt_tokens", 0) else None
         outgoing = self.current_key
         self.current_key = None
         if outgoing:
             try:
-                protect = role == "background" and outgoing in self.entries
-                self.save(outgoing, force=protect)
+                # Background work never costs a parked conversation its state, nor one whose
+                # client asked for automatic saving: save it before the work takes the slot.
+                auto = bool((self.current_prompt or {}).get("autosave"))
+                protect = role == "background" and (outgoing in self.entries or auto)
+                saved = self.entries.get(outgoing)
+                # Unless nothing ran in the slot since its snapshot was taken (a repeated request).
+                if not (saved and saved["identity"] == self.identity and saved.get("prompt") == self.current_prompt
+                        and saved["tokens"] == state.get("n_prompt_tokens")):
+                    self.save(outgoing, force=protect, auto=auto)
                 if protect:
                     self.displaced[outgoing] = self.entries[outgoing]["filename"]
             except Exception as exc:
                 self.record("save-failed", outgoing, reason=str(exc))
                 log.exception("save failed")
-        if key:
-            self.restore(key, incoming)
+        if key and not self.restore(key, incoming) and (incoming or {}).get("autosave") and not (
+                resident and all(resident.get(field) == incoming.get(field) for field in PREFIX_FIELDS)):
+            # A conversation without a usable snapshot of its own, and a slot that does not hold
+            # its system prompt and tools (background work or a restart came first).
+            self.seed(key, incoming)
         self.current_thread = thread
         # The relay claims current_key only after successful completion.
 
@@ -477,6 +557,8 @@ class ResponseMetrics:
             self.metrics["cached_tokens"] = timings["cache_n"]
         if "prompt_n" in timings:
             self.metrics["processed_tokens"] = timings["prompt_n"]
+        if "prompt_ms" in timings:
+            self.metrics["prefill_ms"] = round(timings["prompt_ms"], 1)
         usage = value.get("usage") or {}
         cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
         if cached is not None:
@@ -625,6 +707,9 @@ class Handler(BaseHTTPRequestHandler):
         signature = prompt_signature(req) if path in CHAT_PATHS and generation else None
         role = req.pop("slot_archive_role", "unverified")
         thread = req.pop("slot_archive_thread", None) if key else None
+        autosave = req.pop("slot_archive_autosave", None) is True
+        if signature and key and autosave:
+            signature["autosave"] = True
         req.pop("slot_archive_thread", None)
         req.pop("slot_archive_key", None)
         if generation:
@@ -658,6 +743,7 @@ class Handler(BaseHTTPRequestHandler):
                 ARCHIVE_STATE.current_thread = thread if success and archive_ready else None
                 ARCHIVE_STATE.current_prompt = signature if success and archive_ready and key else None
                 if success:
+                    ARCHIVE_STATE.measured(metrics)
                     ARCHIVE_STATE.record("completed", key, **metrics)
                 ARCHIVE_STATE.set_activity("idle")
 

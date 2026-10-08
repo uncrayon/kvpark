@@ -12,6 +12,14 @@ from . import __version__
 from .runtime import directory
 from .backends import BACKENDS
 
+# sysexits EX_CONFIG: retrying cannot fix it. The documented service units list it in
+# RestartPreventExitStatus, so a broken setup stops instead of restarting every 10 seconds.
+EX_CONFIG = 78
+
+
+class SetupError(ValueError):
+    """kvpark start cannot run until the user changes the setup."""
+
 
 def request(url, action, payload=None, *, timeout=900, control_prefix="/_kvpark/"):
     headers = {"Content-Type": "application/json"}
@@ -32,6 +40,40 @@ def request(url, action, payload=None, *, timeout=900, control_prefix="/_kvpark/
         raise RuntimeError(reason) from None
 
 
+def stop_services(*, hermes=False, archive=None, configured=None):
+    """Drain the proxy, save the conversation in the slot, and stop the proxy and the managed model
+    server; the setup is kept, so kvpark start (or the boot service) starts them again."""
+    from . import removal
+    if hermes:
+        try:
+            from .setup import hermes_settings
+            config = hermes_settings()
+        except ImportError as exc:
+            raise RuntimeError(f"Hermes cannot load in this Python environment ({exc}); "
+                               "stop the connection with kvpark stop --archive-dir DIR instead") from None
+    else:
+        config = configured if configured and directory(configured["archive_dir"]) == directory(archive) else None
+    archive = directory(config["archive_dir"] if config else archive)
+    options = dict(external=config["external"], managed_backend=config["backend"] == "llama.cpp"
+                   and not config["upstream_url"]) if config else {}
+    plan = removal.plan(archive, **options)
+    if not (plan["proxy"] or plan["backend"]):
+        return [f"Nothing to stop: no kvpark proxy or model server of {archive} is running"
+                + (" (its proxy is managed elsewhere)." if options.get("external") else ".")]
+    resident = None
+    if plan["proxy"]:
+        try:
+            resident = request(plan["proxy"]["base_url"], "status", timeout=5).get("resident_key")
+        except (OSError, ValueError, RuntimeError, URLError):
+            pass
+    result = removal.stop(archive, **options)
+    stopped = [f"{name} (PID {result[field]['pid']})" for name, field in (("proxy", "proxy"), ("model server", "backend"))
+               if result[field]]
+    return [f"Stopped the {' and the '.join(stopped)} for {archive}."
+            + (" The conversation in the slot was saved first." if resident else ""),
+            "Start again with kvpark start" + (" --hermes" if hermes else "") + "."]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Park your model's KV cache. Resume where you left off.")
     parser.add_argument("--version", action="version", version=__version__)
@@ -40,12 +82,24 @@ def main():
     setup_mode = setup.add_mutually_exclusive_group()
     setup_mode.add_argument("--hermes", action="store_true", help="configure Hermes in this Python environment")
     setup_mode.add_argument("--standalone", action="store_true", help="configure standalone kvpark")
+    setup_mode.add_argument("--opencode", action="store_true", help="point OpenCode at kvpark (docs/opencode.md)")
+    opencode = setup.add_argument_group("OpenCode (with --opencode)")
+    opencode.add_argument("--project", help="write to this project's .opencode directory, not the global config")
+    opencode.add_argument("--server", help="kvpark's patched llama-server, to run with --model (disk park/resume)")
+    opencode.add_argument("--model", help="the GGUF file with --server; otherwise the model ID the proxy serves")
+    opencode.add_argument("--backend-args", help="llama-server arguments for --server, as one quoted string")
+    opencode.add_argument("--url", help="a running kvpark proxy to use instead, such as Hermes' (http://127.0.0.1:8080)")
+    opencode.add_argument("--context", type=int, help="the model's context window in tokens, if the server does not report it")
     start = sub.add_parser("start", help="restart the connection selected with setup")
     start.add_argument("--archive-dir")
     start.add_argument("--hermes", action="store_true", help="start the connection configured in the active Hermes profile")
     start.add_argument("--supervise", action="store_true",
                        help="keep running and relaunch stopped services; for a systemd or launchd service")
     start.add_argument("--interval", type=float, default=60, help="seconds between supervise checks (default 60)")
+    stop = sub.add_parser("stop", help="save the conversation in the slot, then stop the proxy and model server; "
+                                       "kvpark start starts them again")
+    stop.add_argument("--archive-dir", help="the connection's archive; default: the one selected with setup")
+    stop.add_argument("--hermes", action="store_true", help="stop the connection configured in the active Hermes profile")
     migrate = sub.add_parser("migrate", help="migrate sloth-memory without moving saved caches")
     migrate.add_argument("--hermes", action="store_true", help="migrate the active Hermes profile")
     migrate.add_argument("--archive-dir", help="standalone legacy archive directory")
@@ -54,6 +108,8 @@ def main():
     uninstall.add_argument("--confirm", action="store_true", help="apply the uninstall after previewing")
     uninstall.add_argument("--hermes", action="store_true", help="restore routing and disable the plugin in the active Hermes profile")
     uninstall.add_argument("--archive-dir", help="standalone archive; --hermes reads the profile's archive setting")
+    uninstall.add_argument("--opencode", action="store_true", help="remove kvpark's provider and plugin from OpenCode's config")
+    uninstall.add_argument("--project", help="with --opencode: the project whose .opencode directory to clean")
     update = sub.add_parser("update", help="check or install an official release, retaining rollback files")
     update.add_argument("action", nargs="?", choices=("check",))
     update.add_argument("--archive-dir")
@@ -90,19 +146,31 @@ def main():
         if name == "doctor":
             cmd.add_argument("--hermes", action="store_true",
                              help="check how Hermes loads the plugin in this Python environment; starts nothing")
+            cmd.add_argument("--opencode", action="store_true", help="check OpenCode's kvpark provider, plugin and proxy")
+            cmd.add_argument("--project", help="with --opencode: check this project's .opencode directory")
     args = parser.parse_args()
     if args.command == "park":
         args.command = "save"
     try:
         configured = None
         explicit_backend = args.command == "serve" and (args.backend or args.upstream_url)
-        hermes_uninstall = args.command == "uninstall" and args.hermes
-        if args.command not in {"setup", "migrate", "backend", "bridge"} and not args.archive_dir and not explicit_backend and not hermes_uninstall:
+        hermes_archive = args.command in ("uninstall", "stop") and args.hermes  # the profile's archive
+        opencode = getattr(args, "opencode", False)  # OpenCode's config, not the saved connection
+        if (args.command not in {"setup", "migrate", "backend", "bridge"} and not args.archive_dir and not explicit_backend
+                and not hermes_archive and not opencode):
             from .setup import saved_settings
             configured = saved_settings()
             if configured:
                 args.archive_dir = configured["archive_dir"]
-        if args.command == "setup":
+        if args.command == "setup" and args.opencode:
+            from .opencode import setup as setup_opencode
+            print("\n".join(setup_opencode(project=args.project, url=args.url, server=args.server, model=args.model,
+                                           backend_args=args.backend_args, context=args.context)))
+        elif args.command == "setup":
+            given = [f"--{name.replace('_', '-')}" for name in ("project", "server", "model", "backend_args", "url", "context")
+                     if getattr(args, name) is not None]
+            if given:
+                parser.error(f"{', '.join(given)} {'applies' if len(given) == 1 else 'apply'} only with --opencode")
             from importlib.util import find_spec
             from .setup import terminal
             hermes = args.hermes or (not args.standalone and find_spec("hermes_cli") is not None)
@@ -115,20 +183,25 @@ def main():
                 try:
                     from .setup import hermes_settings
                     config = hermes_settings()
-                except ImportError:
-                    raise RuntimeError("run kvpark start --hermes with the Python environment that runs Hermes") from None
+                except ImportError as exc:
+                    if (exc.name or "hermes_cli").split(".")[0] == "hermes_cli":
+                        raise SetupError("run kvpark start --hermes with the Python environment that runs Hermes") from None
+                    # Hermes is installed here but cannot import its own code: an update added a
+                    # module its editable install does not map yet.
+                    raise SetupError(f"Hermes cannot load in this Python environment ({exc}). Reinstall Hermes "
+                                     f"into {sys.prefix}, then start kvpark again.") from None
                 if config["uninstalled"]:
-                    raise ValueError("kvpark is disconnected in this Hermes profile. Run /kvpark setup in Hermes first.")
+                    raise SetupError("kvpark is disconnected in this Hermes profile. Run /kvpark setup in Hermes first.")
                 if not (config["model"] or config["external"]):
-                    raise ValueError("No model is configured in this Hermes profile. Run /kvpark setup in Hermes first.")
+                    raise SetupError("No model is configured in this Hermes profile. Run /kvpark setup in Hermes first.")
                 check = "kvpark doctor --hermes"
             else:
                 from .setup import saved_settings
                 config = saved_settings()
                 if not config:
-                    raise ValueError("Choose a model first with kvpark setup.")
+                    raise SetupError("Choose a model first with kvpark setup.")
                 if args.archive_dir and directory(args.archive_dir) != directory(config["archive_dir"]):
-                    raise ValueError("kvpark start uses the connection selected in setup; run kvpark setup to choose another.")
+                    raise SetupError("kvpark start uses the connection selected in setup; run kvpark setup to choose another.")
                 check = "kvpark doctor"
             service = Service(lambda: config)
             if args.interval <= 0:
@@ -144,10 +217,21 @@ def main():
             else:
                 service.ensure()
                 print(f"kvpark is ready. Run {check} to check the connection.")
+        elif args.command == "stop":
+            if args.hermes and args.archive_dir:
+                parser.error("--hermes uses its profile's archive; do not pass --archive-dir")
+            print("\n".join(stop_services(hermes=args.hermes, archive=args.archive_dir, configured=configured)))
         elif args.command == "migrate":
             from .migration import run
             print(run(hermes=args.hermes, archive=args.archive_dir, confirm=args.confirm))
+        elif args.command == "uninstall" and args.opencode:
+            if args.hermes or args.archive_dir:
+                parser.error("--opencode changes only OpenCode's config; run --hermes or --archive-dir separately")
+            from .opencode import uninstall as uninstall_opencode
+            print("\n".join(uninstall_opencode(project=args.project, confirm=args.confirm)))
         elif args.command == "uninstall":
+            if args.project:
+                parser.error("--project applies with --opencode")
             if args.hermes:
                 if args.archive_dir:
                     parser.error("--hermes uses its profile's archive; do not pass --archive-dir")
@@ -175,6 +259,17 @@ def main():
         elif args.command == "bridge":
             from .bridge.cli import run as run_bridge
             run_bridge(args)
+        elif args.command == "doctor" and args.opencode:
+            if args.hermes or args.url or args.archive_dir:
+                parser.error("--opencode reads the proxy's address from OpenCode's config; "
+                             "do not combine it with --hermes, --url or --archive-dir")
+            from .opencode import doctor as doctor_opencode
+            lines, ok = doctor_opencode(project=args.project)
+            print("\n".join(lines))
+            if not ok:
+                raise SystemExit(1)
+        elif args.command == "doctor" and args.project:
+            parser.error("--project applies with --opencode")
         elif args.command == "doctor" and args.hermes:
             from .hermes_doctor import report
             lines, ok = report()
@@ -227,6 +322,9 @@ def main():
             print(json.dumps(result, indent=2))
             if args.command == "doctor" and not result["ok"]:
                 raise SystemExit(1)
+    except SetupError as exc:
+        print(f"kvpark: {exc}", file=sys.stderr)
+        raise SystemExit(EX_CONFIG) from None
     except (OSError, ValueError, RuntimeError, URLError) as exc:
         print(f"kvpark: {exc}", file=sys.stderr)
         raise SystemExit(1) from None

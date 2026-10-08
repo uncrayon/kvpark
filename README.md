@@ -50,8 +50,9 @@ Previously installed **sloth-memory**? Follow the
 [one-time rename migration](docs/updates.md#migrate-from-sloth-memory) before enabling kvpark.
 The package, CLI, Hermes command, and repository are now named `kvpark`.
 The service is independent of Hermes. A native Hermes adapter provides startup,
-slash-command onboarding, and cleanup controls. Other agents integrate through
-an HTTP proxy and explicit session metadata; a plain Python example is included.
+slash-command onboarding, and cleanup controls; OpenCode connects with one command.
+Other agents integrate through an HTTP proxy and explicit session metadata; a plain
+Python example is included.
 
 ## What it does
 
@@ -255,6 +256,25 @@ By default, cleanup runs hourly and expires snapshots **seven days after saving*
 It deletes disk snapshots, not transcripts or live RAM. Preferences persist across
 restarts; the guide lists every command and the external-service option.
 
+## Use with OpenCode
+
+With the patched runtime built and a GGUF model of your own:
+
+```bash
+kvpark setup --opencode --server /absolute/path/to/llama-server --model /absolute/path/to/model.gguf
+opencode -m kvpark/local
+```
+
+Setup starts the model server and the proxy, and adds a `kvpark` provider and a small
+plugin to OpenCode's config, keeping a backup. The plugin tells kvpark which OpenCode
+session each request belongs to. Conversations are then saved when other work, such as
+title generation or a subagent, needs the model's slot, and restored when you return.
+A new session reuses OpenCode's system prompt and tools from a saved one. `kvpark stop`
+saves the conversation in the slot and stops both services; `kvpark start` starts them
+again, also after a reboot. Check with `kvpark doctor --opencode`, and remove with
+`kvpark uninstall --opencode --confirm`. To share Hermes' proxy, use `--url` instead of
+`--server`. See the [OpenCode guide](docs/opencode.md).
+
 ## Try it without an agent framework
 
 The example client defaults to port 8080. If the proxy selected another port, pass
@@ -309,6 +329,8 @@ streaming and authentication. The optional Hermes adapter does not patch Hermes.
 | --- | --- |
 | `kvpark backend --server … --model … -- …` | Launch the backend and record runtime identity |
 | `kvpark serve` | Run the inference proxy |
+| `kvpark start` | Start the connection chosen with `kvpark setup` (`--hermes`: the Hermes profile's) |
+| `kvpark stop` | Save the conversation in the slot, then stop that connection's proxy and managed backend; keep the setup |
 | `kvpark doctor` | Check backend reachability, runtime identity, and the single-slot topology |
 | `kvpark save --session …` | Save exactly that resident conversation |
 | `kvpark status` | Inspect archives and actual completed-request reuse |

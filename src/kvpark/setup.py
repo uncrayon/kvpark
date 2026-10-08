@@ -91,6 +91,45 @@ def connect_model(model, current, *, hermes=False):
     return config
 
 
+def connect_managed(server, model, backend_args=None):
+    """Run kvpark's patched llama-server with a local GGUF (disk park/resume) as the standalone
+    connection: `kvpark start` relaunches it and `kvpark doctor` checks it. Returns the settings.
+
+    A running stack for the same server, model and arguments is reused; another model or argument
+    list gets its own archive, so switching never takes over a running stack or its snapshots."""
+    current = saved_settings() or defaults()
+    args = list(backend_args) if backend_args is not None else list(defaults()["backend_args"])
+    config = validate_service({**defaults(), "backend": "llama.cpp", "cache_mode": "native", "server": server,
+                               "model": model, "backend_args": args})
+    identity = json.dumps([config["server"], config["model"], args])
+    key = hashlib.sha256(f"llama.cpp\n{identity}".encode()).hexdigest()[:16]
+    archive = directory() if os.environ.get("KVPARK_ARCHIVE_DIR") else directory() / "connections" / key
+    config = validate_service({**config, "archive_dir": str(archive), "connected": True})
+    if all(current.get(name) == config[name] for name in ("server", "model", "backend_args", "archive_dir", "cache_mode")):
+        config = validate_service({**current, "autostart": True, "external": False, "uninstalled": False, "connected": True})
+    service = Service(lambda: config, config.update)
+    try:
+        if not service.ensure():
+            raise RuntimeError("The model server stopped during setup; inspect hermes-backend.log in " + str(archive))
+        from .proxy import atomic_json
+        from .platforms import file_lock
+        with file_lock(directory() / ".setup.lock"):
+            if (saved_settings() or defaults()) != current:
+                raise ValueError("Another setup changed this connection. Run the setup again.")
+            atomic_json(directory() / "setup.json", config)
+    except BaseException:
+        for child in reversed(service.started_processes):
+            if child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(10)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
+        raise
+    return config
+
+
 @dataclass
 class Pending:
     scan: discovery.Scan

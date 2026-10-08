@@ -36,3 +36,4 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 kvpark = ["update_compat.json"]
+"kvpark.opencode" = ["kvpark.js"]

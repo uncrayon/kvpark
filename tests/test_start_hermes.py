@@ -71,15 +71,34 @@ class StartHermesTests(unittest.TestCase):
             with self.subTest(expected=expected), patch("kvpark.setup.hermes_settings", return_value=config), \
                     patch.object(Service, "ensure") as ensure:
                 code, output = self.run_cli("start", "--hermes")
-            self.assertEqual(code, 1)
+            self.assertEqual(code, cli.EX_CONFIG)
             self.assertIn(expected, output)
             ensure.assert_not_called()
 
     def test_start_hermes_needs_hermes_python(self):
-        with patch("kvpark.setup.hermes_settings", side_effect=ImportError("No module named hermes_cli")):
+        missing = ModuleNotFoundError("No module named 'hermes_cli'", name="hermes_cli")
+        with patch("kvpark.setup.hermes_settings", side_effect=missing):
             code, output = self.run_cli("start", "--hermes")
-        self.assertEqual(code, 1)
+        self.assertEqual(code, cli.EX_CONFIG)
         self.assertIn("Python environment that runs Hermes", output)
+
+    def test_start_hermes_names_the_module_a_broken_hermes_install_misses(self):
+        # Hermes added hermes_yaml.py; an editable install made before it cannot import it.
+        missing = ModuleNotFoundError("No module named 'hermes_yaml'", name="hermes_yaml")
+        with patch("kvpark.setup.hermes_settings", side_effect=missing):
+            code, output = self.run_cli("start", "--hermes")
+        self.assertEqual(code, cli.EX_CONFIG)
+        self.assertIn("hermes_yaml", output)
+        self.assertIn("Reinstall Hermes", output)
+        self.assertNotIn("Python environment that runs Hermes", output)
+
+    def test_start_hermes_runtime_failures_keep_status_one_for_systemd_retries(self):
+        config = {**defaults(), "backend": "ollama", "cache_mode": "routing", "model": "gemma:latest",
+                  "upstream_url": "http://127.0.0.1:11434", "connected": True}
+        with patch("kvpark.setup.hermes_settings", return_value=config), \
+                patch.object(Service, "ensure", side_effect=RuntimeError("model server not ready")):
+            code, output = self.run_cli("start", "--hermes")
+        self.assertEqual(code, 1, output)
 
 
 if __name__ == "__main__":

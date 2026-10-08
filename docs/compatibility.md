@@ -95,7 +95,7 @@ replacement checks, not cryptographic hashes of model contents.
 | OS | Linux, macOS, Windows; backend hardware support varies |
 | Python | 3.10+; psutil is installed as a runtime dependency |
 | Inference server | Included pinned llama.cpp patch; local single-slot topology |
-| Agent | Any server-side client implementing the session/replay contract |
+| Agent | Hermes (plugin), [OpenCode](opencode.md) 1.18 (provider and plugin; tested with 1.18.34; a context of at least 16,384 tokens), or any server-side client implementing the session/replay contract |
 | Wire API | Chat completions, including SSE; health and models discovery |
 | Models | User-supplied GGUFs supported by the pinned runtime; validate each configuration |
 | GPU | CMake opt-in; no universal hardware support claim |

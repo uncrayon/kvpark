@@ -226,9 +226,14 @@ On Linux, save this as `~/.config/systemd/user/kvpark.service`:
 ```ini
 [Unit]
 Description=kvpark proxy and managed model server for Hermes
+# Give up after five failed starts in five minutes instead of retrying forever.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 ExecStart=%h/.hermes/hermes-agent/venv/bin/python -m kvpark start --hermes --supervise
+# Save the conversation in the slot before systemd ends the services (stop, restart, shutdown).
+ExecStop=-%h/.hermes/hermes-agent/venv/bin/python -m kvpark stop --hermes
 # Plugin-directory installation instead of a package:
 # Environment=PYTHONPATH=%h/.hermes/plugins/kvpark/src
 # Non-default profile, or GPU runtime variables from the profile:
@@ -236,11 +241,18 @@ ExecStart=%h/.hermes/hermes-agent/venv/bin/python -m kvpark start --hermes --sup
 # EnvironmentFile=-%h/.hermes/.env
 Restart=on-failure
 RestartSec=10
+# 78: a setup problem (Hermes cannot load, no model configured) that a retry cannot fix.
+RestartPreventExitStatus=78
 TimeoutStopSec=90
 
 [Install]
 WantedBy=default.target
 ```
+
+A setup problem stops the service with status 78 and the reason in
+`journalctl --user -u kvpark`. Fix it, then `systemctl --user restart kvpark`. Other failures
+are retried every 10 seconds, at most five times in five minutes;
+`systemctl --user reset-failed kvpark` clears the count.
 
 Then enable it, and let user services run without a login session:
 
@@ -250,7 +262,9 @@ loginctl enable-linger "$USER"
 ```
 
 `systemctl --user status kvpark` shows the supervisor, proxy, and backend in one
-control group; `systemctl --user stop kvpark` stops all three. Hermes reuses the
+control group; `systemctl --user stop kvpark` stops all three, after `kvpark stop --hermes`
+has saved the conversation in the slot. Without the service, `kvpark stop --hermes` does
+the same from a terminal and `kvpark start --hermes` starts them again. Hermes reuses the
 running services, and `kvpark doctor --hermes` reports them. On macOS, a launchd
 agent in `~/Library/LaunchAgents` with `RunAtLoad` and `KeepAlive` running the
 same command does the equivalent.

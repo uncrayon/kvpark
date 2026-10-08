@@ -18,6 +18,20 @@ Optionally set `slot_archive_thread` to a UI thread identifier. New integrations
 should park by exact conversation key rather than UI thread to avoid ambiguity
 after branching or starting a new conversation in the same thread.
 
+Optionally set `slot_archive_autosave: true` on foreground requests to have kvpark
+manage the conversation's snapshots without explicit parking. The proxy then saves the
+conversation before background work takes the slot, whatever its size, and when another
+conversation takes it, once it holds `KVPARK_MIN_TOKENS` tokens. A new autosave
+conversation that finds the slot without its system prompt and tools starts from the
+smallest saved snapshot with the same system prompt, tools and template settings
+(event `seeded`); the backend reuses that shared prefix. The proxy skips that restore
+when it has measured that prefilling the prefix is faster here (event `seed-skipped`).
+The [OpenCode plugin](opencode.md) sets it.
+
+For every saved conversation, autosave or parked, a snapshot that no longer matches the
+conversation (another system prompt, tool list or template setting, or messages that
+compaction or an edit rewrote) is replaced on the next save whatever the growth.
+
 The `slot_archive_*` fields are private to the proxy and are stripped before
 forwarding. `prompt_cache_key` and `session_id` remain legacy key fallbacks only
 when the foreground role is explicit.
