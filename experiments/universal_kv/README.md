@@ -7,9 +7,9 @@ The product side is `kvpark bridge` ([docs/bridge.md](../../docs/bridge.md)).
 - [ARCHITECTURE.md](ARCHITECTURE.md): design, the state families of the top-20 open models,
   what is supported for each llama.cpp architecture and on what it was validated, the engine
   and its daemon, recurrent state, images, draft models, DeepSeek V4, open problems.
-- [RESULTS.md](RESULTS.md): measurements on four local models (Qwen3.8-27B, Ornith-1.5-9B,
-  Qwen3-4B, Muse-Glimmer-30B) and live switches on real llama-servers; a summary table at the
-  top.
+- [RESULTS.md](RESULTS.md): measurements on four local models fitted jointly (Qwen3.8-27B,
+  Ornith-1.5-9B, Qwen3-4B, Muse-Glimmer-30B), on the twelve onboarded since (sections 9-10; eleven of
+  them in hub6) and live switches on real llama-servers; a summary table at the top.
 - [survey/SURVEY.md](survey/SURVEY.md): the top-20 open-weights models (Artificial Analysis
   Intelligence Index v4.3, read 2026-10-02) and their cache architectures.
 
@@ -33,10 +33,13 @@ has what each was validated on; the bridge's list is `TRANSLATABLE` in
 | Family | Architectures |
 | --- | --- |
 | Dense GQA, sliding window + global | `qwen3`, `muse-glimmer` (real models, live) |
-| GQA family | `llama`, `mistral3`, `qwen3moe`, `hy_v3`, `phi3` (none of them LongRoPE), `gemma3`, `gemma4` (real Gemma-4 saves), `gpt-oss`, `laguna`, `mimo2` |
-| Hybrids with a recurrent cell | `qwen35` (real models, live), `qwen35moe`, `qwen3next`, `qwen4exp`, `minimax-01`, `jamba`, `falcon-h1`, `granitehybrid`, `nemotron_h`, `nemotron_h_moe`, `plamo2` (cache only: its PLaMo-2 vocabulary is not read, so the bridge skips it as `tokenizer`), `lfm2`, `lfm2moe` |
-| MLA, DSA, K-only hybrids | `deepseek2`, `mistral4`, `hy_v4`, `deepseek32`, `glm-dsa`, `dots3note`, `kimi-linear`, `kimi-k3`, `bailingmoe3`, `glm5-next` (a7b94df2c only) |
+| GQA family | `llama`, `mistral3`, `qwen3moe`, `hy_v3`, `phi3` (none of them LongRoPE), `gemma3`, `gemma4` (real Gemma 4 26B-A4B and 31B onboarded, live), `gpt-oss`, `laguna`, `mimo2` |
+| Hybrids with a recurrent cell | `qwen35` (real models, live), `qwen35moe` (real), `qwen3next`, `qwen4exp`, `minimax-01`, `jamba` (real; fails as a source), `falcon-h1` (real), `granitehybrid` (real, live; a target only in practice), `nemotron_h`, `nemotron_h_moe` (real; a target only in practice), `plamo2` (cache only: its PLaMo-2 vocabulary is not read, so the bridge skips it as `tokenizer`), `lfm2` (real), `lfm2moe` |
+| MLA, DSA, K-only hybrids | `deepseek2` (real models), `mistral4`, `hy_v4`, `deepseek32`, `glm-dsa`, `dots3note`, `kimi-linear` (real, live), `kimi-k3`, `bailingmoe3` (real), `glm5-next` (a7b94df2c only) |
 | Pooled latent (target only) | `deepseek4` |
+
+"real": a local model captured, fitted or onboarded into the hub and measured end to end (RESULTS.md); "live":
+switched between running llama-servers through `kvpark bridge`; the rest on random-weight fixtures.
 
 Draft models: DFlash/DSpark (an aligned dummy), MTP (an empty head cache) and the `shared` kind
 (Gemma 4's MTP head, which writes no cells of its own: its 8-byte draft blob is kept as it is).
@@ -67,7 +70,7 @@ by `template_check.py` against `/apply-template` on every local model.
 | pair_eval.py | end-to-end evaluation of a model pair (render, tokenize, save states, translate, seed-score); `--recurrent`, `--recurrent-mean`, `--recurrent-group` for hybrid targets; `--ids` (with `--min-documents`) a fixed set of conversations, such as RESULTS.md section 2's; `--server-render` renders both models as llama-server does (its default template kwargs, a fixed clock) instead of with the templates' defaults; `--extra-hub LABEL=DIR` also translates with another bundle on the same documents, states and native scores (conditions `hub_prefix.LABEL`, and its own floors when its target side differs), so bundles compare paired in one run |
 | score_translate.py | hub vs a pairwise mapper on the documents of a linear_transfer long run; the same recurrent options |
 | recurrent_reset.py | the cost of resetting a hybrid model's recurrent state (R0 alone; superseded by `r0_experiments.py run --strategies zero`) |
-| live_bridge.py | live tests on throwaway llama-servers: `hops`, `drafts`, `media`, `drafts-control`, `media-control`, `options` (request template options, the recurrent mean); a memory guard before each model start |
+| live_bridge.py | live tests on throwaway llama-servers: `hops` (`--cool-c`, `--keep-text`), `drafts`, `media`, `drafts-control`, `media-control`, `options` (request template options, the recurrent mean); a memory guard before each model start; under a guard's Watch (`campaign.py exec`) its servers and the engine daemon stay in its process group ([Running heavy jobs safely](#running-heavy-jobs-safely)) |
 | pair_table.py | markdown table of pair_eval reports |
 | fixtures_families.py | test helpers: tiny MLA/DSA, K-only hybrid and GQA-family models (test-llama-archs and gguf-py Gemma 3/4), the state driver and probe wrappers, exact identity hubs |
 | fixtures_bridge/ | `make_fixtures.py` (tiny Qwen3.5 and Qwen3 targets with DFlash and MTP drafts, and a 5120-wide Qwen3.5 the Qwen3.8 mmproj can feed), `live_resume_check.py` (the bridge's `.resume` sidecars on a kvpark-patched server), `stub_engine.py` (a same-model stand-in engine for live switch checks) |
@@ -180,10 +183,10 @@ Every heavy job now runs under `resource_guard.py` (standard library only):
 | --- | --- | --- |
 | BLAS/OpenMP/MKL threads of heavy children and of fit_hub.py, campaign.py, r0_experiments.py (unless set; OpenBLAS alone would start 32) | 8; 4 for GPU evaluations | `threads`, `KVPARK_GUARD_THREADS` |
 | llama.cpp probe `--threads` (captures, pair_eval, r0_experiments) | 8 (was 16); 4 for pair_eval | `threads` |
-| start a heavy step only when the package (hottest of k10temp Tctl/Tdie/Tccd*, amdgpu edge) is at most | 75 °C | `start_c` |
-| stop the job's process group (SIGSTOP) at | 90 °C (85 °C for GPU evaluations), swap use ≥ 85% (while MemAvailable < 24 GiB), MemAvailable < 8 GiB | `pause_c`, `swap_pause`, `swap_ignore_gib`, `mem_floor_gib` |
-| continue it (SIGCONT) at | ≤ 80 °C (65 °C for GPU evaluations) with MemAvailable ≥ 12 GiB and swap use < 80% (or MemAvailable ≥ 24 GiB) | `resume_c`, `mem_resume_gib`, `swap_resume`, `swap_ignore_gib` |
-| end it (SIGTERM + SIGCONT, SIGKILL after 30 s) at | 95 °C on 2 samples in a row (stopped at the first), no CPU temperature for 60 s, a pause longer than 30 min | `abort_c`, `abort_samples`, `sensor_loss_s`, `max_pause_s` |
+| start a heavy step only when the package (hottest of k10temp Tctl/Tdie/Tccd*; with `sensors=package` also the amdgpu edge, the rule until 2026-10-08, when 58% of the GPU evaluations' pauses came from the edge alone) is at most | 88 °C: `pause_c` − 2 (75 °C until 2026-10-08; for GPU evaluations 83 °C on that evening) | `start_c` |
+| stop the job's process group (SIGSTOP) at | 90 °C, GPU evaluations too (85 °C for them until the evening of 2026-10-08), swap use ≥ 85% (while MemAvailable < 24 GiB), MemAvailable < 8 GiB | `pause_c`, `swap_pause`, `swap_ignore_gib`, `mem_floor_gib` |
+| continue it (SIGCONT) at | ≤ 88 °C: `pause_c` − 2 (80 °C, and 65 °C for GPU evaluations, until 2026-10-08) with MemAvailable ≥ 12 GiB and swap use < 80% (or MemAvailable ≥ 24 GiB) | `resume_c`, `mem_resume_gib`, `swap_resume`, `swap_ignore_gib` |
+| end it (SIGTERM + SIGCONT, SIGKILL after 30 s) at | 98 °C on 2 samples in a row (stopped at the first), no CPU temperature for 60 s, a pause longer than 30 min | `abort_c`, `abort_samples`, `sensor_loss_s`, `max_pause_s` |
 | samples (temperatures, PPT power, NVMe, MemAvailable, swap, load, the job's RSS) | every 2 s, JSONL | `poll_s` |
 | CPU-heavy numpy work: one job at a time, `/tmp/kvpark-campaign-cpu.lock`, always taken after the GPU/memory lock | | |
 | a fit is refused when its estimated anonymous peak exceeds MemAvailable minus | 25 GiB | `fit_margin_gib` |
@@ -192,7 +195,9 @@ Every heavy job now runs under `resource_guard.py` (standard library only):
 Tctl moves fast on this machine. In the guard's own logs, one nice'd AVX-512 thread took it to
 89 °C (36 W PPT). Four threads took it to 91.5 °C (63 W): the guard stopped that job, and 2 s later
 Tctl was at 62 °C. A job running 8 BLAS threads will therefore be paused regularly. This is also
-why a single sample at 95 °C only stops a job, and a second one in a row ends it.
+why a single sample at 98 °C only stops a job, and a second one in a row ends it. The line was 95 °C
+until 2026-10-08: work outside the locks kept the package at 95-97 °C while the job was already
+stopped, and ending a stopped job cools nothing.
 
 **Long GPU evaluations and other work.** A pair_eval run into Qwen3.8 draws 100-138 W (PPT) in bursts
 and takes Tctl from about 65 to 90 °C within 2 s. On the night of October 6 the guard ended such runs
@@ -201,15 +206,24 @@ the locks (another project's test sandboxes, up to 108 W) heating the package. A
 it, so evaluations now resume (`pair_eval.py --resume`, campaign.py's evaluate stage). Most of these
 ends came from the run itself, though, with a lag: a 2 s burst at 125 W (GPU edge 89 °C) is followed, 4-8 s
 into the pause and at 30 W, by a Tctl peak of 97-98 °C, as the heat reaches the CPU dies. The peak
-follows the temperature the burst starts from, so GPU evaluations run with their own defaults
-(`resource_guard.GPU_EVALUATION`: pair_eval, campaign.py's evaluate stage and baseline, `assemble
---evaluate`, `campaign.py exec --gpu-evaluation`): stopped at 85 °C, continued at 65 °C, 4 threads (the
-probe's CPU threads add heat and nothing to a Vulkan run: the scores are the same as with 16 threads).
-With resume at 75 °C a Qwen3.6 → Qwen3.8 run was ended after 2-4 minutes again and again. With 85/65/4
-the twelve evaluation runs of October 7 all completed, but the lag still shows: 69 of their 24,487 samples
-(0.28%) reached 95 °C or more, peaking at 97.9 °C, and the guard ended a run 7 times, each time resumed
-(`--resume`), some of them while the job was already stopped (other work on the package). `KVPARK_GUARD_*`
-still override the defaults.
+follows the temperature the burst starts from. GPU evaluations (`resource_guard.GPU_EVALUATION`: pair_eval,
+campaign.py's evaluate stage and baseline, `assemble --evaluate`, `campaign.py exec --gpu-evaluation`) run with
+4 threads (the probe's CPU threads add heat and nothing to a Vulkan run: the scores are the same as with 16
+threads), and their thresholds have changed twice:
+
+- Until October 7 they stopped at 90 or 85 °C and continued at 80 or 75 °C (a job ended at 95 °C): with resume at
+  75 °C a Qwen3.6 → Qwen3.8 run was ended after 2-4 minutes again and again.
+- On October 7-8 they stopped at 85 °C and continued only at 65 °C, which let the lagged peak start lower: the
+  twelve evaluation runs of October 7 all completed, but 69 of their 24,487 samples (0.28%) reached 95 °C or more,
+  peaking at 97.9 °C, and the guard ended a run 7 times, each resumed (`--resume`), some of them while the job was
+  already stopped (other work on the package).
+- Since the evening of October 8 they stop at 90 °C and continue at 88 °C like every job, and a job ends at 98 °C:
+  the user's choice, to keep the GPU busy and not wait for cool-downs. That trades the low resume temperature's
+  margin for throughput: in the campaigns' guard logs to October 9, 1.9% of the GPU evaluations' 13,294 samples
+  reached 95 °C or more (0.37% of 30,008 under 85/65 °C), 4 reached 98 °C or more (at most 98.4 °C), and 2 of
+  their 17 runs were ended by the guard and resumed.
+
+`KVPARK_GUARD_*` still override the defaults.
 
 **Swap and stopped jobs.** A stopped job's memory is what the kernel swaps out first. On October 7 the
 joint seven-model refit ran with the GPU-evaluation settings (85/65 °C, 4 threads) next to kvpark.service's
@@ -275,6 +289,21 @@ How each job is guarded:
   fit backend of `~/venvs/rocm/bin/python`) under the locks and a Watch with the GPU-evaluation defaults.
   Until October 7 it evaluated on the CPU inside campaign.py, where its Guard could pause only between
   chunks: the package went from 82 °C to 98 °C within one, and the guard ended it ("outside check()").
+- **live_bridge.py** (live switches on throwaway llama-servers) runs under `campaign.py exec --memory-bytes N
+  --gpu-evaluation --guard-log FILE -- python3 live_bridge.py ...`. Under that Watch it keeps its llama-servers
+  and the engine daemon (which the bridge would start in a session of its own) in its process group, so the
+  guard pauses and ends them with the run; the daemon gets an idle exit of a week (the run stops it: its default
+  600 s counts on a clock that runs on while the guard holds the run), and every switch first checks that the
+  daemon answering is still that one. When the run's command exits, campaign.py stops whatever it left in its group
+  before releasing the locks. `hops --cool-c 65` waits for the package to cool before each timed step; the hop
+  records carry the wall clock of each step, from which the guard's pauses inside it are known (a pause stops the
+  processes while the GPU finishes its queue, so the step's own time is bounded by its wall time with and without
+  them), and `--native-chunk 1024` prefills the native reference again in cooled requests. Use the ggml Vulkan
+  engine there (`--engine vulkan=EXPERIMENT_PYTHON:vulkan`): on October 9
+  the torch-ROCm daemon's busy runtime thread ([Fit placement](#fit-placement-fit_backendpy)) alone held Tctl
+  at 93 °C (48 W, everything else idle), so the guard stopped and continued the run every few seconds, and
+  run outside the group its first load drew 59 W while the stopped run's Tctl peaked at 98.2 °C and the guard
+  ended it.
 - **Any other heavy command**, a diagnostic for instance, runs under
   `resource_guard.py run [--cpu-lock] [--log FILE] -- COMMAND ...` (exit status 75 when the guard
   ended it). In Python, use `with resource_guard.cpu_lock(), resource_guard.Guard(log_path=...) as
@@ -282,31 +311,51 @@ How each job is guarded:
 - `resource_guard.py status` prints one sample, the settings, the holder of the CPU lock and whether
   the kernel log is readable (`kernel_log`).
 
-**Fit memory** (`fit_hub.memory_estimate`; the job's own RSS is mostly memory-mapped captures,
-which the kernel can drop, so the estimate counts anonymous memory):
+**Fit memory** (`fit_hub.memory_estimate`): what a fit takes off MemAvailable at its peak. That is its
+anonymous memory (its RSS is mostly memory-mapped captures, which the kernel can drop) and, for a GPU fit, the fit
+backend's device memory: on this APU (2 GiB of VRAM carved out) torch allocates GTT, system RAM that MemAvailable
+no longer counts and that no process's RssAnon shows (a 4 GiB torch allocation added nothing to RssAnon, 4.0 GiB
+to GTT and took 4.01 GiB off MemAvailable). Until October 9 the estimates were calibrated on anonymous peaks
+only, so the GPU fits' real peaks (anonymous + torch's reserved peak) exceeded the onboarding estimate in 7 of 9
+onboardings by 1.0-3.9 GiB. The guard and campaign.py now record a command's GPU memory as the rise of the GPU's
+GTT use since it started (`max_gpu_gib`) and the largest anonymous + GPU sum of one sample (`max_total_gib`, in
+`state.json`, the guard summaries and the report's "Peak memory").
 
-- **Onboarding.** This is campaign.py's model: 4.5 GiB, plus the base hub, plus, for one kind,
-  24·W1² + 8·D·C + dev·pivots·(12·D + 4·C) bytes. W1 is the new model's summed stage-1 ranks, C its
-  K/V columns and D the hub dimension. It predicts 12.0, 17.1 and 14.3 GiB for the three onboardings
-  that recorded 11.0 (LFM2-2.6B), 16.7 (DeepSeek-V2-Lite) and 13.0 (Qwen3.6-35B-A3B).
-- **Joint fit.** The GCCA holds the joint covariance and its whitened copy (2·P² float64, P the views'
-  summed dimensions) plus what `fit_backend.top_eig` allocates on the path it takes (`fit_hub.eigh_bytes`,
-  measured): with scipy, as in `~/venvs/rocm` where fits run, the float32 subset solver adds 1.3·P²
-  float64 and the eigenvectors; numpy's float64 `eigh` would add 4.1·P² (the estimate until October 7
-  counted that path, 6.1·P², 37.4 GiB at P = 28,672). Seven views of 4,096 give P = 28,672: the GCCA
-  phase is 21.5 GiB, so the decoder phase (26.6 GiB, growing with the dev spans) is the peak, with the
-  fitted K adapters (3.1 GiB), the transforms and the 4.5 GiB base on top: about 35.4 GiB of anonymous
-  memory for the joint seven-model refit (46.2 GiB by the old count), which the guard starts at
-  MemAvailable ≥ 60.4 GiB. Without scipy (the experiment venv) the "float32" path adds 5.7·P² (measured:
-  numpy.linalg computes a float32 matrix in float64, so the float32 copy and its promotion come on top of
-  `eigh`, and it is slower, 50 s against 25 s at 8,192): run large fits with `~/venvs/rocm/bin/python`.
+- **Onboarding.** This is campaign.py's model (`fit_hub_extra`): 5.5 GiB, plus 3.5 GiB on the GPU, plus the base
+  hub, plus, for one kind, 28·W1² + 10·D·C + 12·chunk·C + 12·dev·pivots·D bytes. W1 is the new model's summed
+  stage-1 ranks, C its K/V columns, D the hub dimension and chunk the rows fit_hub streams at a time (4,096). It is
+  calibrated on the twelve onboardings: the three CPU fits' anonymous peaks (LFM2-2.6B 11.0 GiB, DeepSeek-V2-Lite
+  16.7, Qwen3.6-35B-A3B 13.0) and the nine GPU fits' anonymous + reserved peaks (13.5-16.5 GiB for the six with at
+  most 8,192 columns, GLM-4.7-Flash 31.3, Gemma-4-26B-A4B 24.2, Gemma-4-31B 56.4). At each onboarding's own dev
+  spans the estimate lies 0.5-3.8 GiB above each (Kimi-Linear closest: 16.1 against 15.6); campaign.py's lock
+  counts the base hub's 17,355 dev spans, which bound every model's (Gemma-4-31B: 60.3 GiB). Until October 9 it
+  also counted 4·dev·pivots·C for dev rows tiled over the pivots, which the fit has streamed since October 6: that
+  asked 98 GiB for Gemma-4-31B (225,280 columns), more than any lock could grant. A re-encode (`campaign.py
+  reencode`) asks for the bundle, 5.5 + 2 GiB and the 3.5 GiB on the GPU (Granite-4.0-H-Tiny's: 9.6 GiB anonymous
+  and 4.1 GiB reserved on the GPU, 4.7 GiB bundle).
+- **Joint fit.** The GCCA holds the joint covariance and its whitened copy (2·P² float64, P the views' summed
+  dimensions) plus what `fit_backend.top_eig` allocates on the path it takes (`fit_hub.eigh_bytes`, measured):
+  with scipy, as in `~/venvs/rocm` where fits run, the float32 subset solver adds 1.3·P² float64 and the
+  eigenvectors; numpy's float64 `eigh` would add 4.1·P² (the estimate until October 7 counted that path, 6.1·P²,
+  37.4 GiB at P = 28,672). Seven views of 4,096 give P = 28,672: the GCCA phase is 21.5 GiB, so the decoder phase
+  (26.6 GiB, growing with the dev spans) is the anonymous peak, with the fitted K adapters (3.1 GiB), the
+  transforms and the base on top: 35.6 GiB of anonymous memory for the joint seven-model refit, which peaked at
+  28.3 GiB. On the GPU the device adds 3.5 GiB and 18 bytes per P² cell (the joint covariance's float64 sums and
+  their tiles there), calibrated on that refit, whose torch peak was 16.6 GiB reserved: 53 GiB in all for it, which
+  the guard starts at MemAvailable ≥ 78 GiB. Without scipy (the experiment venv) the "float32" path adds 5.7·P²
+  (measured: numpy.linalg computes a float32 matrix in float64, so the float32 copy and its promotion come on top
+  of `eigh`, and it is slower, 50 s against 25 s at 8,192): run large fits with `~/venvs/rocm/bin/python`.
+- **R² of an assembled hub** (`assemble --evaluate`, `campaign.py evaluate-onboarded`): the lock asks for 2.3
+  times the hub's files. hub6-20261008's (21.6 GiB of files, fifteen models, on the GPU) peaked at 36.2 GiB
+  anonymous and 12.2 GiB on the GPU, and MemAvailable fell by 46.9 GiB; hub6-20261009's, with the guard's GTT
+  reading, 36.1 and 12.5 GiB, 46.6 GiB at the same time. Until October 9 the lock asked for the files alone.
 - **Train rows.** No phase holds the train rows: every statistic is a float64 sum over 4,096-row
   chunks. An estimate proportional to models × train rows × view_dim cannot fit the recorded peaks.
   DeepSeek-V2-Lite had the fewest train spans (87,712, against 116,865 for LFM2 and 185,672 for
   Qwen3.6) and the largest peak.
 - **Calibration.** The eigendecompositions are measured (`test_resource_guard.py` checks both the
-  numpy and the scipy subset path); the decoder phase of a joint fit is not, and its guard samples
-  (`rss_gib`, `anon_gib`) calibrate it (RESULTS.md section 9).
+  numpy and the scipy subset path, and the onboarding estimate against the twelve recorded peaks); the decoder
+  phase of a joint fit has one recorded peak (RESULTS.md section 9).
 
 ## Fit placement (fit_backend.py)
 
@@ -372,8 +421,9 @@ thread is created during `torch.cuda` initialization (`spinner.py`). None of the
 `OMP_WAIT_POLICY=PASSIVE`, `HSA_ENABLE_INTERRUPT=1`, `AMD_DIRECT_DISPATCH=0`,
 `ROC_ACTIVE_WAIT_TIMEOUT=0`, `HIP_LAUNCH_BLOCKING=1`, `HSA_ENABLE_SDMA=0`, `GPU_MAX_HW_QUEUES=1`,
 `hipSetDeviceFlags(hipDeviceScheduleBlockingSync)`. It used 152 of the 584 CPU-seconds in the GPU
-onboarding below, and 996 of the 7,015 in the GPU joint fit. The engine daemon also runs torch-ROCm and probably has the same thread while it
-stays resident. That was not checked.
+onboarding below, and 996 of the 7,015 in the GPU joint fit. The engine daemon on the torch backend has the
+same thread for as long as it stays resident, idle and after its idle unload too (`top -H`, October 9: one
+thread at 100%, Tctl 93 °C at 48 W with the loaded llama-servers idle); the ggml Vulkan engine has none.
 
 **Algebra that helps both devices.** These changes give the same numbers to float rounding
 (`test_fit_backend`, `CpuBackendTest`):
@@ -614,13 +664,14 @@ waits included.
   tables: the captures, recurrent, evaluate, `assemble --evaluate`) holds an exclusive `flock` on
   `/tmp/kvpark-campaign-gpu.lock` and starts only once MemAvailable is at least what it loads plus
   25 GiB (else it releases the lock, waits 60 s and retries, logging each wait). What it loads:
-  the model; for pair_eval the larger model and the hub bundle it holds whole; for fit_hub the
+  the model; for pair_eval the larger model, the two hub sides it reads and 4 GiB for the probe's buffers and its
+  states (Nemotron-3.5 → Qwen3.8 took 34.0 GiB, 30.5 of them on the GPU, where the model and sides came to 33.2); for fit_hub the
   base hub plus an estimate that grows with the new model's K/V width and the dev spans
-  (`fit_hub_extra`: its stage-1 covariance, decoder moments and the dev spans tiled over the
-  pivots, counted at the base hub's 17,355 dev spans, which bound every model's; 13.8 GiB for
-  LFM2-2.6B, measured 11.0, 21.0 GiB for DeepSeek-V2-Lite, measured 16.7, and 14.3 GiB for
-  Qwen3.6-35B-A3B, measured 13.0, where the estimate by width alone had asked for 12.1: its
-  tokenizer keeps every dev span of the base, twice LFM2's). The command
+  (`fit_hub_extra`: its stage-1 covariance, its decoder's statistics and chunk rows, per dev span
+  and pivot what does not grow with the model, counted at the base hub's 17,355 dev spans, which
+  bound every model's, and on the GPU the device's memory; with the base hub, for a GPU fit, 17.5 GiB
+  for LFM2-2.6B, 34.1 GiB for GLM-4.7-Flash, measured 31.3 with the GPU's, and 60.3 GiB for
+  Gemma-4-31B, measured 56.4: "Fit memory" above). The command
   inherits the locked descriptor, so the lock stays held as long as it runs even if campaign.py is
   killed; it runs in its own process group, which campaign.py stops on SIGINT, SIGTERM, SIGHUP or
   a timeout. render loads no model. The CPU-heavy commands also hold the CPU lock, after this one,
@@ -639,6 +690,16 @@ waits included.
   `dflash.attention.sliding_window` (Qwen3.6-35B-A3B's is 4,096, the bridge assumes 2,048): with
   the draft on its server a switch keeps a native tail of the window minus one token, so that the
   draft sees native context only.
+- **Held-out chats: a selection set now.** Every evaluation uses the long-chat corpus's test split
+  (`corpus-long-chat`), kept out of the hub corpus by id. By October 9 all 18 of its chat conversations had been
+  scored, the eight fixed ones 48-88 times each, and the `reverse` encoder, its variance cap and the native-prefix
+  rule were chosen on those eight: the campaigns' numbers are selection-set results (RESULTS.md section 9,
+  "Selection set"), and those choices are frozen. A fresh set for the next choice is built and kept unscored:
+  `evidence/linear-transfer/corpus-heldout-20261009/`, 30 multi-turn chats (24 primary, 6 reserve) of 6,631-14,746
+  Muse tokens before the final message, drawn by `build_corpus.py` from the local SmolTalk2 file of
+  `multi_turn_reasoning_if_think` (no download), with every earlier corpus excluded by id and by user turns (no
+  conversation in common with any of them). Point `pair_eval.py --corpus` at it only for a decision not yet
+  taken.
 - **Floors.** Into Qwen3.8 the campaign starts the recurrent cell from Qwen3.8's mean on the new
   pin; RESULTS.md section 2 started it from zero on the old pin, so those floors and recovered
   shares are not comparable with a campaign's. The Qwen3-4B → Qwen3.8 baseline runs under the
@@ -677,11 +738,17 @@ waits included.
   therefore capped at 4 times the pooled pivot estimates' (`hub.ONBOARD_VARIANCE_CAP`, `fit_hub.py
   --onboard-variance-cap`, 0 for none),
   the largest the end-to-end comparison covered (the pilots reached at most 3.75 on their train spans;
-  `reverse_z`, median 8-10 and up to 41, lost on LFM2). The cap binds on none of the four models
-  onboarded so far. The fit logs each encoder's smallest per-dimension R², its variance ratios and the
-  dimensions capped (stage `onboard-encoder`), and warns (stage `onboard-warning`, stderr, the campaign
-  report) when the cap binds or a dimension's R² is below 0.05. Another method for models already
-  onboarded:
+  `reverse_z`, median 8-10 and up to 41, lost on LFM2). The cap bound on none of the first four models
+  onboarded, nor on Falcon-H1, Kimi-Linear or the two Gemma 4 models. It bound on Ling-3.0-tiny (1,509 of
+  4,096 K dimensions, smallest per-dimension R² 0.061), which still translates well, and on three Mamba hybrids
+  where a dimension's R² was also below 0.05: Granite-4.0-H-Tiny (2,561; R² 0.044), Nemotron-3.5 (2,915; 0.028)
+  and Jamba (3,926; 0.003), whose `reverse` encoders did no good or harm
+  ([hub6](#hub6-and-onboarding-results-by-family)). The fit logs each encoder's smallest per-dimension R², its
+  variance ratios and the dimensions capped (stage `onboard-encoder`), and warns (stage `onboard-warning`,
+  stderr, the campaign report) when the cap binds or a dimension's R² is below 0.05: when both fire on about
+  half of the dimensions or more, evaluate the direction out of the model before using its `reverse` encoder,
+  and re-encode it with `ridge` where it does not help (Granite and Nemotron, October 9). Another method for
+  models already onboarded:
 
   ```bash
   ../linear_transfer/.venv/bin/python campaign.py reencode [--encoder METHOD] NAME [NAME ...]
@@ -747,7 +814,7 @@ GB of new disk (`evidence/universal-kv/campaign/deepseek-v2-lite/report.md`; dia
 f32 state saves (k_pe de-rotated with the real YaRN settings) match the probe's named nodes as
 closely in the rope columns as in the latent ones (relative RMS 2e-4 at layer 0). Onboarding gives
 K R² 0.47-0.53 into it and 0.60-0.71 out of it (V 0.44-0.49 / 0.43-0.53); fit_hub needed 16.7 GiB
-of anonymous memory, which the lock's estimate now follows (`fit_hub_extra`).
+of anonymous memory (a CPU fit), which the lock's estimate covers (`fit_hub_extra`).
 
 - **Qwen3.8 → DeepSeek-V2-Lite** (13 distinct chats: six fixed, two render too short, and nine of
   the longer set): hub_prefix against floor_prefix KL −0.130 [−0.384, −0.004], lower on 13/13, 47%
@@ -825,7 +892,7 @@ before the shutdown: the whole corpus, 260,546 tokens, 53.3 GB, 318 tokens/s, 0.
 prefill). Parity held on 96/96 prompts and 12/12 whole conversations; like Qwen3.6, its server keeps
 earlier reasoning, so the evaluation also ran as the servers render. Its template keeps reasoning, so
 its spans are nearly the base's (train 185,663). Onboarding (GPU fit, `reverse`) took 21 minutes of
-running time and 19.2 GiB of anonymous memory (estimated 33.0); held-out K R² 0.60-0.65 into it and
+running time, 19.2 GiB of anonymous memory and 12.1 GiB on the GPU (estimated then 33.0 in all; 34.1 now); held-out K R² 0.60-0.65 into it and
 0.66-0.75 out of it (V 0.53-0.58 / 0.50-0.60).
 
 - **Qwen3.8 → GLM-4.7-Flash** (13 chats: six fixed and the longer set): the native prompt start
@@ -849,30 +916,113 @@ them). To add another model:
 cd experiments/universal_kv
 ../linear_transfer/.venv/bin/python campaign.py plan --name NAME                 # [--catalog-id ID]; loads no model
 ../linear_transfer/.venv/bin/python campaign.py run --name NAME                  # again after a guard stop: it resumes
-../linear_transfer/.venv/bin/python campaign.py assemble --output ../../evidence/universal-kv/hub6-YYYYMMDD --evaluate \
-    lfm2-2.6b deepseek-v2-lite qwen3.6-35b-a3b glm-4.7-flash NAME
+../linear_transfer/.venv/bin/python campaign.py assemble --output ../../evidence/universal-kv/hub7-YYYYMMDD --evaluate \
+    lfm2-2.6b deepseek-v2-lite qwen3.6-35b-a3b glm-4.7-flash granite-4.0-h-tiny falcon-h1-3b \
+    nemotron-3.5-lightning-30b-a3b kimi-linear-48b-a3b ling-3.0-tiny gemma-4-26b-a4b gemma-4-31b NAME
 # only if the guard ended the R^2 evaluation of an assembled hub (the directory is kept):
-../linear_transfer/.venv/bin/python campaign.py evaluate-onboarded --hub ../../evidence/universal-kv/hub6-YYYYMMDD \
-    lfm2-2.6b deepseek-v2-lite qwen3.6-35b-a3b glm-4.7-flash NAME
+../linear_transfer/.venv/bin/python campaign.py evaluate-onboarded --hub ../../evidence/universal-kv/hub7-YYYYMMDD \
+    lfm2-2.6b deepseek-v2-lite ... NAME
 ```
 
-The joint refit of the seven models (Track A's option (c), RESULTS.md section 9) is pending: it needs the
-model servers stopped (kvpark.service's llama-server holds 47 GiB of GPU memory, and next to it the fit's
-memory went to swap). Then:
+hub6 ([below](#hub6-and-onboarding-results-by-family)) holds every model onboarded so far but Jamba.
+
+The joint refit of the seven models (Track A's option (c), RESULTS.md section 9) ran to the end on its fifth
+try (October 8-9: 1 h 44 min wall, 235 kJ). Fitted on the seven models' 87,426 common train spans, it did worse
+end to end than onboarding with `reverse` out of every model into Qwen3.8 (DS-V2-Lite 6% against 17%, LFM2 7%
+against 24%, Qwen3.6 23% against 41% of the floor's KL removed, and even Qwen3-4B 23% against 30%; individually
+significant, exact sign-flip p 0.023, for LFM2 and Qwen3.6) and into LFM2 and Qwen3.6, although its K R² was
+higher (+0.03 to +0.07 out of the onboarded models). It differs from onboarding in three ways at once (joint, on
+fewer spans, every decoder refitted), so this rules out that refit as a replacement, not joint refits in general;
+keep onboarding. The earlier tries: on
+October 8, with kvpark.service stopped (MemAvailable 104-112 GiB), it ran four times and the guard ended
+it each time (after 7, 20, 91 and 17 minutes), always on two samples at 95 °C or more taken while the job
+was already stopped: other projects' jobs outside the locks (54-122 W) heated the package. fit_hub.py
+cannot resume, so each try started over, after waiting 17-67 minutes for the GPU/memory lock behind the
+other campaigns. A whole refit needs about 1 h 50 min of wall time, half of it stopped, with the package
+free of work outside the locks. To run it again:
 
 ```bash
 cd evidence/universal-kv/onboard-encoders
-../../../experiments/linear_transfer/.venv/bin/python window_c.py --steps joint,e2e   # fit, convert, end to end
-../../../experiments/linear_transfer/.venv/bin/python review_tables.py               # the tables
+../../../experiments/linear_transfer/.venv/bin/python window_c.py --steps joint,e2e,compare   # fit, convert, end to end, tables
 ```
 
-The evaluations run with the GPU-evaluation guard defaults (85 °C / 65 °C / 4 threads) without
-environment variables, and `assemble --evaluate` runs on the GPU as a watched child process
+`compare` writes `joint7/comparison.json`: held-out R² of every pair against hub4 plus the reverse pilots
+on the same 8,884 test spans, then the joint hub against the onboarded hub end to end on the campaigns'
+own commands (`JOINT_RUNS`, `e2e-joint/`), then the cost from the logs.
+
+The evaluations run with the GPU-evaluation guard defaults (90 °C / 88 °C / 4 threads; 85 / 65 °C until
+October 8) without environment variables, and `assemble --evaluate` runs on the GPU as a watched child process
 ([Running heavy jobs safely](#running-heavy-jobs-safely)). hub5-20261006's evaluation predates that: the
 guard ended the in-process CPU evaluation once (98 °C), and it ran with `onboard_encoders.py evaluate` (GPU
 products) under `campaign.py exec`. Read the report's encoder line: an onboarding whose `reverse` encoder
 hit the variance cap, or a dimension the view barely predicts, carries a warning there (state.json
 `onboard.result.warnings`).
+
+### hub6 and onboarding results by family
+
+**hub6-20261009** (format 1) and **hub6-20261009-v2** (format 2, for `kvpark bridge engine --hub`) hold fifteen
+models: hub4-d4096's four (qwen38, muse, qwen3-4b, ornith) and eleven onboarded (lfm2-2.6b, deepseek-v2-lite,
+qwen3.6-35b-a3b, glm-4.7-flash, granite-4.0-h-tiny, falcon-h1-3b, nemotron-3.5-lightning-30b-a3b,
+kimi-linear-48b-a3b, ling-3.0-tiny, gemma-4-26b-a4b, gemma-4-31b), all with `reverse` encoders but Granite and
+Nemotron, which carry `ridge` encoders (`campaign.py reencode --encoder ridge`, October 9). Jamba, whose onboarding
+fails as a source, is left out. It was assembled on October 9 with hard links (no new disk), like
+**hub6-20261008** (`-v2`), which it replaces: that one carried the `reverse` encoders of Granite and Nemotron, so a
+switch out of Nemotron did worse than no translation (`campaign.py status` flags it as built from an older
+onboarding). Held-out R² between the eleven onboarded models (8,699 test spans they all share): K 0.35-0.75, V 0.28-0.63; the
+per-model ranges are in RESULTS.md section 10. Register each model with its campaign report's settings (`report.md`,
+"Bridge settings": `--hub-name NAME --native-prefix`, `--recurrent-mean .../campaign/NAME/recurrent/recurrent-mean.npz`
+for a hybrid whose cell holds a state, and `--no-source` where a switch out of the model did worse than the floor:
+Nemotron-3.5).
+
+Share of the floor's KL a switch removes, with Qwen3.8 (RESULTS.md section 10 has every interval and p). Into the
+model: on the six fixed chats every model's runs share, and in brackets the reports' pooled figure over every chat
+its runs scored (the longer set adds a5add943, a reply that rewrites the earlier answer, whose floor is 10-100 times
+the others' and dominates some pooled figures). Out of it: the eight fixed chats. "n.s.": no measurable difference
+(exact sign-flip p above 0.05). Qwen3-4B → Qwen3.8 under the same settings: 30%. These are selection-set numbers
+([Onboarding campaign](#onboarding-campaign-campaignpy), "Held-out chats").
+
+| Family | Models (llama.cpp arch) | Qwen3.8 → model, six chats (pooled) | model → Qwen3.8 | In hub6 |
+| --- | --- | --- | --- | --- |
+| Gated DeltaNet hybrid | Qwen3.6-35B-A3B (`qwen35moe`) | 50% (39%) | 41% (50% as the servers render) | both directions |
+| Short-convolution hybrid | LFM2-2.6B (`lfm2`) | 51% (37%) | 24% | both directions |
+| MLA | DeepSeek-V2-Lite, GLM-4.7-Flash (`deepseek2`) | 31% (47%), 83% (79%) | 17%, 38% (48%) | both directions; the native prompt start is essential into them |
+| MLA + linear-attention hybrid | Kimi-Linear-48B-A3B (`kimi-linear`), Ling-3.0-tiny (`bailingmoe3`) | 21% (70%), 71% (72%) | 32%, 42% | both directions |
+| Gemma 4 iSWA | Gemma-4-26B-A4B, Gemma-4-31B (`gemma4`) | 45% (44%), 35% (27%) | 37% (35%), 33% (34%) | both directions; the source side reads only the full-attention layers |
+| Mamba2 + attention in every layer | Falcon-H1-3B (`falcon-h1`) | 9.5% n.s. (51%, nearly all of it a5add943) | 25% (p 0.055) | both directions |
+| Mamba hybrids with few attention layers | Granite-4.0-H-Tiny (`granitehybrid`, 4), Nemotron-3.5-Lightning-30B-A3B (`nemotron_h_moe`, 6), Jamba-Reasoning-3B (`jamba`, 2) | 6% n.s. (42%, nearly all a5add943), 16% (23%), 7% n.s. (4%) | `reverse`: 5% n.s., −16% n.s. (−115% as the servers render), −1031%; `ridge`: 1.3%, 4.7% (−44% as the servers render) | Granite with its `ridge` encoder; Nemotron with its `ridge` encoder, registered with `--no-source` (switches out of it skipped); Jamba left out |
+
+What decides out of a model is not the number of attention layers (Gemma-4-26B's source reads 5 full-attention
+layers and removes 37%, Ling with 6, as many as Nemotron, 42%) but whether the onboarding's encoder warnings fire:
+a hub dimension the model's attention cache predicts with train R² below 0.05, together with the variance cap
+binding on about half of the dimensions or more (Granite 0.044 and 49-63%, Nemotron 0.028 and 71-72%, Jamba 0.003
+and 95-96%; Ling, 0.061 and 37%, works). Where they fire, `reverse` scales each dimension by about 1 / R² and inflates
+what the view does not carry: no gain (Granite), harm as the servers render (Nemotron), great harm (Jamba). A `ridge`
+encoder keeps about as little as the floor and is harmless out of Granite, which is what hub6 now carries; out of
+Nemotron as the servers render (what a live switch holds) it still does worse than the floor (−44%, lower on 1 of 8
+chats), so register Nemotron with `kvpark bridge add --no-source`: switches out of it are skipped and the next model
+prefills natively (the campaign report's "Bridge settings" add the flag when a switch out of the model did worse
+than the floor). When the earlier conversation matters, a native prefill is the better choice out of Granite too. The warnings come from the onboarding
+itself, before any evaluation (state.json `onboard.result.warnings`, the report's encoder line): for a new model,
+evaluate the direction out of it before shipping its `reverse` encoder, and re-encode with `ridge` where it does not
+help.
+
+Into a model the decoders, which do not depend on the encoder, removed 16-83% of the floor on the six shared chats for
+nine of the twelve, and nothing measurable into Granite, Falcon-H1 and Jamba (6-10%, sign-flip p 0.09-0.25); into
+Granite, Falcon and Kimi-Linear one chat (a5add943) carries 93-95% of the pooled floor, so their pooled figures are
+mostly that chat.
+
+Live with hub6 (October 9; RESULTS.md section 10, `evidence/universal-kv/live-hub6-20261009b/`): ten switches on
+throwaway a7b94df2c ROCm servers, two models per run under `campaign.py exec --gpu-evaluation`, the Vulkan engine:
+Qwen3.8 → Granite-4.0-H-Tiny, Qwen3.8 ↔ Gemma-4-26B-A4B, Kimi-Linear → Qwen3.8 and Kimi-Linear → Gemma-4-26B-A4B
+(two onboarded models). Every switch reused exactly T0. Into Qwen3.8 (12-15K tokens) a switch took 9.7-12.5 s of wall
+time against 48-52 s of native prefill: 3.3-6.8 times faster where the native prefill met few guard pauses (a pause
+stops the job while the GPU finishes its queue, so a timing with pauses inside is only bounded, and the first series'
+pause-corrected "3.6-5.9 times" is withdrawn). Into Gemma-4-26B 2.7-3.5 s against 6.6-6.8 s without a pause (2.0-3.1
+times), into Granite 1.8-2.1 s against 3.8-5.3 s (it prefills fast). The first 32 generated tokens matched the native
+run's in all four switches into Gemma and in one of two into Granite, which mostly reflects the 2,048-token native
+tail; into Qwen3.8 they part early but restate the request correctly. To repeat them:
+`live-hub6-20261009b/scripts/live.sh HUB NAME=A,B@PORT ...`; `live_bridge.py hops --native-chunk 1024` also prefills each
+native reference in cooled 1,024-token requests (an upper bound: each request adds its own overhead).
 
 ## The engine
 

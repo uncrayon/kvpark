@@ -184,6 +184,11 @@ def joint_spans(views):
             if int(end[-1]) != len(record["text"].encode("utf-8")):
                 raise ValueError(f"{view.name} capture does not cover the rendered text of {document_id}")
             segment, inside, overlap = classify_tokens(start, end, table)
+            # the capture's special flags are kv_probe's (control, user-defined and unknown tokens), stricter than the
+            # engine's and pair_eval's (control tokens only, pair_eval.engine_special): a document whose text spells a
+            # user-defined token (Falcon-H1-3B's 192 LaTeX commands) is left out of the fit and the token tables (17 of
+            # Falcon's 248) although a live switch and pair_eval translate it. Kept so: every fitted
+            # hub's spans stay as they were
             if np.any(overlap & view.captures.special[span].astype(bool)):
                 bad.append(view.name)
             ids, starts, _ = table
@@ -378,13 +383,17 @@ def fit_view(view, kind, rows, *, layer_rank=512, view_dim=2048, eps=1e-3, chunk
         for moment, block in zip(moments, blocks):
             moment.add(block)
     means, bases, explained = [], [], []
-    for moment in moments:
+    for index, moment in enumerate(moments):
         guard_check("view")
         cov = moment.covariance()
         values, vectors = _top_eig(cov, min(layer_rank, len(cov)))
         means.append(moment.mean.astype(np.float32))
         bases.append(vectors.astype(np.float32))
         explained.append(float(values.sum() / max(np.trace(cov), 1e-30)))
+        # its float64 sums and covariance (16 bytes per width^2 cell: 13 GiB for Gemma-4-31B's 60 layers)
+        # are not needed by stage 2, whose own covariance and eigendecomposition are the peak
+        moments[index] = None
+    moment = cov = None
     partial = ViewTransform(layers, means, bases, np.zeros((0, 0), np.float32), np.zeros(0, np.float32))
     width = sum(b.shape[1] for b in bases)
     second = Moments(width)

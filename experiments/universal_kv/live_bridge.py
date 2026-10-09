@@ -25,7 +25,11 @@ hops    per conversation (held-out corpus, final assistant message removed): pri
         kvpark.bridge.switch.switch() (save A's slot, translate, restore into B, warm request),
         32 generated tokens. Records cache reuse (cache_n == T0), engine mode and device,
         engine, restore and tail-prefill seconds against the native prefill, the load average
-        and MemAvailable next to every timing, and how many generated tokens agree.
+        and MemAvailable next to every timing, the wall clock (epoch seconds) of the prime, the
+        native run, each switch and its generation (to take a guard's pauses out of them), and
+        how many generated tokens agree (--keep-text: and the 32 tokens' text); --native-chunk N
+        prefills the native reference's tokens again in requests of N tokens, each after the
+        --cool-c wait: the native prefill's time without the guard's pauses (chunked_prefill).
 drafts  speculative decoding on the target after a translated restore: per conversation the
         target generates --n-predict tokens (temperature 0) after a native prefill and after a
         switch from the source (no warm request, as Hermes switches), with the draft counts of
@@ -88,10 +92,18 @@ options switches whose real chat request carries template options (TEMPLATE_OPTI
 
 Every server start waits for memory (wait_for_memory): MemAvailable must exceed the model files
 (the model, a draft model, a projector) plus 25 GiB (the box hard-freezes rather than OOM-killing); it polls every 60 s for up to 90
-minutes and records the wait.
+minutes and records the wait. Run it under a resource guard (`campaign.py exec --memory-bytes N
+--gpu-evaluation --guard-log FILE -- python3 live_bridge.py ...`: the GPU/memory lock, the memory check
+and a Watch): the servers and the engine daemon (started ahead, start_engine_daemon, with an idle exit of a
+week: the run stops it) then stay in its process group, so the guard pauses and ends them with it, and every
+switch first checks that the daemon answering is still that one (check_daemon: else the bridge would start
+another outside the guard); hops --cool-c waits for the package to cool before each timed step. There, use the
+ggml Vulkan engine (--engine vulkan=PYTHON:vulkan): a torch-ROCm
+daemon keeps one runtime thread busy, which alone held Tctl at 93 C, so the guard stopped and continued
+the run every few seconds (2026-10-09).
 
-Counts, timings and token ids only for the corpus conversations (no text); the media answers
-(about the generated chart) are kept.
+Counts, timings and token ids only for the corpus conversations (no text; hops --keep-text keeps the
+32 generated tokens, the models' own words); the media answers (about the generated chart) are kept.
 """
 
 import argparse
@@ -119,7 +131,8 @@ from kvpark.bridge import engine_client, messages as bridge_messages, registry, 
 from kvpark.bridge import switch as bridge_switch  # noqa: E402
 from kvpark.bridge.client import LlamaServer  # noqa: E402
 from kvpark.bridge.messages import conversation_from_openai  # noqa: E402
-from kvpark.bridge.switch import switch  # noqa: E402
+from kvpark.bridge.switch import switch as bridge_switch_switch  # noqa: E402
+import resource_guard  # noqa: E402  (standard library only)
 
 COMMON = ["--n-gpu-layers", "all", "--split-mode", "none", "--parallel", "1", "--threads", "16",
           "--threads-batch", "16", "--batch-size", "2048", "--ubatch-size", "512", "--flash-attn", "on",
@@ -189,16 +202,125 @@ def machine():
     return {"load_average": load_average(), "mem_available_mib": mem_available_mib()}
 
 
+def cool(args):
+    """With --cool-c: wait until the package is at most that cool (resource_guard.wait_cool) before a timed step,
+    so that a prefill burst seldom reaches the guard's pause (which a timing would include, and whose lagged
+    Tctl peak can end the run); the seconds waited, else None."""
+    if args.cool_c is None:
+        return None
+    return round(resource_guard.wait_cool(start_c=args.cool_c), 1)
+
+
+# the idle exit of a daemon started in the run's process group: the run stops it itself (Rig.stop). Its idle time
+# counts on the monotonic clock, which runs on while the guard holds the run stopped and while --cool-c waits (no
+# limit), so the daemon's default 600 s could end it mid-run; the bridge's ensure_daemon would then start another in
+# a session of its own, outside the guard (what ended the first live attempt of 2026-10-09, aborted-1)
+WATCHED_IDLE_EXIT_S = 7 * 24 * 3600
+WATCHED_DAEMONS = {}        # bridge directory -> the daemon process start_engine_daemon started in this process group
+
+
+def chunked_prefill(server, tokens, chunk, args):
+    """The native prefill of `tokens` once more, `chunk` tokens per request, each after a cooling wait (--cool-c), so
+    that no timed request meets the guard's pause: on this machine a 30-60 s prefill always does (it holds Tctl at
+    89-90 C at 120-138 W and the guard stops it at 90 C), and while the run is stopped the GPU still drains its queue,
+    so neither the wall time nor the wall time less the pauses is the prefill's own. The server splits any request
+    into the same n_ubatch batches, so the chunks' summed prompt_ms is the whole prefill's time without pauses (a
+    chunk after the first re-processes the few tokens the server rolls back to a context checkpoint: cache_n and
+    prompt_n say how many). The slot is erased before and after. Returns {"chunk", "chunks", "prompt_ms", "prompt_n"}."""
+    server.slot_action("erase")
+    out = []
+    for end in range(chunk, len(tokens) + chunk, chunk):
+        end = min(end, len(tokens))
+        waited = cool(args)
+        started = time.time()
+        reply, wall = server.complete(tokens[:end], n_predict=1)
+        timings = reply.get("timings") or {}
+        out.append({"end": end, "cache_n": timings.get("cache_n"), "prompt_n": timings.get("prompt_n"),
+                    "prompt_ms": timings.get("prompt_ms"), "wall_s": round(wall, 3),
+                    "clock": [round(started, 3), round(time.time(), 3)], "cool_wait_s": waited})
+        if end == len(tokens):
+            break
+    server.slot_action("erase")
+    return {"chunk": chunk, "chunks": out, "prompt_ms": round(sum(item["prompt_ms"] or 0.0 for item in out), 3),
+            "prompt_n": sum(item["prompt_n"] or 0 for item in out)}
+
+
+def start_engine_daemon(config, path, timeout=180, *, idle_exit=WATCHED_IDLE_EXIT_S):
+    """Under a guard's Watch: the engine daemon of the configuration at `path`, started in this process group (the
+    bridge would start it in a session of its own, which the guard cannot pause: on 2026-10-09 its first load drew
+    up to 59 W while the stopped run's Tctl peaked at 98.2 C and the guard ended the run), with the configuration's
+    idle unload (as engine_client starts it) and an idle exit of `idle_exit` seconds; returns the process once it
+    answers, recorded in WATCHED_DAEMONS (switch() checks it before every switch). The bridge then finds it
+    running and uses it."""
+    engine = config["engine"]
+    command = [engine["python"], str(Path(engine["script"]).with_name(engine_client.DAEMON_SCRIPT)),
+               "--bridge-dir", str(path.parent)]
+    if engine.get("device"):
+        command += ["--device", str(engine["device"])]
+    if engine.get("idle_unload") is not None:
+        command += ["--idle-unload", str(engine["idle_unload"])]
+    command += ["--idle-exit", str(idle_exit)]
+    with open(path.parent / engine_client.LOG, "ab") as stream:
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stream,
+                                   env=engine_client._environment(config))
+    started = time.monotonic()
+    while time.monotonic() - started < timeout:
+        if process.poll() is not None:
+            raise RuntimeError(f"the engine daemon exited; see {path.parent / engine_client.LOG}")
+        try:
+            engine_client._ping(path.parent)
+            WATCHED_DAEMONS[str(Path(path).parent.resolve())] = process
+            return process
+        except (OSError, ValueError, engine_client.DaemonError):
+            time.sleep(0.5)
+    process.terminate()
+    raise RuntimeError("the engine daemon did not answer")
+
+
+def check_daemon(path):
+    """Before a switch under a guard's Watch: the daemon start_engine_daemon started for the configuration at `path`
+    must still run and answer for its bridge directory (RuntimeError otherwise: the bridge would start another in a
+    session of its own, which the guard can neither pause nor end). Nothing to check without one."""
+    if path is None:
+        return
+    directory = str(Path(path).parent.resolve())
+    process = WATCHED_DAEMONS.get(directory)
+    if process is None:
+        return
+    if process.poll() is not None:
+        raise RuntimeError(f"the engine daemon started in the run's process group (pid {process.pid}) exited "
+                           f"({process.returncode}); a switch would start another outside the guard")
+    try:
+        reply = engine_client._ping(Path(directory))
+    except (OSError, ValueError, engine_client.DaemonError) as error:
+        raise RuntimeError(f"the engine daemon started in the run's process group (pid {process.pid}) does not "
+                           f"answer ({error})") from None
+    if reply.get("pid") != process.pid:
+        raise RuntimeError(f"the engine daemon answering for {directory} is pid {reply.get('pid')}, not the one started "
+                           f"in the run's process group ({process.pid})")
+
+
+def switch(config, conversation, source, target, *, config_path=None, **options):
+    """kvpark.bridge.switch.switch, after check_daemon (under a guard's Watch: the daemon is still the run's own)."""
+    check_daemon(config_path)
+    return bridge_switch_switch(config, conversation, source, target, config_path=config_path, **options)
+
+
 class Server:
+    """A throwaway llama-server. Run under a resource guard's Watch (campaign.py exec, resource_guard.py run:
+    KVPARK_GUARD_WATCHED=1) it stays in this process's group, so the guard pauses and ends it with the run;
+    otherwise it gets a session of its own."""
+
     def __init__(self, name, binary, gguf, port, ctx, slot_dir, log, args=None, env=None):
         self.name, self.port = name, port
         self.argv = [binary, "--model", gguf, "--alias", name, "--port", str(port), "--ctx-size", str(ctx),
                      "--slot-save-path", str(slot_dir), *(COMMON if args is None else args)]
         self.log, self.process, self.env = log, None, env
+        self.own_group = os.environ.get(resource_guard.WATCHED) != "1"
 
     def start(self, timeout=900):
         self.process = subprocess.Popen(self.argv, stdout=open(self.log, "ab"), stderr=subprocess.STDOUT,
-                                        stdin=subprocess.DEVNULL, start_new_session=True,
+                                        stdin=subprocess.DEVNULL, start_new_session=self.own_group,
                                         env={**os.environ, **(self.env or {})})
         started = time.monotonic()
         while time.monotonic() - started < timeout:
@@ -215,11 +337,17 @@ class Server:
 
     def stop(self):
         if self.process and self.process.poll() is None:
-            os.killpg(self.process.pid, signal.SIGTERM)
+            if self.own_group:
+                os.killpg(self.process.pid, signal.SIGTERM)
+            else:
+                self.process.terminate()
             try:
                 self.process.wait(timeout=60)
             except subprocess.TimeoutExpired:
-                os.killpg(self.process.pid, signal.SIGKILL)
+                if self.own_group:
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                else:
+                    self.process.kill()
 
     def log_offset(self):
         return Path(self.log).stat().st_size
@@ -279,7 +407,7 @@ class Rig:
         missing = set(names) - set(self.specs)
         if missing:
             raise SystemExit(f"no server spec for {sorted(missing)}")
-        self.servers, self.configs = {}, {}
+        self.servers, self.configs, self.daemons = {}, {}, []
 
     def start(self):
         args = self.args
@@ -309,10 +437,20 @@ class Rig:
             config["tail"] = args.tail
             registry.save(config, path)
             self.configs[label] = (registry.load(path), path)
+            if os.environ.get(resource_guard.WATCHED) == "1":
+                self.daemons.append(start_engine_daemon(self.configs[label][0], path))
 
     def stop(self):
         for label, (_, path) in self.configs.items():
             engine_client.stop(path.parent)
+        for daemon in self.daemons:
+            try:
+                daemon.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                daemon.kill()
+            for directory, process in list(WATCHED_DAEMONS.items()):
+                if process is daemon:
+                    del WATCHED_DAEMONS[directory]
         for server in self.servers.values():
             server.stop()
 
@@ -397,6 +535,7 @@ def switch_record(report, prewarmed, before):
 
 
 def prewarm(config, path, a, b):
+    check_daemon(path)
     started = time.monotonic()
     reply = engine_client.prewarm(config, [a, b], path.parent)
     return {"seconds": round(time.monotonic() - started, 3), "ok": bool(reply),
@@ -416,24 +555,41 @@ def hops(args):
                         max_tokens=min(spec["ctx"] for spec in rig.specs.values()) - 512)
         for item, conversation, _ in chosen:
             record = {"id": item.get("id"), "source": item.get("source"), "hops": []}
-            record["prime"] = {"model": route[0], **prime(first, conversation), **machine()}
+            waited = cool(args)
+            started = time.time()
+            record["prime"] = {"model": route[0], **prime(first, conversation), **machine(),
+                               "clock": [round(started, 3), round(time.time(), 3)], "cool_wait_s": waited}
             for a, b in zip(route, route[1:]):
                 hop = {"from": a, "to": b, "engines": {}}
                 target = rig.client(b)
                 t_tokens = target_tokens(target, conversation)
                 target.slot_action("erase")
+                waited = cool(args)
                 before = machine()
+                started = time.time()
                 native, wall = target.complete(t_tokens, n_predict=32)
-                hop["native"] = {**generation(native), "wall_s": round(wall, 2), "tokens": len(t_tokens), **before}
+                hop["native"] = {**generation(native), "wall_s": round(wall, 2), "tokens": len(t_tokens), **before,
+                                 "clock": [round(started, 3), round(time.time(), 3)], "cool_wait_s": waited}
+                if args.keep_text:
+                    hop["native"]["text"] = native.get("content")
+                if args.native_chunk:
+                    hop["native_chunked"] = chunked_prefill(target, t_tokens, args.native_chunk, args)
                 for label, (config, path) in rig.configs.items():
                     entry = {}
                     try:
                         warmed = prewarm(config, path, a, b) if args.prewarm else None
+                        waited = cool(args)
                         before = machine()
+                        started = time.time()
                         report = switch(config, conversation, a, b, config_path=path)
                         entry = switch_record(report, warmed, before)
+                        entry["clock"] = [round(started, 3), round(time.time(), 3)]
+                        entry["cool_wait_s"] = waited
+                        started = time.time()
                         bridged, _ = target.complete(t_tokens, n_predict=32)
-                        entry["generation"] = generation(bridged)
+                        entry["generation"] = {**generation(bridged), "clock": [round(started, 3), round(time.time(), 3)]}
+                        if args.keep_text:
+                            entry["generation"]["text"] = bridged.get("content")
                         entry["agree_prefix"] = agree(bridged.get("tokens"), native.get("tokens"))
                     except Exception as error:      # noqa: BLE001  (record and continue)
                         entry["error"] = f"{type(error).__name__}: {error}"[:400]
@@ -1449,6 +1605,17 @@ def main(argv=None):
                         "(KVPARK_BRIDGE_KEEP_JOB; on disk, they hold slot copies)")
     parser.add_argument("--after", help="options: a command run before the servers stop (its output in "
                         "OUTPUT/after.log)")
+    parser.add_argument("--cool-c", type=float,
+                        help="hops: before the prime, each native reference and each switch, wait until the package "
+                        "is at most this many C (resource_guard.wait_cool), so that the timed step seldom meets the "
+                        "guard's pause")
+    parser.add_argument("--native-chunk", type=int, metavar="TOKENS",
+                        help="hops: after each native reference, prefill the same tokens again in requests of this many "
+                        "tokens, each after the --cool-c wait (chunked_prefill): the prefill's time without the guard's "
+                        "pauses (hop native_chunked)")
+    parser.add_argument("--keep-text", action="store_true",
+                        help="hops: also keep the 32 generated tokens' text, native and after each switch (the "
+                        "models' own words, for an answer check; the conversations' text is never kept)")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     args.output = args.output.resolve()

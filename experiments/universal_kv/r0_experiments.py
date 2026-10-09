@@ -40,8 +40,8 @@ model's size + 25 GB (polled every 60 s for up to 90 min; waits are logged). Pro
 sequential, so one model is loaded at a time.
 
 Resource guard (resource_guard.py): BLAS threads and the probe's --threads are capped at 8; run by
-hand, every probe run waits until the CPU is at most 75 C and runs under a Watch (paused at 90 C,
-ended at 95 C on two samples in a row; samples in <output>/.../<step>.guard.jsonl); inside a campaign
+hand, every probe run waits until the CPU is at most 88 C and runs under a Watch (paused at 90 C, continued at
+88 C, ended at 98 C on two samples in a row; samples in <output>/.../<step>.guard.jsonl); inside a campaign
 command (calibrate) the campaign's Watch covers the whole process group instead. --guard KEY=VALUE
 changes a setting.
 """

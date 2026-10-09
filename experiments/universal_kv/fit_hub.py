@@ -53,10 +53,10 @@ Resource guard (resource_guard.py): BLAS threads are capped at 8 unless set; a G
 lock first (/tmp/kvpark-campaign-gpu.lock, campaign.py's; a fit campaign.py exec runs inherits it) and
 the guard's GPU-hang stop reads the kernel log; every fit holds the CPU lock
 (/tmp/kvpark-campaign-cpu.lock: one CPU-heavy fit at a time; a fit campaign.py runs inherits
-it); it is refused when its estimated peak of anonymous memory (memory_estimate, logged as stage
-"memory"; --estimate prints it and exits) exceeds MemAvailable minus 25 GiB (--guard
-fit_margin_gib=N); it waits until the CPU is at most 75 C, and every fit loop calls the guard between
-chunks (hub.guard_check: sleep at 90 C until 80 C, stop at 95 C twice in a row, stop at a GPU hang), with
+it); it is refused when its estimated peak of anonymous memory, plus the device's for a GPU fit (GTT on this
+APU: memory_estimate, logged as stage "memory"; --estimate prints it and exits) exceeds MemAvailable minus 25 GiB (--guard
+fit_margin_gib=N); it waits until the CPU is at most 88 C, and every fit loop calls the guard between
+chunks (hub.guard_check: sleep at 90 C until 88 C, stop at 98 C twice in a row, stop at a GPU hang), with
 a sample every 2 s in OUTPUT.guard.jsonl. A single eigendecomposition of a joint fit runs for minutes
 without a check: run a joint refit under `resource_guard.py run --cpu-lock --` (or campaign.py exec
 --cpu-lock) so that it can be paused there too.
@@ -83,13 +83,24 @@ import hub
 
 GIB = 1024 ** 3
 # -- the memory a fit holds -------------------------------------------------------------------------
-# Anonymous memory at the fit's peak (its RSS is mostly the memory-mapped captures, file pages the
-# kernel can drop). An onboarding (--base) follows campaign.fit_hub_extra, calibrated on the recorded
-# peaks with the 4.6 GiB base hub (LFM2-2.6B 11.0 GiB, DeepSeek-V2-Lite 16.7, Qwen3.6-35B-A3B 13.0):
-# ONBOARD_BASE and the base hub, plus per kind (one at a time) 24 bytes per cell of the new model's
-# stage-1 covariance (W1 x W1, W1 its per-layer PCA ranks summed), 8 per hub dimension x column of its
-# decoder's float64 cross moments, and per dev span and pivot 12 per hub dimension and 4 per column
-# (the alpha choice's tiled dev estimates and rows).
+# What a fit takes off MemAvailable at its peak: its anonymous memory (its RSS is mostly the memory-mapped
+# captures, file pages the kernel can drop) and, for a GPU fit, the fit backend's device memory, which on this
+# APU is GTT: system RAM that no RssAnon shows (a 4 GiB torch allocation added nothing to RssAnon and took
+# 4.0 GiB off MemAvailable). Until 2026-10-09 the onboarding estimate was calibrated on anonymous peaks only,
+# and the GPU fits' real peaks (anonymous + torch's reserved peak) exceeded it in 7 of 9 onboardings by 1.0-3.9
+# GiB. An onboarding (--base) follows campaign.fit_hub_extra, calibrated on the twelve onboardings' recorded
+# peaks with the 4.6 GiB base hub (anonymous + GPU; the first three fitted on the CPU: LFM2-2.6B 11.0 GiB,
+# DeepSeek-V2-Lite 16.7, Qwen3.6-35B-A3B 13.0; on the GPU 13.5-16.5 for the six with at most 8,192 columns,
+# GLM-4.7-Flash 31.3, Gemma-4-26B-A4B 24.2, Gemma-4-31B 56.4; each estimate 0.5-4 GiB above): ONBOARD_BASE and the
+# base hub, ONBOARD_GPU_BYTES on the GPU (torch's context and calibration, the pivots' rows and estimates on the
+# device), plus per kind (one at a time) 28 bytes per cell of the new model's stage-1 covariance (W1 x W1, W1 its
+# per-layer PCA ranks summed: float64 sums, the covariance and its eigendecomposition, on the host and on the
+# device), 10 per hub dimension x column (its decoder's float64 cross moments and float32 weights), 12 per chunk
+# row x column (its rows in 4,096-row chunks: two on the host while the next is read, one on the backend), and
+# per dev span and pivot 12 per hub dimension (what does not grow with the model: the pivots' chunk rows and
+# estimates, their dev Moments). The decoder's dev statistics are streamed (hub._DecoderStats.add_dev) since
+# 2026-10-06: the 4 bytes per dev span x pivot x column counted until 2026-10-09 asked 98 GiB of Gemma-4-31B
+# (225,280 columns), more than the machine has.
 # A joint fit holds, per kind, at most: the GCCA's eigendecomposition, the joint covariance C and the
 # whitened W C W (P x P float64, P the views' dimensions summed: 28,672 for seven views of 4,096: EIGH_HELD of
 # them) and fit_backend.top_eig of it (eigh_bytes: what that path allocates beyond its input); or later the
@@ -98,14 +109,17 @@ GIB = 1024 ** 3
 # the widest model (M - 1 copies of its dev rows and of their estimates, float32 and float64, and three
 # float64 D x columns solves); or first a model's stage-2 eigendecomposition (its Moments' sums and
 # covariance, EIGH_HELD of W1 x W1, and top_eig of it). Each kind's transforms and, while the next kind is
-# fitted, the fitted kind's adapters (float32) stay held. JOINT_BASE is the onboarding's ONBOARD_BASE: no
-# joint fit has a recorded peak yet; its guard samples (OUTPUT.guard.jsonl, rss_gib and anon_gib) will
-# calibrate it.
-ONBOARD_BASE = int(4.5 * GIB)
-ONBOARD_COVARIANCE_BYTES = 24
-ONBOARD_DECODER_BYTES = 8
+# fitted, the fitted kind's adapters (float32) stay held. JOINT_BASE is the onboarding's ONBOARD_BASE. On the GPU
+# the device adds ONBOARD_GPU_BYTES and JOINT_GPU_BYTES per P x P cell (the joint covariance's float64 sums and
+# their tiles there): the one joint fit on the GPU (seven views, P = 28,672, 2026-10-08/09) peaked at 28.3 GiB
+# anonymous (estimated 35.6) and 16.6 GiB reserved on the device.
+ONBOARD_BASE = int(5.5 * GIB)
+ONBOARD_GPU_BYTES = int(3.5 * GIB)
+ONBOARD_COVARIANCE_BYTES = 28
+ONBOARD_DECODER_BYTES = 10
+ONBOARD_CHUNK_BYTES = 12
 ONBOARD_DEV_LATENT_BYTES = 12
-ONBOARD_DEV_COLUMN_BYTES = 4
+JOINT_GPU_BYTES = 18
 # fit_backend.top_eig's allocations beyond its float64 n x n input, in n x n float64 matrices (8 n^2 bytes), by
 # the path it takes, the eigenvectors' 12 n k bytes (float32 and float64) on top. Measured in a fresh process
 # (VmHWM over the RSS before, scratchpad trackA/topeig_mem.py, 2026-10-07): numpy's eigh of the float64 matrix
@@ -185,10 +199,11 @@ def view_shape(widths, layer_rank, view_dim):
             "bases": sum(width * rank for width, rank in zip(widths, ranks))}
 
 
-def onboard_bytes(stage1, columns, *, dev_spans, pivots, hub_dim):
-    """An onboarding's anonymous memory beyond ONBOARD_BASE and the base hub, for one kind."""
+def onboard_bytes(stage1, columns, *, dev_spans, pivots, hub_dim, chunk=4096):
+    """An onboarding's memory (anonymous and, on the GPU, the device's) beyond ONBOARD_BASE, the base hub and
+    ONBOARD_GPU_BYTES, for one kind: chunk is fit_hub's --chunk (the rows it streams at a time)."""
     return (ONBOARD_COVARIANCE_BYTES * stage1 ** 2 + ONBOARD_DECODER_BYTES * hub_dim * columns
-            + dev_spans * pivots * (ONBOARD_DEV_LATENT_BYTES * hub_dim + ONBOARD_DEV_COLUMN_BYTES * columns))
+            + ONBOARD_CHUNK_BYTES * chunk * columns + dev_spans * pivots * ONBOARD_DEV_LATENT_BYTES * hub_dim)
 
 
 def joint_bytes(shapes, *, hub_dim, dev_spans, scipy=None):
@@ -210,30 +225,34 @@ def joint_bytes(shapes, *, hub_dim, dev_spans, scipy=None):
             "adapters": transforms + 4 * sum(D * c + v * D for c, v in zip(columns, views))}
 
 
-def memory_estimate(shapes, *, hub_dim, dev_spans, base_bytes=None, scipy=None):
-    """The fit's estimated peak of anonymous memory: {"bytes", "gib", "mode", "phase", "kinds"}.
-    shapes: {kind: [view_shape per model]}, the new model first when onboarding; base_bytes: the base
-    hub an onboarding loads (None: a joint fit); scipy: as joint_bytes."""
+def memory_estimate(shapes, *, hub_dim, dev_spans, base_bytes=None, scipy=None, gpu=False, chunk=4096):
+    """The fit's estimated peak of what it takes off MemAvailable (anonymous memory, and the device's on the GPU:
+    gpu): {"bytes", "gib", "mode", "phase", "kinds", "gpu"}. shapes: {kind: [view_shape per model]}, the new model
+    first when onboarding; base_bytes: the base hub an onboarding loads (None: a joint fit); scipy: as joint_bytes;
+    chunk: fit_hub's --chunk."""
     kinds = {}
+    device = ONBOARD_GPU_BYTES if gpu else 0
     if base_bytes is not None:
         pivots = len(next(iter(shapes.values()))) - 1
         for kind, items in shapes.items():
             kinds[kind] = {"onboard": onboard_bytes(items[0]["stage1"], items[0]["columns"], dev_spans=dev_spans,
-                                                    pivots=pivots, hub_dim=hub_dim)}
+                                                    pivots=pivots, hub_dim=hub_dim, chunk=chunk)}
         kind = max(kinds, key=lambda k: kinds[k]["onboard"])
-        total, phase = ONBOARD_BASE + base_bytes + kinds[kind]["onboard"], f"{kind} onboard"
+        total, phase = ONBOARD_BASE + device + base_bytes + kinds[kind]["onboard"], f"{kind} onboard"
     else:
         total, phase, held = 0, None, 0
         for kind, items in shapes.items():
             parts = kinds[kind] = joint_bytes(items, hub_dim=hub_dim, dev_spans=dev_spans, scipy=scipy)
+            if gpu:
+                parts["device"] = device + JOINT_GPU_BYTES * sum(s["view"] for s in items) ** 2
             name = max(("gcca", "decoder", "stage2"), key=parts.get)
-            peak = JOINT_BASE + held + parts["transforms"] + parts[name]
+            peak = JOINT_BASE + held + parts["transforms"] + parts[name] + parts.get("device", 0)
             if peak > total:
                 total, phase = peak, f"{kind} {name}"
             held += parts["adapters"]
     return {"bytes": int(total), "gib": round(total / GIB, 1), "mode": "onboard" if base_bytes is not None else "joint",
-            "phase": phase, "kinds": {kind: {key: round(value / GIB, 2) for key, value in parts.items()}
-                                      for kind, parts in kinds.items()}}
+            "phase": phase, "gpu": bool(gpu),
+            "kinds": {kind: {key: round(value / GIB, 2) for key, value in parts.items()} for kind, parts in kinds.items()}}
 
 
 def fit_memory(views, spans, args, base_manifest=None, base_bytes=None):
@@ -241,7 +260,8 @@ def fit_memory(views, spans, args, base_manifest=None, base_bytes=None):
     hub_dim = base_manifest["settings"]["hub_dim"] if base_manifest else args.hub_dim
     shapes = {kind: [view_shape([v.width(kind, layer) for layer in v.layers(kind)], args.layer_rank, args.view_dim)
                      for v in views] for kind in hub.KINDS}
-    return memory_estimate(shapes, hub_dim=hub_dim, dev_spans=int(len(spans.select("dev"))), base_bytes=base_bytes)
+    return memory_estimate(shapes, hub_dim=hub_dim, dev_spans=int(len(spans.select("dev"))), base_bytes=base_bytes,
+                           gpu=getattr(args, "device", "cpu") == "gpu", chunk=args.chunk)
 
 
 def refuse_short_memory(estimate, settings, log):
@@ -255,7 +275,8 @@ def refuse_short_memory(estimate, settings, log):
                     "margin_gib": settings.fit_margin_gib, "fits": estimate["bytes"] <= room}))
     if estimate["bytes"] <= room:
         return
-    message = (f"fit_hub: this fit needs about {estimate['gib']} GiB of anonymous memory at its peak "
+    holds = "anonymous and GPU memory" if estimate.get("gpu") else "anonymous memory"
+    message = (f"fit_hub: this fit needs about {estimate['gib']} GiB of {holds} at its peak "
                f"({estimate['mode']}, {estimate['phase']}), MemAvailable is {available / GIB:.1f} GiB and "
                f"{settings.fit_margin_gib:g} GiB must stay free")
     if not settings.enabled:

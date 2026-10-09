@@ -6,17 +6,19 @@ On 2026-10-05 at 22:02 this machine (Ryzen AI Max+ 395 with the Radeon 8060S in 
 core) and an onboarding diagnostic ran together on the CPU after hours of GPU captures. Every heavy
 job now runs under this guard:
 
-  read_sample()  the package temperature (k10temp Tctl, Tdie and Tccd*, and the iGPU's amdgpu edge,
-                 which sits in the same package; amdgpu junction, its PPT power and the NVMe composite
-                 temperatures are logged only) from /sys/class/hwmon, MemAvailable, swap and the load
-  wait_cool()    before a heavy step: wait until the package is at most start_c (75 C) and memory
+  read_sample()  the package temperature (k10temp Tctl, Tdie and Tccd*; the iGPU's amdgpu edge only with
+                 sensors="package", the rule until 2026-10-08; the edge, amdgpu junction, its PPT power and
+                 the NVMe composite temperatures are logged either way) from /sys/class/hwmon, MemAvailable, swap and the load
+  wait_cool()    before a heavy step: wait until the package is at most start_c (88 C) and memory
                  is not short (MemAvailable at least mem_resume, swap use below swap_resume)
   Watch          around a child process group: a JSONL sample every poll_s (2 s: temperatures,
-                 memory, swap, load, the group's RSS); the group is stopped (SIGSTOP) when the package
+                 memory, swap, load, the group's RSS and anonymous memory, the GPU's GTT use and its rise
+                 since the group started: the group's GPU memory, which RssAnon does not show on this
+                 APU); the group is stopped (SIGSTOP) when the package
                  reaches pause_c (90 C), swap use swap_pause (85%) or MemAvailable falls below
-                 mem_floor (8 GiB), and continued (SIGCONT) once the package is at most resume_c (80 C)
+                 mem_floor (8 GiB), and continued (SIGCONT) once the package is at most resume_c (88 C)
                  and memory has recovered; GuardAbort, after which the caller ends the group (SIGTERM,
-                 SIGCONT, SIGKILL after 30 s: stop_group), when the package is at abort_c (95 C) on
+                 SIGCONT, SIGKILL after 30 s: stop_group), when the package is at abort_c (98 C) on
                  abort_samples (2) samples in a row (the group is stopped at the first: Tctl spikes
                  that fast on this machine, and stopping the job alone brings it down 30 C within 2 s),
                  when no CPU temperature can be read for sensor_loss_s (60 s) or when a pause lasts
@@ -51,10 +53,11 @@ through run(), a fit's Guard) then leave pausing and logging to the outer Watch,
 process group.
 
 GPU evaluations (pair_eval's probe runs; campaign.py's evaluate stage and assemble --evaluate; campaign.py exec
---gpu-evaluation) take GPU_EVALUATION's defaults instead: stop at 85 C, continue at 65 C, 4 threads (a probe
-burst on the iGPU heats the CPU dies 4-8 s after the job is already stopped; with these, ~0.3% of their samples
-reached 95 C, peaks 97.9 C, and every run completed, some after a resume). KVPARK_GUARD_* and --guard still
-override them.
+--gpu-evaluation) take GPU_EVALUATION's defaults instead: 4 threads, and since 2026-10-08 the same 90 C stop and
+88 C resume as every job (a probe burst on the iGPU heats the CPU dies 4-8 s after the job is already stopped).
+In the campaigns' guard logs (to 2026-10-09) the GPU evaluations' samples at 95 C or more were 0.37% of 30,008
+with 85/65 C (ending at 95 C: 9 ends in 33 runs, each resumed) and 1.9% of 13,294 with 90/88 C (ending at 98 C: 4
+samples at 98 C or more, at most 98.4 C, 2 ends in 17 runs). KVPARK_GUARD_* and --guard still override them.
 
 Settings (Settings.from_env): KVPARK_GUARD=off turns waiting, pausing, aborting and fit_hub.py's
 memory refusal off with a loud warning (samples are still logged; the CPU lock and the thread caps
@@ -63,7 +66,7 @@ swap), _SWAP_IGNORE_GIB (0: swap always counts), _ABORT_SAMPLES, _MEM_FLOOR_GIB,
 estimated peak), _POLL_S, _SENSOR_LOSS_S, _STOP_GRACE_S, _MAX_PAUSE_S and _MAX_WAIT_S (0: no limit;
 wait_cool waits without one by default), _THREADS, _GPU_WATCH (auto, journal, kmsg or off: where the
 GPU-hang stop reads the kernel log; with the guard off a hang is logged, never acted on);
-KVPARK_HWMON_ROOT, KVPARK_GUARD_MEMINFO,
+KVPARK_HWMON_ROOT, KVPARK_GUARD_MEMINFO, KVPARK_GUARD_DRM_ROOT,
 KVPARK_GUARD_CPU_LOCK and KVPARK_GUARD_GPU_LOCK point elsewhere (tests). Command lines that use the guard take --guard KEY=VALUE
 with the same keys in lower case (pause_c=88, threads=4, off).
 """
@@ -95,14 +98,19 @@ THREAD_VARIABLES = ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"
                     "NUMEXPR_NUM_THREADS")
 WATCHED = "KVPARK_GUARD_WATCHED"        # in a watched child's environment: the outer Watch pauses it
 CPU_LOCK_FD = "KVPARK_CPU_LOCK_FD"      # the inherited descriptor that holds the CPU lock
+COOL_MARGIN_C = 2.0                     # start_c and resume_c by default: this far below pause_c
 ABORT_EXIT = 75                         # `resource_guard.py run`'s exit status when the guard ended the command
 GPU_WATCH_SOURCES = ("auto", "journal", "kmsg", "off")
 # the defaults of GPU evaluations (pair_eval's probe runs, campaign.py's evaluate stage and assemble --evaluate, exec
 # --gpu-evaluation), where KVPARK_GUARD_* do not set them: a 2 s burst of the probe at ~125 W is followed by a Tctl
 # peak of 97-98 C 4-8 s later, while the job is already stopped at 90 C (2026-10-06/07). Stopping at 85 C, resuming at
-# 65 C and 4 BLAS/probe threads: 69 of the 24,487 samples of the twelve 2026-10-07 pair_eval runs (0.28%) at or above
-# 95 C, peaks up to 97.9 C, 7 guard ends, every run completed (resumed); at the defaults they ended again and again.
-GPU_EVALUATION = {"pause_c": 85.0, "resume_c": 65.0, "threads": 4}
+# 65 C and 4 BLAS/probe threads (2026-10-07): 69 of the 24,487 samples of the twelve pair_eval runs (0.28%) at or above
+# 95 C, peaks up to 97.9 C, 7 guard ends, every run completed (resumed); at 90/80 C they ended again and again.
+# 2026-10-08 (the user: keep the GPU busy): GPU evaluations stop at 90 C like every job, continue 2 C below, and the
+# iGPU edge no longer counts (Settings.sensors); they keep 4 threads. Under these the campaigns' 17 GPU evaluations to
+# 2026-10-09 had 1.9% of their 13,294 samples at 95 C or above (85/65 C: 0.37%), 4 at 98 C or above (at most 98.4 C),
+# and 2 were ended by the guard (resumed)
+GPU_EVALUATION = {"pause_c": 90.0, "threads": 4}
 
 
 class GuardError(RuntimeError):
@@ -126,10 +134,15 @@ def now():
 @dataclasses.dataclass(frozen=True)
 class Settings:
     enabled: bool = True
-    start_c: float = 75.0           # wait_cool: the package at most this before a heavy step starts
+    # start_c and resume_c follow pause_c (COOL_MARGIN_C below it) unless set, since 2026-10-08 (they were 75 and
+    # 80 C): the user asked not to wait for cool-downs. Stopping a job drops Tctl by ~30 C within one 2 s sample, so
+    # it continues on the next one.
+    start_c: float = None           # wait_cool: the package at most this before a heavy step starts (pause_c - 2)
     pause_c: float = 90.0           # stop the job at or above
-    resume_c: float = 80.0          # continue at or below (and memory recovered)
-    abort_c: float = 95.0           # end the job at or above ...
+    resume_c: float = None          # continue at or below (and memory recovered) (pause_c - 2)
+    # 98 C since 2026-10-08 (was 95): at 95 C the guard kept ending jobs it had already stopped while
+    # work outside the locks held the package hot, which cools nothing (four joint refits lost)
+    abort_c: float = 98.0           # end the job at or above ...
     abort_samples: int = 2          # ... on this many samples in a row (stopped at the first)
     swap_pause: float = 0.85        # stop when this fraction of swap is used
     swap_resume: float = 0.80       # continue below
@@ -145,11 +158,21 @@ class Settings:
     threads: int = DEFAULT_THREADS
     hwmon_root: str = "/sys/class/hwmon"
     meminfo: str = "/proc/meminfo"
+    drm_root: str = "/sys/class/drm"    # amdgpu's GTT use (read_gpu_memory): a job's GPU memory
     cpu_lock: str = CPU_LOCK
     gpu_lock: str = GPU_LOCK        # gpu_lock(): the campaign's GPU/memory lock file
     gpu_watch: str = "auto"         # the kernel log for GPU hangs: auto, journal, kmsg or off (KernelLog)
+    # which temperatures stop and end jobs: "cpu" (k10temp Tctl/Tdie/Tccd*) or "package" (those and the iGPU's
+    # edge, the rule until 2026-10-08). "cpu" since then: 58% of the GPU evaluations' pauses that day came from the
+    # iGPU edge alone, and the GPU's own firmware throttles it; the 2026-10-05 power-off was the CPU's limit.
+    sensors: str = "cpu"
 
     def __post_init__(self):
+        for name in ("resume_c", "start_c"):
+            if getattr(self, name) is None:
+                object.__setattr__(self, name, self.pause_c - COOL_MARGIN_C)
+        if self.sensors not in ("cpu", "package"):
+            raise ValueError(f"guard: sensors must be cpu or package ({self.sensors!r})")
         if self.gpu_watch not in GPU_WATCH_SOURCES:
             raise ValueError(f"guard: gpu_watch must be one of {', '.join(GPU_WATCH_SOURCES)} ({self.gpu_watch!r})")
         if not self.resume_c < self.pause_c < self.abort_c:
@@ -248,7 +271,7 @@ def _parse(field, text, name):
 def add_arguments(parser):
     """--guard KEY=VALUE (repeatable): resource guard settings for this run (Settings.from_args)."""
     parser.add_argument("--guard", action="append", default=[], metavar="KEY=VALUE",
-                        help="resource guard setting (resource_guard.Settings: pause_c=90, abort_c=95, threads=8, "
+                        help="resource guard setting (resource_guard.Settings: pause_c=90, abort_c=98, threads=8, "
                              "mem_floor_gib=8, ...; 'off' disables it with a warning); repeatable")
 
 
@@ -368,15 +391,38 @@ def read_memory(meminfo="/proc/meminfo"):
     return out
 
 
+def read_gpu_memory(root="/sys/class/drm"):
+    """{"gtt_used", "vram_used"} in bytes, summed over the amdgpu cards (cardN/device/mem_info_*; None when
+    no card reports them). On this APU (Radeon 8060S, 2 GiB of VRAM carved out of the RAM) the GPU's working
+    memory is GTT: system RAM that MemAvailable no longer counts, and that no process's RssAnon shows (a 4 GiB
+    torch allocation added 0.0 to RssAnon, 4.0 GiB to GTT and took 4.01 GiB off MemAvailable, 2026-10-09). The
+    carve-out is outside MemTotal: VRAM use is logged only."""
+    out = {"gtt_used": None, "vram_used": None}
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError:
+        return out
+    for entry in entries:
+        if not re.fullmatch(r"card\d+", entry):
+            continue
+        for key, name in (("gtt_used", "mem_info_gtt_used"), ("vram_used", "mem_info_vram_used")):
+            value = _number(os.path.join(root, entry, "device", name), 1)
+            if value is not None:
+                out[key] = int(value) + (out[key] or 0)
+    return out
+
+
 def read_sample(settings=None):
-    """One reading: temperatures, package_c (the hottest CPU sensor or the iGPU edge; None when no CPU
-    sensor can be read), memory, swap use and the 1-minute load."""
+    """One reading: temperatures, package_c (the hottest CPU sensor, and the iGPU edge with sensors="package";
+    None when no CPU sensor can be read; edge_c is logged either way), memory, swap use, the GPU's GTT and VRAM
+    use and the 1-minute load."""
     settings = settings or Settings.from_env()
     temperatures = read_temperatures(settings.hwmon_root)
     memory = read_memory(settings.meminfo)
+    gpu = read_gpu_memory(settings.drm_root)
     cpu = temperatures["cpu"]
-    package = max(list(cpu.values()) + ([temperatures["edge"]] if temperatures["edge"] is not None else [])) \
-        if cpu else None
+    edge = [temperatures["edge"]] if temperatures["edge"] is not None and settings.sensors == "package" else []
+    package = max(list(cpu.values()) + edge) if cpu else None
     swap_total, swap_free = memory["swap_total"], memory["swap_free"]
     swap_used = None if swap_total is None or swap_free is None else swap_total - swap_free
     try:
@@ -388,7 +434,7 @@ def read_sample(settings=None):
             "mem_total": memory["mem_total"], "mem_available": memory["mem_available"], "swap_total": swap_total,
             "swap_used": swap_used,
             "swap_fraction": (swap_used / swap_total) if swap_used is not None and swap_total else 0.0,
-            "load1": load}
+            "gtt_used": gpu["gtt_used"], "vram_used": gpu["vram_used"], "load1": load}
 
 
 def group_memory(pgid, proc="/proc"):
@@ -489,6 +535,8 @@ def sample_record(sample, **extra):
             "load1": None if sample.get("load1") is None else round(sample["load1"], 2)}
     if sample.get("junction_c") is not None:
         item["junction_c"] = sample["junction_c"]
+    if sample.get("gtt_used") is not None:
+        item["gtt_used_gib"] = _gib(sample["gtt_used"])
     if sample.get("nvme_c"):
         item["nvme_c"] = sample["nvme_c"]
     item.update({key: value for key, value in extra.items() if value is not None})
@@ -519,7 +567,7 @@ class JsonLog:
 
 def wait_cool(settings=None, *, start_c=None, log=None, sample=None, clock=time.monotonic, sleep=time.sleep,
               log_every_s=60.0):
-    """Before a heavy step: wait until the package is at most start_c (settings.start_c, 75 C) and
+    """Before a heavy step: wait until the package is at most start_c (settings.start_c, 88 C) and
     memory is not short (MemAvailable at least mem_resume, swap use below swap_resume). Logs the wait
     (every log_every_s) and returns its seconds; GuardError when no CPU temperature can be read for
     sensor_loss_s or the wait passes max_wait_s (when set). With the guard off: a warning, no wait."""
@@ -770,6 +818,9 @@ class Watch:
         self.paused_since, self.reason = None, None
         self.paused_total, self.pauses, self.samples = 0.0, 0, 0
         self.max_c, self.min_available, self.max_rss, self.max_anon = None, None, 0, 0
+        # the group's GPU memory: the rise of the system's GTT use over its value at attach() (other GPU work started
+        # meanwhile counts too), and the largest anonymous + GPU memory of one sample (what the group took off MemAvailable)
+        self.gtt_base, self.max_gpu, self.max_total = None, 0, 0
         self.lost_since, self.aborted, self._last = None, None, None
         self.critical = 0               # samples in a row at abort_c
         self.kernel, self._kernel_given = kernel_log, kernel_log is not None
@@ -820,9 +871,16 @@ class Watch:
             self.min_available = min(self.min_available or current["mem_available"], current["mem_available"])
         if memory:
             self.max_rss, self.max_anon = max(self.max_rss, memory["rss"]), max(self.max_anon, memory["anon"])
+        gpu = None
+        if current.get("gtt_used") is not None:
+            self.gtt_base = current["gtt_used"] if self.gtt_base is None else self.gtt_base
+            gpu = max(0, current["gtt_used"] - self.gtt_base)
+            self.max_gpu = max(self.max_gpu, gpu)
+            self.max_total = max(self.max_total, gpu + (memory["anon"] if memory else 0))
         self.log.write(sample_record(current, state="paused" if self.paused_since is not None else "running",
                                      child_rss_gib=_gib(memory["rss"]) if memory else None,
-                                     child_anon_gib=_gib(memory["anon"]) if memory else None))
+                                     child_anon_gib=_gib(memory["anon"]) if memory else None,
+                                     child_gpu_gib=_gib(gpu)))
         self._act(current, moment)
 
     def _act(self, current, moment):
@@ -869,7 +927,10 @@ class Watch:
     def summary(self):
         return {"samples": self.samples, "max_c": self.max_c, "paused_s": round(self.paused_seconds(), 1),
                 "pauses": self.pauses, "min_available_gib": _gib(self.min_available), "max_rss_gib": _gib(self.max_rss),
-                "max_anon_gib": _gib(self.max_anon), "aborted": self.aborted, "gpu_hang": self.gpu_hang,
+                "max_anon_gib": _gib(self.max_anon),
+                "max_gpu_gib": None if self.gtt_base is None else _gib(self.max_gpu),
+                "max_total_gib": None if self.gtt_base is None else _gib(self.max_total),
+                "aborted": self.aborted, "gpu_hang": self.gpu_hang,
                 "gpu_watch": None if self.kernel is None else self.kernel.source,
                 "log": None if self.log.path is None else str(self.log.path)}
 
@@ -933,6 +994,7 @@ class Guard:
         self._stop = threading.Event()
         self._thread = None
         self.paused_total, self.pauses, self.max_c, self.critical = 0.0, 0, None, None
+        self.gtt_base, self.max_gpu = None, None         # this process's GPU memory: the rise of GTT use since __enter__
         self._critical = 0              # check() samples in a row at abort_c
         self.gpu, self.kernel, self._kernel_given = gpu, kernel_log, kernel_log is not None
         self.gpu_hang, self._hang_seen = None, None     # the first GPU-hang line; when the background saw it
@@ -940,6 +1002,7 @@ class Guard:
     def __enter__(self):
         self.log.write({"event": "guard", "pid": os.getpid(), "watched": self.watched, "gpu": self.gpu,
                         "settings": self.settings.as_dict()})
+        self.gtt_base = read_gpu_memory(self.settings.drm_root)["gtt_used"]
         if not self.settings.enabled:
             warn_off(self.log.label or f"process {os.getpid()}")
             self.log.write({"event": "guard-off", "where": "guard"})
@@ -962,7 +1025,7 @@ class Guard:
             self._gpu_check("exit", act=False)
             self.kernel.close()
         self.log.write({"event": "guard-done", "paused_s": round(self.paused_total, 1), "pauses": self.pauses,
-                        "max_c": self.max_c, "gpu_hang": self.gpu_hang,
+                        "max_c": self.max_c, "gpu_hang": self.gpu_hang, "max_gpu_gib": _gib(self.max_gpu),
                         **{f"{k}_gib": _gib(v) for k, v in own_memory().items()}})
         return False
 
@@ -992,7 +1055,12 @@ class Guard:
         if current.get("package_c") is not None:
             self.max_c = max(self.max_c or current["package_c"], current["package_c"])
         memory = own_memory()
-        self.log.write(sample_record(current, rss_gib=_gib(memory["rss"]), anon_gib=_gib(memory["anon"]), **extra))
+        gpu = None
+        if current.get("gtt_used") is not None and self.gtt_base is not None:
+            gpu = max(0, current["gtt_used"] - self.gtt_base)
+            self.max_gpu = max(self.max_gpu or 0, gpu)
+        self.log.write(sample_record(current, rss_gib=_gib(memory["rss"]), anon_gib=_gib(memory["anon"]),
+                                     gpu_gib=_gib(gpu), **extra))
 
     def _run_background(self):
         lost_since, critical = None, 0

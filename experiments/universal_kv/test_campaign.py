@@ -206,6 +206,16 @@ class FakeSpec:
         return self.shapes[key]
 
 
+class TypedSpec(FakeSpec):
+    """A FakeSpec whose K and V head shape depends on the layer's type (Gemma 4's sliding and full layers)."""
+
+    def __init__(self, layer_types, shapes, **kwargs):
+        super().__init__(layer_types, shapes, architecture="gemma4", **kwargs)
+
+    def head_shape(self, layer, key):
+        return self.shapes[self.layer_types[layer]]
+
+
 class ModelFactsTest(unittest.TestCase):
     def test_bytes_per_token(self):
         gqa = FakeSpec(("recurrent", "full", "recurrent", "full", "nextn"), {"k": (8, 64), "v": (8, 64)})
@@ -222,24 +232,38 @@ class ModelFactsTest(unittest.TestCase):
         qwen36 = FakeSpec(("recurrent", "recurrent", "recurrent", "full") * 10, {"k": (2, 256), "v": (2, 256)},
                           architecture="qwen35moe")
 
-        def extra(spec, dev):
-            return campaign.fit_hub_extra(spec, 512, dev_spans=dev, pivots=4, hub_dim=4096)
+        def extra(spec, dev, gpu=True):
+            return campaign.fit_hub_extra(spec, 512, dev_spans=dev, pivots=4, hub_dim=4096, gpu=gpu)
 
-        def formula(stage1, columns, dev):
-            return (campaign.FIT_HUB_BASE + 24 * stage1 ** 2 + 8 * 4096 * columns
-                    + dev * 4 * (12 * 4096 + 4 * columns))
+        def formula(stage1, columns, dev, gpu=True):
+            return (campaign.FIT_HUB_BASE + (campaign.FIT_HUB_GPU if gpu else 0) + 28 * stage1 ** 2
+                    + 10 * 4096 * columns + 12 * 4096 * columns + dev * 4 * 12 * 4096)
         self.assertEqual(extra(lfm2, 9945), formula(4096, 4096, 9945))
-        self.assertEqual(extra(dsv2, 8010), formula(13824, 27 * 576, 8010))         # K is the wider kind
+        self.assertEqual(extra(dsv2, 8010, gpu=False), formula(13824, 27 * 576, 8010, gpu=False))   # K is the wider kind
         base_hub = 4.58 * campaign.GIB
-        # what fit_hub measured with the 4.6 GiB base hub (anonymous memory) and its dev spans: the
+        # what the three CPU fits measured with the 4.6 GiB base hub (anonymous memory) and their dev spans: the
         # estimate is above it and not far above
-        for spec, dev, measured in ((lfm2, 9945, 11.0), (dsv2, 8010, 16.7), (qwen36, 17355, 12.96)):
-            self.assertGreater(base_hub + extra(spec, dev), measured * campaign.GIB)
-            self.assertLess(base_hub + extra(spec, dev), (measured + 1.5) * campaign.GIB)
+        for spec, dev, measured in ((lfm2, 9945, 11.0), (dsv2, 8010, 16.72), (qwen36, 17355, 12.96)):
+            self.assertGreater(base_hub + extra(spec, dev, gpu=False), measured * campaign.GIB)
+            self.assertLess(base_hub + extra(spec, dev, gpu=False), (measured + 2.5) * campaign.GIB)
             # the base hub's dev spans (17,355) bound every model's
             self.assertGreaterEqual(extra(spec, 17355), extra(spec, dev))
+        # Gemma 4: five sliding layers to one full; 26B-A4B 8 x 256 and 2 x 512, 31B 16 x 256 and 4 x 512
+        pattern = ("sliding",) * 5 + ("full",)
+        gemma26 = TypedSpec(pattern * 5, {"sliding": (8, 256), "full": (2, 512)})
+        gemma31 = TypedSpec(pattern * 10, {"sliding": (16, 256), "full": (4, 512)})
+        self.assertEqual(extra(gemma26, 16930), formula(15360, 25 * 2048 + 5 * 1024, 16930))
+        # recorded on the GPU (2026-10-08/09): anonymous peak + torch's reserved peak on the device (GTT)
+        self.assertGreater(base_hub + extra(gemma26, 16930), (15.74 + 8.43) * campaign.GIB)
+        self.assertGreater(base_hub + extra(gemma31, 16930), (32.7 + 23.67) * campaign.GIB)
+        # the dev rows tiled over the pivots (counted until 2026-10-09) asked 98 GiB for Gemma-4-31B: the lock
+        # (25 GiB margin) could never be granted with 114 GiB free of the machine's 123
+        self.assertLess(base_hub + extra(gemma31, 17355) + campaign.GPU_MARGIN, 114 * campaign.GIB)
         nextn = FakeSpec(("full", "nextn"), {"k": (1, 576), "v": (1, 512)})
         self.assertEqual(extra(nextn, 100), formula(512, 576, 100))                 # nextn layers are not captured
+        # a fit on the GPU unless fit_hub runs in the experiment venv (no torch)
+        self.assertFalse(campaign.fits_on_gpu(campaign.PYTHON))
+        self.assertTrue(campaign.fits_on_gpu(campaign.FIT_PYTHON))
 
     def test_capture_mode_and_refusals(self):
         self.assertEqual(campaign.capture_mode("lfm2"), "collect")
@@ -495,6 +519,29 @@ class ProcessTest(unittest.TestCase):
         self.assertGreater(outcome.max_anon, 96 << 20)
         self.assertLess(outcome.max_anon, 1 << 30)
 
+    def test_what_a_command_leaves_running_in_its_group_is_stopped_before_its_locks_go(self):
+        """live_bridge.py keeps its llama-servers and engine daemon in the command's group under a Watch: anything
+        still running there when the command exits (it crashed, it forgot one) would hold GPU memory after the
+        locks are released, so run_child ends it."""
+        with tempfile.TemporaryDirectory() as directory:
+            pidfile = Path(directory) / "pid"
+            outcome = campaign.run_child(["sh", "-c", f"sleep 60 & echo $! > {pidfile}; exit 0"], poll=0.05)
+            self.assertEqual(outcome.returncode, 0)
+            self.assertTrue(gone(int(pidfile.read_text())))
+            self.assertEqual(campaign.group_members(999_999_999), [])
+
+    def test_gpu_memory_is_the_rise_of_gtt_while_the_command_runs(self):
+        """On this APU a GPU job's memory is GTT (no RssAnon shows it): run_child records its rise over the value
+        at the start, and the largest anonymous + GPU sum of one sample (what came off MemAvailable)."""
+        readings = iter([6 * campaign.GIB] + [10 * campaign.GIB] * 1000)
+        outcome = campaign.run_child([sys.executable, "-c", "import time; time.sleep(0.6)"], sample=0.1,
+                                     gpu_memory=lambda: next(readings))
+        self.assertEqual(outcome.max_gpu, 4 * campaign.GIB)
+        self.assertGreaterEqual(outcome.max_total, 4 * campaign.GIB)
+        blind = campaign.run_child([sys.executable, "-c", "pass"], gpu_memory=lambda: None)
+        self.assertIsNone(blind.max_gpu)
+        self.assertEqual(blind.max_total, blind.max_anon)
+
     def test_exec_runs_one_command_under_the_lock(self):
         with tempfile.TemporaryDirectory() as directory:
             with mock.patch.object(campaign, "GPU_LOCK", Path(directory) / "gpu.lock"), \
@@ -538,6 +585,13 @@ class EvaluationTablesTest(unittest.TestCase):
         self.assertEqual(campaign.verdict([-0.1, 0.2]), "no measurable difference")
         self.assertEqual(campaign.verdict([0.1, 0.2]), "higher")
         self.assertEqual(set(campaign.paired_table(rows)), {"hub-floor", "hub_prefix-floor_prefix", "hub_prefix-hub"})
+        # the exact sign-flip test: with 2 chats both lower, 2 of the 4 sign patterns are as extreme
+        self.assertEqual(pair["p"], 0.5)
+        eight = np.ones(8)
+        self.assertEqual(campaign.sign_flip_p(eight, eight), 2 / 256)            # the smallest p 8 chats allow
+        self.assertEqual(campaign.sign_flip_p([1.0, 2, 3, -0.5, 1, 1, 1, 1], eight), 4 / 256)
+        self.assertLess(campaign.sign_flip_p(np.ones(20), np.ones(20)), 1e-4)     # random patterns past 16 chats
+        self.assertIn("(p 0.500)", campaign._diff(pair))
         share = campaign.recovered_share(rows, "hub", "floor")
         self.assertAlmostEqual(share["share"], 1 - 0.125 / 0.325)
         largest = share["largest"]
@@ -877,8 +931,10 @@ class RunnerTest(unittest.TestCase):
                 mock.patch.object(campaign, "run_baseline", lambda camp_: self.root / "baseline"):
             campaign.stage_evaluate(camp, self.args())
         # qwen38's encoder sides (1 + 2) and m's decoder sides (30 + 40); m's encoders (100 + 200) and qwen38's
-        # decoders (10 + 20), the float16 copies and the other model are not read
-        self.assertEqual(asked, {"qwen38-to-m": 1000 + 73, "m-to-qwen38": 1000 + 300 + 30})
+        # decoders (10 + 20), the float16 copies and the other model are not read; and the probe's buffers and
+        # pair_eval's states on top (EVALUATION_EXTRA)
+        extra = campaign.EVALUATION_EXTRA
+        self.assertEqual(asked, {"qwen38-to-m": 1000 + 73 + extra, "m-to-qwen38": 1000 + 300 + 30 + extra})
 
     def test_a_model_whose_server_renders_otherwise_is_evaluated_both_ways(self):
         camp = self.campaign(recurrent=False, hybrid=False)
@@ -990,7 +1046,7 @@ class RunnerTest(unittest.TestCase):
                 if item.get("event") == "watch":
                     settings[label] = item["settings"]
         self.assertEqual((settings["pair_eval-x"]["pause_c"], settings["pair_eval-x"]["resume_c"],
-                          settings["pair_eval-x"]["threads"]), (85.0, 65.0, 4))
+                          settings["pair_eval-x"]["threads"]), (90.0, 88.0, 4))
         self.assertEqual((settings["tables"]["pause_c"], settings["tables"]["threads"]), (90.0, 8))
         ran = []
         camp.path("eval").mkdir()
@@ -1342,7 +1398,7 @@ class AssembleEvaluateTest(unittest.TestCase):
             self.assertEqual(call["argv"][0], str(campaign.fit_python()))
             self.assertIn("auto", call["argv"])
             self.assertEqual((call["settings"].pause_c, call["settings"].resume_c, call["settings"].threads),
-                             (85.0, 65.0, 4))
+                             (90.0, 88.0, 4))
             self.assertLessEqual(int(call["environment"]["OPENBLAS_NUM_THREADS"]), 4)
             self.assertIn(campaign.resource_guard.CPU_LOCK_FD, call["environment"])
             self.assertEqual(sorted(result["models"]), ["a", "b", "d", "e"])

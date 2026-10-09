@@ -92,16 +92,16 @@ kills on SIGINT, SIGTERM, SIGHUP or a timeout. render loads no model (a tokenize
 
 Resource guard (resource_guard.py; after 2026-10-05's thermal shutdown): every command runs with
 BLAS/OpenMP threads capped at 8 unless set (the probe with --threads 8), starts only once the CPU is
-at most 75 C (after its locks), and runs under a Watch that samples it every 2 s into
+at most 88 C (after its locks), and runs under a Watch that samples it every 2 s into
 logs/<label>.guard.jsonl, stops its process group at 90 C, at 85% swap use or below 8 GiB
-MemAvailable, continues it at 80 C with memory recovered, and ends it at 95 C on two samples in a
+MemAvailable, continues it at 88 C with memory recovered, and ends it at 98 C on two samples in a
 row or when the sensors are lost for 60 s (the stage fails: GuardStop). Pauses count neither toward
 a command's seconds nor its timeout. The CPU-heavy commands (fit_hub, token_tables, r0 calibrate,
 pair_eval, a capture on the CPU probe) also hold the CPU lock,
 /tmp/kvpark-campaign-cpu.lock, taken after the GPU/memory lock and inherited like it
 (KVPARK_CPU_LOCK_FD): one CPU-heavy job at a time, hand-run fits (fit_hub.py takes it too)
 included. The GPU evaluations (the evaluate stage's pair_eval runs and the baseline, assemble
---evaluate) run with resource_guard.GPU_EVALUATION's defaults: stopped at 85 C, continued at 65 C,
+--evaluate) run with resource_guard.GPU_EVALUATION's defaults: stopped at 90 C, continued at 88 C,
 4 BLAS and probe threads (commands.sh: exec --gpu-evaluation). KVPARK_GUARD_* change the thresholds
 (KVPARK_GUARD=off disables pausing and aborting, with a warning).
 
@@ -259,23 +259,31 @@ CAPTURE_THREADS = resource_guard.DEFAULT_THREADS   # the probe's CPU threads (16
 CAPTURE_CTX = 5120
 PROBE_MAX_CTX = 32768           # kv_probe refuses a larger context
 PARITY_PER_SOURCE = 2
-# what the CPU stages need resident beyond what they load (anonymous memory; their RSS is mostly the
-# memory-mapped captures, file pages the kernel can drop). fit_hub (fit_hub_extra) holds the new
-# model's stage-1 covariance and its eigendecomposition (about 3 float64 copies of W1 x W1, W1 = its
-# per-layer PCA ranks summed), its decoder's float64 cross moments (hub dim x columns) and, for the
-# alpha choice, the dev spans tiled over the pivots: their hub estimates (float32, and the float64
-# centred copy each prediction makes) and the rows of its widest kind (float32). Measured with the
-# 4.6 GiB base hub: 11.0 GiB on LFM2-2.6B (W1 4,096, 4,096 columns, 9,945 dev spans), 16.7 GiB on
-# DeepSeek-V2-Lite (W1 13,824, 15,552 columns, 8,010) and 13.0 GiB on Qwen3.6-35B-A3B (W1 5,120,
-# 5,120 columns, 17,355: its tokenizer keeps every span of the base), which an estimate by width
-# alone (6 GiB + 192 KiB per column) put at 12.1; the rest, 3.1-4.1 GiB, does not grow with the
-# model. The dev spans are bounded by the base hub's (a new rendering only removes joint spans).
+# what the CPU stages need resident beyond what they load (anonymous memory and, for a GPU fit, the device's:
+# GTT on this APU, which no RssAnon shows and which comes off MemAvailable all the same; their RSS is mostly the
+# memory-mapped captures, file pages the kernel can drop). fit_hub (fit_hub_extra; fit_hub.memory_estimate is the
+# same model) holds the new model's stage-1 covariance and its eigendecomposition (float64 sums and copies of W1 x W1,
+# W1 = its per-layer PCA ranks summed, on the host and the device: 28 bytes per cell), its decoder's statistics
+# (float64 cross moments and float32 weights: 10 bytes per hub dim x column), its rows in 4,096-row chunks (two on the
+# host while the next is read, one on the backend: 12 bytes per chunk row x column), 12 bytes per dev span x pivot x
+# hub dim for what does not grow with the model (the pivots' chunk rows and estimates, their dev Moments) and on the
+# GPU FIT_HUB_GPU (torch's context and calibration, the pivots' rows on the device). Calibrated on 2026-10-09 on the
+# twelve onboardings' anonymous peaks plus torch's reserved peak on the device (the three CPU fits: LFM2-2.6B 11.0 GiB,
+# DeepSeek-V2-Lite 16.7, Qwen3.6-35B-A3B 13.0; the GPU fits: Jamba, Nemotron-3.5, Granite, Ling, Kimi-Linear and
+# Falcon-H1 13.5-16.5, Gemma-4-26B-A4B 24.2, GLM-4.7-Flash 31.3, Gemma-4-31B 56.4), with the 4.6 GiB base hub; at each
+# onboarding's own dev spans the estimate lies 0.5-4 GiB above each. The estimate until then counted anonymous memory
+# only: 7 of the 9 GPU onboardings' peaks exceeded it by 1.0-3.9 GiB (and until 2026-10-09 it also counted the dev
+# rows tiled over the pivots, 4 bytes per dev span x pivot x column, which the fit has streamed since 2026-10-06: 98
+# GiB for Gemma-4-31B, which no lock could grant). The dev spans are bounded by the base hub's (a new rendering only
+# removes joint spans).
 # token_tables 0.5-0.6 GiB
-FIT_HUB_BASE = int(4.5 * GIB)
-FIT_HUB_COVARIANCE_BYTES = 24       # per W1 x W1 cell
-FIT_HUB_DECODER_BYTES = 8           # per hub dimension x column
+FIT_HUB_BASE = int(5.5 * GIB)
+FIT_HUB_GPU = int(3.5 * GIB)        # a fit on the GPU
+FIT_HUB_COVARIANCE_BYTES = 28       # per W1 x W1 cell
+FIT_HUB_DECODER_BYTES = 10          # per hub dimension x column of the widest kind
+FIT_HUB_CHUNK_BYTES = 12            # per chunk row x column of the widest kind
+FIT_HUB_CHUNK = 4096                # fit_hub.py's --chunk
 FIT_HUB_DEV_LATENT_BYTES = 12       # per dev span x pivot x hub dimension
-FIT_HUB_DEV_COLUMN_BYTES = 4        # per dev span x pivot x column of the widest kind
 TABLES_MEMORY = 2 * GIB
 
 STAGES = ("render", "capture", "onboard", "tables", "recurrent", "evaluate", "report")
@@ -617,17 +625,39 @@ def condition_table(report):
     return conditions_of(report["documents"])
 
 
+SIGN_FLIP_EXACT = 16             # sign_flip_p enumerates all 2^n sign patterns up to this many documents
+SIGN_FLIP_DRAWS = 1 << 16
+
+
+def sign_flip_p(diff, weight, seed=0):
+    """Two-sided p of the paired sign-flip (permutation) test of a token-weighted mean difference: the share of the
+    2^n patterns of per-document signs whose weighted mean is at least as far from 0 as the observed one (exact up to
+    SIGN_FLIP_EXACT documents, else SIGN_FLIP_DRAWS random patterns). With 8 chats the percentile bootstrap's interval
+    excludes 0 more often than this test rejects (its smallest p is then 2/256): read both."""
+    diff, weight = np.asarray(diff, float), np.asarray(weight, float)
+    n = len(diff)
+    if n == 0 or weight.sum() <= 0:
+        return None
+    exact = n <= SIGN_FLIP_EXACT
+    signs = (1 - 2 * ((np.arange(2 ** n)[:, None] >> np.arange(n)) & 1) if exact
+             else np.random.default_rng(seed).choice(np.array([-1, 1]), size=(SIGN_FLIP_DRAWS, n)))
+    stats = (signs * diff) @ weight / weight.sum()
+    observed = abs(float(diff @ weight / weight.sum()))
+    extreme = int(np.sum(np.abs(stats) >= observed * (1 - 1e-9)))
+    return extreme / len(stats) if exact else (extreme + 1) / (len(stats) + 1)
+
+
 def paired(rows, a, b, metric, seed=0, draws=10000):
     """The token-weighted mean of the per-document difference a - b of a metric, its
-    document-bootstrap 95% interval (both conditions resampled together) and on how many documents a
-    is below b."""
+    document-bootstrap 95% interval (both conditions resampled together), the exact sign-flip test's
+    two-sided p (sign_flip_p) and on how many documents a is below b."""
     diff = np.asarray([row[a][metric] - row[b][metric] for row in rows], float)
     weight = np.asarray([row["n_scored"] for row in rows], float)
     index = np.random.default_rng(seed).integers(0, len(diff), (draws, len(diff)))
     stats = (diff[index] * weight[index]).sum(axis=1) / weight[index].sum(axis=1)
     return {"diff": float(diff @ weight / weight.sum()),
             "ci95": [float(np.quantile(stats, 0.025)), float(np.quantile(stats, 0.975))],
-            "lower": int((diff < 0).sum()), "documents": len(rows)}
+            "p": sign_flip_p(diff, weight), "lower": int((diff < 0).sum()), "documents": len(rows)}
 
 
 PAIRS = (("hub", "floor"), ("hub_prefix", "floor_prefix"), ("hub_prefix", "hub"), ("hub_table_prefix", "hub_prefix"))
@@ -902,21 +932,29 @@ def group_anon_bytes(pgid, proc="/proc"):
 
 
 def run_child(argv, *, cwd=None, env=None, output=None, keep_fds=(), timeout=None, poll=CHILD_POLL_S,
-              sample=MEMORY_SAMPLE_S, watch=None):
+              sample=MEMORY_SAMPLE_S, watch=None, gpu_memory=None):
     """Run a command in its own session (process group) with the descriptors keep_fds inherited, and
     wait for it; on a timeout, or when this process is interrupted (KeyboardInterrupt, Terminated),
     its whole group is stopped. watch: a resource_guard.Watch attached to the group and stepped while
     it runs (it stops and continues the group); its pauses count neither toward the timeout nor the
     seconds, and when it ends the command (GuardAbort) the group is stopped and `aborted` says why.
+    Once the command has exited, whatever it left running in its group (a server, a daemon) is stopped
+    too, before the caller releases its locks.
     Returns a namespace: returncode, seconds, max_rss (bytes, wait4's ru_maxrss of the command or the
     largest descendant it waited for: file pages it touched included), max_anon (the group's peak
-    RssAnon, sampled every `sample` seconds: what it needs resident), timed_out, paused_s, aborted
-    and guard (the Watch's summary)."""
+    RssAnon, sampled every `sample` seconds: what it needs resident), max_gpu (the peak rise of the GPU's
+    GTT use since the command started, resource_guard.read_gpu_memory, or None where it cannot be read: on
+    this APU a GPU job's memory, which RssAnon does not show), max_total (the largest anonymous + GPU memory
+    of one sample: what the command takes off MemAvailable), timed_out, paused_s, aborted and guard (the
+    Watch's summary)."""
+    gpu_memory = gpu_memory or (lambda: resource_guard.read_gpu_memory()["gtt_used"])
+    gtt_base = gpu_memory()
     started = time.perf_counter()
     child = subprocess.Popen([str(item) for item in argv], cwd=cwd, env=env, stdout=output,
                              stderr=subprocess.STDOUT if output is not None else None, pass_fds=tuple(keep_fds),
                              start_new_session=True)
     usage, timed_out, max_anon, sampled, aborted = None, False, 0, 0.0, None
+    max_gpu = max_total = 0
     try:
         if watch is not None:
             watch.attach(child.pid)
@@ -932,7 +970,10 @@ def run_child(argv, *, cwd=None, env=None, output=None, keep_fds=(), timeout=Non
                 timed_out = True
                 break
             if elapsed - sampled >= sample:
-                max_anon, sampled = max(max_anon, group_anon_bytes(child.pid)), elapsed
+                anon, used = group_anon_bytes(child.pid), gpu_memory() if gtt_base is not None else None
+                gpu = 0 if used is None else max(0, used - gtt_base)
+                max_anon, max_gpu, max_total, sampled = (max(max_anon, anon), max(max_gpu, gpu),
+                                                         max(max_total, anon + gpu), elapsed)
             time.sleep(poll)
     except resource_guard.GuardAbort as error:
         stop_group(child)
@@ -942,11 +983,55 @@ def run_child(argv, *, cwd=None, env=None, output=None, keep_fds=(), timeout=Non
         if watch is not None:
             watch.close()
         raise
+    seconds = time.perf_counter() - started
+    if not timed_out and aborted is None:
+        stop_leftovers(child.pid)
     guard = watch.close() if watch is not None else None
     paused = guard["paused_s"] if guard else 0.0
-    return types.SimpleNamespace(returncode=child.returncode, seconds=time.perf_counter() - started - paused,
+    return types.SimpleNamespace(returncode=child.returncode, seconds=seconds - paused,
                                  max_rss=None if usage is None else usage.ru_maxrss * 1024, max_anon=max_anon,
+                                 max_gpu=None if gtt_base is None else max_gpu,
+                                 max_total=max_anon if gtt_base is None else max_total,
                                  timed_out=timed_out, paused_s=paused, aborted=aborted, guard=guard)
+
+
+def group_members(pgid, proc="/proc"):
+    """The pids of a process group's live members (zombies left out), from /proc."""
+    out = []
+    for entry in os.scandir(proc):
+        if not entry.name.isdigit():
+            continue
+        try:
+            with open(os.path.join(entry.path, "stat"), "rb") as stream:
+                stat = stream.read()
+            fields = stat[stat.rindex(b")") + 2:].split()
+            if int(fields[2]) == pgid and fields[0] != b"Z":
+                out.append(int(entry.name))
+        except (OSError, ValueError, IndexError):
+            continue
+    return out
+
+
+def stop_leftovers(pgid, grace=STOP_GRACE_S, proc="/proc"):
+    """After a command has exited: end what it left running in its process group (a llama-server or an engine
+    daemon live_bridge.py kept there under a Watch, which would hold GPU memory after the locks are released):
+    SIGTERM and SIGCONT, SIGKILL after `grace` seconds. Returns the pids it found."""
+    left = group_members(pgid, proc)
+    if not left:
+        return []
+    for number in (signal.SIGTERM, signal.SIGCONT):
+        try:
+            os.killpg(pgid, number)
+        except ProcessLookupError:
+            return left
+    deadline = time.monotonic() + grace
+    while group_members(pgid, proc) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    return left
 
 
 @contextlib.contextmanager
@@ -1175,11 +1260,14 @@ class Campaign:
                          returncode=outcome.returncode, timed_out=outcome.timed_out, guard_abort=outcome.aborted,
                          max_c=(outcome.guard or {}).get("max_c"),
                          max_rss_gib=None if outcome.max_rss is None else round(outcome.max_rss / GIB, 2),
-                         max_anon_gib=round(outcome.max_anon / GIB, 2))
+                         max_anon_gib=round(outcome.max_anon / GIB, 2),
+                         max_gpu_gib=None if outcome.max_gpu is None else round(outcome.max_gpu / GIB, 2),
+                         max_total_gib=round(outcome.max_total / GIB, 2))
         self.save()
         self.log({"event": "command-done", "stage": stage, "label": label, "seconds": round(outcome.seconds, 1),
                   "returncode": outcome.returncode, "timed_out": outcome.timed_out, "max_rss_gib": entry[-1]["max_rss_gib"],
-                  "max_anon_gib": entry[-1]["max_anon_gib"], "paused_s": outcome.paused_s, "max_c": entry[-1]["max_c"],
+                  "max_anon_gib": entry[-1]["max_anon_gib"], "max_gpu_gib": entry[-1]["max_gpu_gib"],
+                  "max_total_gib": entry[-1]["max_total_gib"], "paused_s": outcome.paused_s, "max_c": entry[-1]["max_c"],
                   "guard_abort": outcome.aborted})
         if outcome.aborted:
             raise GuardStop(f"{label} was ended by the resource guard: {outcome.aborted} (samples in {guard_log})")
@@ -1417,12 +1505,12 @@ def record_differences(records, sample, whole, template):
     return out
 
 
-def fit_hub_extra(spec, layer_rank, *, dev_spans, pivots, hub_dim):
-    """What fit_hub needs resident beyond the base hub to onboard a model of this spec (bytes):
-    FIT_HUB_BASE, and per kind (the larger counts, one kind is fitted at a time) its stage-1
-    covariance (W1 = the per-layer ranks min(layer_rank, width) summed over the attention layers),
-    its decoder's cross moments and the dev spans tiled over the pivots: their hub estimates and
-    the kind's columns (see FIT_HUB_BASE). dev_spans: the base hub's, an upper bound."""
+def fit_hub_extra(spec, layer_rank, *, dev_spans, pivots, hub_dim, gpu=True, chunk=FIT_HUB_CHUNK):
+    """What fit_hub needs beyond the base hub to onboard a model of this spec (bytes of anonymous memory and, on
+    the GPU, the device's): FIT_HUB_BASE, FIT_HUB_GPU when it fits on the GPU (gpu), and per kind (the larger counts,
+    one kind is fitted at a time) its stage-1 covariance (W1 = the per-layer ranks min(layer_rank, width) summed over
+    the attention layers), its decoder's statistics, its chunk rows, and per dev span and pivot the part that does
+    not grow with the model (see FIT_HUB_BASE). dev_spans: the base hub's, an upper bound."""
     out = 0
     for kind in ("k", "v"):
         widths = [int(np.prod(spec.head_shape(layer, kind))) for layer in spec.attention_layers
@@ -1430,8 +1518,8 @@ def fit_hub_extra(spec, layer_rank, *, dev_spans, pivots, hub_dim):
         stage1 = sum(min(layer_rank, width) for width in widths)
         columns = sum(widths)
         out = max(out, FIT_HUB_COVARIANCE_BYTES * stage1 ** 2 + FIT_HUB_DECODER_BYTES * hub_dim * columns
-                  + dev_spans * pivots * (FIT_HUB_DEV_LATENT_BYTES * hub_dim + FIT_HUB_DEV_COLUMN_BYTES * columns))
-    return FIT_HUB_BASE + out
+                  + FIT_HUB_CHUNK_BYTES * chunk * columns + dev_spans * pivots * FIT_HUB_DEV_LATENT_BYTES * hub_dim)
+    return FIT_HUB_BASE + (FIT_HUB_GPU if gpu else 0) + out
 
 
 def capture_ctx(max_tokens):
@@ -1647,6 +1735,12 @@ def fit_python(environ=None):
     return FIT_PYTHON if FIT_PYTHON.is_file() else PYTHON
 
 
+def fits_on_gpu(python):
+    """Whether fit_hub.py run with `python` (--fit-device auto) may fit on the GPU: any Python but the experiment
+    venv, which has no torch (the memory estimate then counts the device's memory too)."""
+    return Path(python) != PYTHON
+
+
 def stage_onboard(campaign, args):
     spec = campaign.spec()
     base = json.loads((BASE_HUB / "manifest.json").read_text(encoding="utf-8"))
@@ -1666,7 +1760,7 @@ def stage_onboard(campaign, args):
     fit_seconds = campaign.run(argv, stage="onboard", label="fit_hub", cpu=True,
                                memory_bytes=hub_bytes(BASE_HUB) + fit_hub_extra(
                                    spec, settings["layer_rank"], dev_spans=base["spans"]["dev"],
-                                   pivots=len(base_models()), hub_dim=settings["hub_dim"]))
+                                   pivots=len(base_models()), hub_dim=settings["hub_dim"], gpu=fits_on_gpu(python)))
     convert_seconds = campaign.run([PYTHON, HERE / "convert_hub.py", campaign.path("hub"), campaign.path("hub-v2"),
                                     "--reuse", BASE_HUB_V2], stage="onboard", label="convert_hub")
     return {**onboard_result(campaign, ONBOARD_ENCODER, python), "source_global": sliding(spec),
@@ -1701,7 +1795,9 @@ def onboard_result(campaign, encoder, python):
                       "hub-v2": own_files(campaign.path("hub-v2"), campaign.name)}}
 
 
-REENCODE_EXTRA = 2 * GIB        # a re-encode's statistics beyond FIT_HUB_BASE and the bundle it loads
+# a re-encode's statistics beyond FIT_HUB_BASE (and FIT_HUB_GPU on the GPU) and the bundle it loads: Granite-4.0-H-Tiny's
+# (2026-10-09, GPU, 4.7 GiB bundle) peaked at 9.6 GiB anonymous and 4.1 GiB reserved on the device
+REENCODE_EXTRA = 2 * GIB
 OUTDATED = "outdated"           # a stage status: not done, its finished parts kept (no stale wipe)
 
 
@@ -1742,7 +1838,8 @@ def reencode(campaign, encoder=None, *, stamp=None):
     argv += ["--output", new]
     entry = onboard.setdefault("reencoded", [])
     fit_seconds = campaign.run(argv, stage="onboard", label=f"fit_hub-reencode-{encoder}", cpu=True,
-                               memory_bytes=hub_bytes(campaign.path("hub")) + FIT_HUB_BASE + REENCODE_EXTRA)
+                               memory_bytes=hub_bytes(campaign.path("hub")) + FIT_HUB_BASE + REENCODE_EXTRA
+                               + (FIT_HUB_GPU if fits_on_gpu(python) else 0))
     convert_seconds = campaign.run([PYTHON, HERE / "convert_hub.py", new, new_v2, "--reuse", BASE_HUB_V2],
                                    stage="onboard", label=f"convert_hub-reencode-{encoder}")
     history = campaign.path("history", f"onboard-{previous}-{stamp or time.strftime('%Y%m%dT%H%M%S')}")
@@ -1850,6 +1947,10 @@ def server_renders_differently(render_result):
 
 
 RESULT_NEUTRAL = ("--resume",)       # pair_eval flags that do not change a run's results
+# an evaluation's memory beyond the larger model and the two hub sides it reads: the probe's KV cache and compute buffers
+# (GTT on this APU), pair_eval's states and scores. Nemotron-3.5 -> Qwen3.8 (2026-10-09, the first run that recorded its
+# GPU memory) took 34.0 GiB (7.8 anonymous, 30.5 on the GPU) where those two came to 33.2
+EVALUATION_EXTRA = 4 * GIB
 
 
 def command_digest(argv):
@@ -1901,7 +2002,7 @@ def run_baseline(campaign):
         fcntl.flock(lock, fcntl.LOCK_EX)
         run_evaluation(campaign, f"baseline-{baseline_label()}", argv, output,
                        max(BASELINE_GGUF.stat().st_size, REFERENCE_GGUF.stat().st_size)
-                       + sides_bytes(BASE_HUB_V2, BASELINE_SOURCE, REFERENCE))
+                       + sides_bytes(BASE_HUB_V2, BASELINE_SOURCE, REFERENCE) + EVALUATION_EXTRA)
     return output
 
 
@@ -1921,7 +2022,7 @@ def stage_evaluate(campaign, args):
             recurrent = target_recurrent(campaign, into_new)
             # the larger model (the probe runs one at a time) and the two hub sides pair_eval reads
             memory = (max(Path(s_gguf).stat().st_size, Path(t_gguf).stat().st_size)
-                      + sides_bytes(campaign.path("hub-v2"), s_name, t_name))
+                      + sides_bytes(campaign.path("hub-v2"), s_name, t_name) + EVALUATION_EXTRA)
             argv = eval_argv((s_name, s_gguf), (t_name, t_gguf), out / label, hub=campaign.path("hub-v2"),
                              tables=tables, recurrent=recurrent, server_render=bool(variant))
             run_evaluation(campaign, label, argv, out / label, memory)
@@ -1976,6 +2077,10 @@ def stage_report(campaign, args):
     # the bridge renders a live conversation as the target's server does: its runs decide when there are any
     into = f"{REFERENCE}-to-{campaign.name}"
     into = into + "-server" if into + "-server" in summary else into
+    out_of = f"{campaign.name}-to-{REFERENCE}"
+    out_of = out_of + "-server" if out_of + "-server" in summary else out_of
+    # a switch out of the model that does worse than the floor (paired 95% CI of the switch's KL against the floor's
+    # above 0): register it as a target only (kvpark bridge add --no-source), so the next model prefills natively
     baseline_path = Path((stages.get("evaluate", {}).get("result") or {}).get("baseline")
                          or BASELINE_DIR / baseline_label() / "report.json")
     baseline = None
@@ -1995,7 +2100,7 @@ def stage_report(campaign, args):
               "campaign_sha256": cached_sha256(Path(__file__).resolve()),
               "stages": {stage: {**{key: stages.get(stage, {}).get(key)
                                     for key in ("status", "seconds", "waited_s", "disk", "max_rss_gib", "max_anon_gib",
-                                                "reason")}, "command_seconds": spent.get(stage)}
+                                                "max_total_gib", "reason")}, "command_seconds": spent.get(stage)}
                          for stage in STAGES if stage != "report"},
               "render": stages["render"]["result"], "capture": stages["capture"]["result"],
               "capture_plan": {k: v for k, v in json.loads(campaign.path("capture-plan.json").read_text(
@@ -2011,6 +2116,8 @@ def stage_report(campaign, args):
                         f"with {BASELINE_SOURCE} -> {REFERENCE} runs under the very settings of this report."],
               "bridge": {"hub_name": campaign.name,
                          "native_prefix": summary[into]["native_prefix"], "native_prefix_from": into,
+                         "source": summary[out_of]["verdict"] != "higher" if out_of in summary else True,
+                         "source_from": out_of if out_of in summary else None,
                          "recurrent_mean": (recurrent.get("result") or {}).get("npz") if state.get("recurrent_mean")
                          else None,
                          "dflash_drafts": drafts, "draft_window": max(windows) if windows else None}}
@@ -2037,7 +2144,9 @@ def _cell(item, metric, ci, digits=3, sign=True):
 
 
 def _diff(item, digits=4):
-    return f"{item['diff']:+.{digits}f} [{item['ci95'][0]:+.{digits}f}, {item['ci95'][1]:+.{digits}f}]"
+    """A paired difference with its bootstrap interval and, when known, the sign-flip test's p."""
+    text = f"{item['diff']:+.{digits}f} [{item['ci95'][0]:+.{digits}f}, {item['ci95'][1]:+.{digits}f}]"
+    return text + (f" (p {item['p']:.3f})" if item.get("p") is not None else "")
 
 
 def direction_markdown(item):
@@ -2093,16 +2202,18 @@ def report_markdown(report):
                 else "") + ".", "",
              "## Stages", "", "Wall time of the stage's last attempt; command time of every attempt since it last started "
              "over (a resumed stage keeps what earlier attempts finished: capture chunks, evaluations), from log.jsonl. "
-             "Peak memory: anonymous (RssAnon of the command's process group, what it needs resident) / RSS (with the "
+             "Peak memory: anonymous (RssAnon of the command's process group, what it needs resident) / anonymous + GPU "
+             "(with the rise of the GPU's GTT use, which RssAnon does not show: recorded since 2026-10-09) / RSS (with the "
              "file pages it touched, the captures it memory-maps).", "",
              "| Stage | Status | Wall time | Commands, all attempts | Lock wait | Disk (own) | Disk (linked) | Peak memory |",
              "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |"]
     for stage, item in report["stages"].items():
         disk = item.get("disk") or {}
         seconds, waited, spent = item.get("seconds"), item.get("waited_s"), item.get("command_seconds")
-        rss, anon = item.get("max_rss_gib"), item.get("max_anon_gib")
+        rss, anon, total = item.get("max_rss_gib"), item.get("max_anon_gib"), item.get("max_total_gib")
         memory = "—" if rss is None and anon is None else \
-            f"{'—' if anon is None else f'{anon:.1f}'} / {'—' if rss is None else f'{rss:.1f}'} GiB"
+            (f"{'—' if anon is None else f'{anon:.1f}'} / {'—' if total is None else f'{total:.1f}'} / "
+             f"{'—' if rss is None else f'{rss:.1f}'} GiB")
         lines.append(f"| {stage} | {item.get('status') or '—'} | "
                      f"{'—' if seconds is None else f'{seconds / 60:.1f} min'} | "
                      f"{'—' if spent is None else f'{spent / 60:.1f} min'} | "
@@ -2138,7 +2249,8 @@ def report_markdown(report):
               f"Pivots {', '.join(onboard['pivots'])}; spans train {onboard['spans']['train']:,}, dev "
               f"{onboard['spans']['dev']:,}, test {onboard['spans']['test']:,} ({onboard['documents']} documents, "
               f"{onboard['rejected']} rejected). Encoder `{onboard.get('encoder') or 'ridge'}`"
-              + (f" (variance cap {onboard['variance_cap']:g})" if onboard.get("variance_cap") else "")
+              + (f" (variance cap {onboard['variance_cap']:g})" if onboard.get("variance_cap")
+                 and (onboard.get("encoder") or "ridge") in ("reverse", "reverse_z") else "")
               + "".join(f"; fitted again from `{item['from']}` on {item['at'][:10]} (campaign.py reencode: the "
                         "transforms and decoders are the onboarding's)" for item in onboard.get("reencoded") or [])
               + "." + encoder_stats_markdown(onboard.get("encoder_stats"), onboard.get("warnings")), "",
@@ -2147,7 +2259,8 @@ def report_markdown(report):
         lines.append(f"| {pair} | {onboard['r2']['k'][pair]:.3f} | {onboard['r2']['v'][pair]:.3f} |")
     lines += ["", "## End to end (seed-score, first 256 tokens of the final message)", "",
               "Token-weighted means with document-bootstrap 95% CIs; paired differences resample both conditions "
-              "of a chat together."
+              "of a chat together, and p is the exact sign-flip test's (two-sided; with 8 chats the bootstrap "
+              "interval can exclude 0 at p above 0.05)."
               + (" Runs labelled `-server` render both models as llama-server renders them (pair_eval "
                  "--server-render: its default template kwargs, which keep earlier reasoning where a template reads "
                  "them), what a live switch holds; the others with the templates' defaults, as RESULTS.md section 2."
@@ -2217,8 +2330,13 @@ def report_markdown(report):
     bridge = report["bridge"]
     command = (f"kvpark bridge add ... --hub-name {bridge['hub_name']}"
                + (" --native-prefix" if bridge["native_prefix"] else "")
-               + (f" --recurrent-mean {bridge['recurrent_mean']}" if bridge["recurrent_mean"] else ""))
+               + (f" --recurrent-mean {bridge['recurrent_mean']}" if bridge["recurrent_mean"] else "")
+               + (" --no-source" if bridge.get("source") is False else ""))
     lines += ["", "## Bridge settings", "", f"`{command}`", ""]
+    if bridge.get("source") is False:
+        lines += [f"`--no-source`: a switch out of {report['name']} did worse than the floor (`{bridge['source_from']}`: "
+                  "the paired 95% CI of its KL against the floor's lies above 0), so the bridge registers it as a target "
+                  "only: switches out of it are skipped and the next model prefills natively.", ""]
     if (bridge.get("native_prefix_from") or "").endswith("-server"):
         lines += [f"The native prefix follows `{bridge['native_prefix_from']}`: the bridge renders a live conversation "
                   "as the target's server does.", ""]
@@ -2314,9 +2432,11 @@ def run_stages(campaign, args):
         commands = entry.get("commands") or []
         rss = [command["max_rss_gib"] for command in commands if command.get("max_rss_gib") is not None]
         anon = [command["max_anon_gib"] for command in commands if command.get("max_anon_gib") is not None]
+        total = [command["max_total_gib"] for command in commands if command.get("max_total_gib") is not None]
         entry.update(status="done", finished=now(), seconds=round(time.perf_counter() - started, 1),
                      waited_s=round(sum(command.get("waited_s") or 0.0 for command in commands), 1),
                      max_rss_gib=max(rss) if rss else None, max_anon_gib=max(anon) if anon else None,
+                     max_total_gib=max(total) if total else None,
                      disk=disk_usage([campaign.path(name) for name in OUTPUTS[stage]]), result=result)
         campaign.save()
         campaign.log({"event": "stage-done", "stage": stage, "seconds": entry["seconds"], "disk": entry["disk"]})
@@ -2398,6 +2518,13 @@ def onboarded_evaluation(output, campaigns, log=print):
             "spans": {split: int(len(spans.select(split))) for split in ("train", "dev", "test")}, **result}
 
 
+# what evaluate_onboarded takes off MemAvailable, per byte of the assembled hub's files: hub6-20261008's evaluation
+# (2026-10-09, 15 models, 21.6 GiB of files, on the GPU) peaked at 36.2 GiB anonymous (the whole hub loaded, the
+# test chunks) and 12.2 GiB reserved on the device, and MemAvailable fell by 46.9 GiB; the lock asked the hub's
+# bytes alone until then
+EVALUATE_ONBOARDED_FACTOR = 2.3
+
+
 def evaluate_onboarded(output, campaigns, log=print, *, campaign_dir=CAMPAIGN_DIR, python=None):
     """onboarded_evaluation of an assembled hub as a child process, `campaign.py evaluate-onboarded` with
     fit_python() (its products on the GPU, --fit-device auto), under the GPU/memory lock (the whole hub is
@@ -2415,7 +2542,8 @@ def evaluate_onboarded(output, campaigns, log=print, *, campaign_dir=CAMPAIGN_DI
     guard_log = output / "evaluation-onboarded.guard.jsonl"
     log_path = output / "evaluation-onboarded.log"
     result_path.unlink(missing_ok=True)
-    with guarded_locks(hub_bytes(output), log, cpu=True, label="campaign assemble --evaluate") as (held, fds, extra):
+    with guarded_locks(int(EVALUATE_ONBOARDED_FACTOR * hub_bytes(output)), log, cpu=True,
+                       label="campaign assemble --evaluate") as (held, fds, extra):
         log({"event": "command", "label": "evaluate-onboarded", "command": shlex.join(argv)})
         with open(log_path, "a", encoding="utf-8") as stream:
             outcome = guarded_child(argv, settings=settings, guard_log=guard_log, label="assemble-evaluate", events=log,
@@ -2579,7 +2707,9 @@ def exec_command(args):
                                 environment={**environment, **extra}, keep_fds=fds, timeout=args.timeout)
     log({"event": "exec-done", "returncode": outcome.returncode, "seconds": round(outcome.seconds, 1),
          "timed_out": outcome.timed_out, "max_rss_gib": None if outcome.max_rss is None else round(outcome.max_rss / GIB, 2),
-         "max_anon_gib": round(outcome.max_anon / GIB, 2), "paused_s": outcome.paused_s,
+         "max_anon_gib": round(outcome.max_anon / GIB, 2),
+         "max_gpu_gib": None if outcome.max_gpu is None else round(outcome.max_gpu / GIB, 2),
+         "max_total_gib": round(outcome.max_total / GIB, 2), "paused_s": outcome.paused_s,
          "guard_abort": outcome.aborted})
     if outcome.aborted:
         return resource_guard.ABORT_EXIT
@@ -2624,8 +2754,8 @@ def main(argv=None):
     sub.add_argument("--timeout", type=float, help="stop the command's process group after this many seconds")
     sub.add_argument("--cpu-lock", action="store_true", help="also hold the CPU lock (a CPU-heavy command)")
     sub.add_argument("--gpu-evaluation", action="store_true",
-                     help="a GPU evaluation: the guard's defaults are resource_guard.GPU_EVALUATION (stop at 85 C, "
-                     "continue at 65 C, 4 threads) where KVPARK_GUARD_* do not set them")
+                     help="a GPU evaluation: the guard's defaults are resource_guard.GPU_EVALUATION (stop at 90 C, "
+                     "continue at 88 C, 4 threads) where KVPARK_GUARD_* do not set them")
     sub.add_argument("--guard-log", type=Path, help="the resource guard's JSONL samples of the command")
     sub.add_argument("argv", nargs=argparse.REMAINDER, metavar="-- COMMAND ...")
     args = parser.parse_args(argv)

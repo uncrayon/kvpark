@@ -39,8 +39,8 @@ floor_prefix.LABEL beside them when that bundle's target side (its decoder and i
 sha256) differs from --hub's, since the floor then differs too. Bundles that differ only in the
 source's encoder (an onboarding encoder, Track A) share the floor, so one run compares them paired.
 
---resume makes a run that was stopped (the resource guard ends a job at 95 C, also when other work heats
-the package) continue in its output directory: each document's states are saved and scored by probe
+--resume makes a run that was stopped (the resource guard ends a job at 98 C, 95 C until 2026-10-08, also when other
+work heats the package) continue in its output directory: each document's states are saved and scored by probe
 runs of their own (states-<side>/<document>/, scores/<document>/), so a stopped run keeps every
 document it finished (and a whole states-<side>/ of an earlier run, when the probe got the same input);
 the translations of the documents still to score are built again (deterministic). The scores are those of
@@ -56,8 +56,8 @@ Writes <output>/report.json and prints token-weighted delta NLL with document-bo
 
 Resource guard (resource_guard.py) with the GPU-evaluation defaults (resource_guard.GPU_EVALUATION, where
 KVPARK_GUARD_* do not set them): BLAS threads and the probe's --threads are capped at 4; run by hand, every
-probe run (the model loads) waits until the CPU is at most 75 C and runs under a Watch (paused at 85 C,
-continued at 65 C, ended at 95 C on two samples in a row; samples in <output>/<step>.guard.jsonl); inside a
+probe run (the model loads) waits until the CPU is at most 88 C and runs under a Watch (paused at 90 C,
+continued at 88 C, ended at 98 C on two samples in a row; samples in <output>/<step>.guard.jsonl); inside a
 campaign command the campaign's Watch (with the same defaults) covers the whole process group instead.
 --guard KEY=VALUE changes a setting.
 """
@@ -81,6 +81,7 @@ import sys
 
 import numpy as np
 
+import engine
 import hub as hub_module
 import recurrent_init
 import translate
@@ -126,6 +127,21 @@ def render(conversation, gguf, server=False):
     rendered = chat.render(conversation, info["chat_template"], bos_token=info["bos_token"], extra_context=context)
     return chat.rendered_record({**conversation, "split": "test", "source": conversation.get("source", "eval")},
                                 "model", rendered)
+
+
+def engine_special(tokens, gguf):
+    """{document: token arrays} with the special flags the bridge's engine gives a live conversation's
+    tokens (engine.token_arrays): control tokens only. kv_probe also flags user-defined and unknown
+    tokens (it needs them for the space a tokenizer puts after one), so a chat whose text spells a
+    user-defined token (Falcon-H1's LaTeX commands, \\frac) would fail the alignment ("special token
+    inside a segment") although a live switch translates it."""
+    types = np.asarray(engine.profile(str(gguf))["token_types"], dtype=np.int64)
+    out = {}
+    for document_id, item in tokens.items():
+        ids = np.asarray(item["token_id"], dtype=np.int64)
+        control = (types[ids] == engine.CONTROL) if len(types) else np.zeros(len(ids), dtype=bool)
+        out[document_id] = {**item, "special": control.astype(np.uint8)}
+    return out
 
 
 def wanted_ids(text, document_ids):
@@ -366,8 +382,8 @@ def main(argv=None):
         candidates.append((conversation, records))
     tokens = {}
     for side, gguf in (("s", s_gguf), ("t", t_gguf)):
-        tokens[side] = collect_v2.tokenize(args.probe, gguf, [r[side] for _, r in candidates], ctx=args.ctx,
-                                           workdir=args.output)
+        tokens[side] = engine_special(collect_v2.tokenize(args.probe, gguf, [r[side] for _, r in candidates],
+                                                          ctx=args.ctx, workdir=args.output), gguf)
     wanted = wanted_ids(args.ids, [records["t"]["document_id"] for _, records in candidates])
     documents, left_out = [], {}
     for conversation, records in candidates:

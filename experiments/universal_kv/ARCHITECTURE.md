@@ -68,11 +68,11 @@ against a one-token native save of the target); the bridge's list is `TRANSLATAB
 | Dense GQA | `qwen3` | K/V of every layer for [0, T0), K rotated at the target positions | real model (Qwen3-4B-Instruct-2507), live switches |
 | Sliding window + global | `muse-glimmer` | global layers for [0, T0) (NoPE); sliding layers for their last n_swa + 1 positions | real model (Muse-Glimmer-30B), live switches |
 | Gated DeltaNet hybrid | `qwen35` | the attention layers (IMROPE, partial); one recurrent cell at T0 − 1 | real models (Qwen3.8-27B, Ornith-1.5-9B), live switches into the production Qwen3.8 build |
-| GQA family | `llama`, `mistral3`, `qwen3moe`, `hy_v3`, `phi3` (none of them LongRoPE), `gemma3`, `gemma4`, `gpt-oss`, `laguna`, `mimo2` | K/V of every layer for [0, T0) with per-layer KV heads and head sizes; a sliding cache's last n_swa + 1 positions; per-layer-kind RoPE (the sliding layers' own base, scale and rotary width; Laguna's plain RoPE on its sliding layers; the GGUF's `rope_freqs.weight` frequency factors of Llama, Mistral 3 and Gemma 4's full layers, Gemma 4's proportional RoPE); Gemma 4's shared KV layers hold nothing of their own | test-llama-archs and gguf-py Gemma 3/4 fixtures on both pins (codec byte-identical, RoPE bit-exact against the CPU cache rows, identity-hub translation restores the native logits); real Gemma-4 26B-A4B and 31B saves parse and write back byte for byte, and a translated-shape state of the 26B restores token for token with its MTP head (CPU) |
-| Other GQA hybrids | `qwen35moe`, `qwen3next`, `qwen4exp` (with its block indexer), `minimax-01`, `jamba`, `falcon-h1`, `granitehybrid`, `nemotron_h`, `nemotron_h_moe`, `plamo2`, `lfm2`, `lfm2moe` | the same | random test-llama-archs fixtures |
-| MLA | `deepseek2` (DeepSeek V2/V3, Kimi K2.x, GLM-4.7-Flash), `mistral4`, `hy_v4` | K-only rows [c_kv on its RMS shell, RoPE(k_pe)], no V; nextn layers as the zero rows a native save holds | tiny gguf-py and test-llama-archs fixtures |
+| GQA family | `llama`, `mistral3`, `qwen3moe`, `hy_v3`, `phi3` (none of them LongRoPE), `gemma3`, `gemma4`, `gpt-oss`, `laguna`, `mimo2` | K/V of every layer for [0, T0) with per-layer KV heads and head sizes; a sliding cache's last n_swa + 1 positions; per-layer-kind RoPE (the sliding layers' own base, scale and rotary width; Laguna's plain RoPE on its sliding layers; the GGUF's `rope_freqs.weight` frequency factors of Llama, Mistral 3 and Gemma 4's full layers, Gemma 4's proportional RoPE); Gemma 4's shared KV layers hold nothing of their own | test-llama-archs and gguf-py Gemma 3/4 fixtures on both pins (codec byte-identical, RoPE bit-exact against the CPU cache rows, identity-hub translation restores the native logits); real Gemma-4 26B-A4B and 31B saves parse and write back byte for byte, and a translated-shape state of the 26B restores token for token with its MTP head (CPU); both onboarded into hub6 (sources through their full-attention layers only) and measured end to end, live switches into and out of the 26B ([RESULTS.md section 10](RESULTS.md#10-hub6-eight-more-models-onboarded-october-8-9-2026)) |
+| Other GQA hybrids | `qwen35moe`, `qwen3next`, `qwen4exp` (with its block indexer), `minimax-01`, `jamba`, `falcon-h1`, `granitehybrid`, `nemotron_h`, `nemotron_h_moe`, `plamo2`, `lfm2`, `lfm2moe` | the same | real models onboarded and measured end to end: Qwen3.6-35B-A3B (`qwen35moe`), LFM2-2.6B (`lfm2`), Falcon-H1-3B (`falcon-h1`), Granite-4.0-H-Tiny (`granitehybrid`, live switches into it) and Nemotron-3.5-Lightning-30B-A3B (`nemotron_h_moe`), both with `ridge` source encoders in hub6 (`reverse` gained nothing out of them or did harm; Nemotron is registered as a target only, `kvpark bridge add --no-source`), Jamba-Reasoning-3B (`jamba`: as a source it fails, left out of hub6); the others on random test-llama-archs fixtures |
+| MLA | `deepseek2` (DeepSeek V2/V3, Kimi K2.x, GLM-4.7-Flash), `mistral4`, `hy_v4` | K-only rows [c_kv on its RMS shell, RoPE(k_pe)], no V; nextn layers as the zero rows a native save holds | real DeepSeek-V2-Lite and GLM-4.7-Flash (`deepseek2`) onboarded and measured end to end; `mistral4`, `hy_v4` on tiny gguf-py and test-llama-archs fixtures |
 | DSA (MLA plus indexer keys) | `deepseek32`, `glm-dsa`, `dots3note`, `hy_v4` with an indexer | as MLA, plus indexer keys: zeros while the whole prompt fits in top_k, the hub's indexer ridge beyond; refused without a ridge | fixtures |
-| K-only hybrids (MLA + KDA) | `kimi-linear`, `kimi-k3`, `bailingmoe3` (M-RoPE on a7b94df2c when its GGUF has rope sections); `glm5-next` (a7b94df2c only: NoPE latents, k-pool indexer rows `[key \| gate \| pooled]`) | MLA rows and one recurrent cell; GLM5-Next's indexer keys and per-token gates as DSA's (zeros within top_k, the indexer ridge beyond) | test-llama-archs fixtures |
+| K-only hybrids (MLA + KDA) | `kimi-linear`, `kimi-k3`, `bailingmoe3` (M-RoPE on a7b94df2c when its GGUF has rope sections); `glm5-next` (a7b94df2c only: NoPE latents, k-pool indexer rows `[key \| gate \| pooled]`) | MLA rows and one recurrent cell; GLM5-Next's indexer keys and per-token gates as DSA's (zeros within top_k, the indexer ridge beyond) | real Kimi-Linear-48B-A3B (`kimi-linear`, live switches out of it) and Ling-3.0-tiny (`bailingmoe3`) onboarded and measured end to end; `kimi-k3`, `glm5-next` on test-llama-archs fixtures |
 | Pooled latent | `deepseek4`, target only | raw window of the last n_swa latents, CSA/HCA/LID pooled rows and compressor rings, synthesized; T0 rounded down to a multiple of 128 | test-llama-archs fixture |
 | Pure recurrent | `mamba`, `mamba2`, `rwkv6`, `rwkv6qwen2`, `rwkv7`, `arwkv7` | nothing: there is no per-token cache, so the bridge skips (`no-per-token-cache`) and the target prefills natively | the codec parses and writes them back byte for byte |
 
@@ -87,11 +87,13 @@ dots3note's sliding layers keep too few source cells for an identity test; it is
 a hub fitted with `fit_hub.py` on probe captures of random-weight models, which translates `qwen3`
 to and from `deepseek2`, `deepseek32` and `dots3note`: shapes, positions, the restore and
 decoding are checked, quality is not. For the hybrids the tests prove layouts and acceptance,
-not the cost of R0. Real MLA (DeepSeek-V2-Lite-Chat, GLM-4.7-Flash), KDA-hybrid (Kimi-Linear,
-Ling-3.0-tiny), other hybrid (LFM2, granite-4.0-h, Falcon-H1, Jamba, Nemotron-3.5) and Gemma 4
-models are now local and smoke-tested at a7b94df2c (evidence/models/README.md), and DeepSeek-V4-Flash
-and Laguna are on disk but not loaded; none of them has been captured or translated yet, so
-real-model quality for those families is unmeasured (no DSA model fits this machine).
+not the cost of R0. The real models of those families on this machine were then captured and onboarded
+into the hub with `campaign.py` (README "Onboarding campaign"): MLA (DeepSeek-V2-Lite-Chat,
+GLM-4.7-Flash), MLA + linear-attention hybrids (Kimi-Linear-48B-A3B, Ling-3.0-tiny), other hybrids
+(Qwen3.6-35B-A3B, LFM2-2.6B, Granite-4.0-H-Tiny, Falcon-H1-3B, Nemotron-3.5-Lightning-30B-A3B, Jamba-Reasoning-3B)
+and Gemma 4 (26B-A4B, 31B), each measured end to end with Qwen3.8 in both directions; all but Jamba are in
+hub6 (RESULTS.md sections 9 and 10). DeepSeek-V4-Flash and Laguna are on disk but not loaded, and no DSA
+model fits this machine, so those families are measured on fixtures only.
 
 Of the top 20, eleven are translatable (Qwen3.8-27B measured; Qwen3.8-2.4T and Nex-N2-Pro as
 `qwen35moe`, Qwen3.8-Flash-Next as `qwen4exp`, GLM-5.3 as `glm-dsa`, Kimi K3 as `kimi-k3`, Kimi
@@ -564,7 +566,7 @@ token's (a, s), so they cannot be rebuilt from the window, but they can be synth
 | product: model registry, capability rules, `.resume` draft states, llama-server client, engine client, switch orchestration, CLI | src/kvpark/bridge (`kvpark bridge add / engine / engine-status / engine-stop / switch / undo / status`), docs/bridge.md |
 | evaluation: end-to-end ΔNLL for any pair; engine benchmarks; live multi-server tests | experiments/universal_kv/pair_eval.py, score_translate.py, bench_engine.py, live_bridge.py |
 
-## 13. Status and open problems (2026-10-05)
+## 13. Status and open problems (2026-10-09)
 
 Works today on an EVO-X2-class box, measured end to end on real models: Qwen3.8-27B →
 Muse-Glimmer-30B, → Ornith-1.5-9B and → Qwen3-4B are within 0.05 nats/token of native on
@@ -572,8 +574,12 @@ held-out chats (+0.029, +0.016, +0.008); live switches among Qwen3.8 (the produc
 build), Muse and Qwen3-4B restored and reused exactly the translated cells in every switch that
 was not skipped (24 of 24 in the hop table, and every later run), in 8–18 s against 15–86 s of
 native prefill, with DFlash2, MTP, images and Hermes' template options. The engine is no longer
-the cost of a switch: the native tail is. The other cache families of the pinned llama.cpp
-listed in section 2 are translated on fixtures. Open:
+the cost of a switch: the native tail is. hub6 holds fifteen real models (eleven onboarded:
+MLA, MLA + linear-attention, gated DeltaNet, short-convolution and Mamba hybrids, Gemma 4's iSWA),
+measured end to end against Qwen3.8, and live switches with it into Granite-4.0-H-Tiny and
+Gemma-4-26B and out of Kimi-Linear and Gemma-4-26B reused exactly T0 in 10 of 10 (RESULTS.md
+section 10). The other cache families of the pinned llama.cpp listed in section 2 are translated
+on fixtures only. Open:
 
 - **Agent and document workloads:** tool output and long documents translate much worse than
   chat (agent traces +0.295 nats/token Qwen3.8 → Muse; KL 0.40–0.50 into Qwen3.8);
@@ -581,18 +587,26 @@ listed in section 2 are translated on fixtures. Open:
   loss-trained) maps are the next levers.
 - **Sources matter:** a small model's cache (Qwen3-4B) carries little of what a larger model
   needs (0–15% of the gap recovered); prefer the larger model as the source.
-- **Onboarded sources:** the onboarded encoder is now `reverse` (RESULTS.md section 9), which
-  removes 17-24% of the floor's KL into Qwen3.8 against 3-4% before; the jointly fitted Qwen3-4B
-  still removes 30%. Measured into Qwen3.8 only: translations from an onboarded model into Muse,
-  Qwen3-4B, Ornith or another onboarded model have held-out R² (lower with `reverse` than with
-  `ridge`, e.g. LFM2 → DeepSeek-V2-Lite K 0.427 vs 0.472) but no end-to-end measurement yet.
-- **Real models for the new families:** MLA, DSA, KDA hybrids, the other GQA hybrids, the GQA
-  family (but Gemma 4's real saves) and DeepSeek V4 are validated on random-weight fixtures
-  only. The local models are downloaded and smoke-tested (DeepSeek-V2-Lite, GLM-4.7-Flash,
-  Kimi-Linear-48B, Ling-3.0-tiny, LFM2, granite, Falcon-H1, Jamba, Nemotron-3.5, Gemma 4 26B/31B;
-  DeepSeek-V4-Flash and Laguna not loaded, about 100 GB each); capturing them and onboarding them
-  into the hub is the next step. No DSA model fits this machine; MiniMax-M3's cache is not
-  modelled.
+- **Onboarded sources:** the onboarded encoder is `reverse` (RESULTS.md section 9). Out of models whose
+  attention view predicts every hub dimension at least a little (DeepSeek-V2-Lite, LFM2, Qwen3.6, GLM-4.7-Flash,
+  Falcon-H1, Kimi-Linear, Ling-3.0-tiny, Gemma 4 26B/31B) a switch into Qwen3.8 removes 17-42% of the floor's
+  KL, around the jointly fitted Qwen3-4B's 30%. Where the onboarding's encoder warnings fire (a dimension with
+  train R² below 0.05 and the variance cap binding on about half of the dimensions or more: Granite-4.0-H-Tiny,
+  Nemotron-3.5, Jamba) `reverse` inflates what the view does not carry and gains nothing or does harm; the
+  number of attention layers does not decide it (Gemma-4-26B's source reads 5 and works). hub6 carries `ridge`
+  encoders for Granite and Nemotron (about the floor; out of Nemotron as the servers render still worse than it)
+  and leaves Jamba out (RESULTS.md section 10); choosing the encoder per model is a manual step (`campaign.py
+  reencode`), and a model whose switches out do harm is registered as a target only (`kvpark bridge add
+  --no-source`, which the campaign report recommends: Nemotron). Onboarded → onboarded pairs have held-out R² and a few live hops, no seeded
+  end-to-end measurement; every measured target but the live hops is Qwen3.8 or the onboarded model itself,
+  and every number was chosen and measured on the same held-out chats (a fresh set is kept unscored).
+- **Real models for the new families:** captured, onboarded and measured end to end against Qwen3.8 (both
+  directions): MLA (DeepSeek-V2-Lite, GLM-4.7-Flash), MLA + linear-attention hybrids (Kimi-Linear, Ling-3.0-tiny),
+  gated DeltaNet (Qwen3.6), short-convolution (LFM2) and Mamba hybrids (Granite, Falcon-H1, Nemotron-3.5,
+  Jamba), and Gemma 4's iSWA (26B-A4B, 31B; the source side reads only its full-attention layers). Still on
+  fixtures only: DSA (no DSA model fits this machine), DeepSeek V4 (not loaded) and the remaining
+  architectures without a local model; MiniMax-M3's cache is not modelled. A joint refit of all of them does
+  not fit this machine (RESULTS.md section 10) and translated worse at seven models (section 9).
 - **DeepSeek V4:** target only, no drafts, numpy pooling (~21 s per 32K tokens at V4-Flash
   geometry); V4.1 waits for llama.cpp; as a source it needs a native prefill.
 - **Recurrent state:** the mean is calibrated for Qwen3.8 and Ornith; their `tools` groups come

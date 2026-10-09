@@ -1,4 +1,4 @@
-# Universal KV translator: results (October 2-7, 2026)
+# Universal KV translator: results (October 2-9, 2026)
 
 One shared latent ("hub") now translates attention caches between four local models of
 three architectures and three tokenizers, and a `kvpark bridge switch` moves real
@@ -33,8 +33,10 @@ machine shared with other work; the sections give the load and memory at each ru
 | DFlash2 after a translated restore | 37% of drafted tokens accepted against 41% natively; the aligned dummy alone: 43.4% against 43.7% with the real draft state | [6](#6-stage-2-live-october-3-2026-engine-daemon-the-production-qwen38-build-mtp-images) |
 | MTP after a translated restore | 48% against 61%; the empty head cache alone costs about 5 points (55% against 60%) | [6](#6-stage-2-live-october-3-2026-engine-daemon-the-production-qwen38-build-mtp-images) |
 | Images, Muse → Qwen3.8 (vision) | every switch reused exactly T0; an image in the newest message got the native answer; with an image in an earlier message the translated prefix changed the outcome in 3 of 3 conversations (the target's own cache restored the same way did not) | [6](#6-stage-2-live-october-3-2026-engine-daemon-the-production-qwen38-build-mtp-images) |
-| Onboarded models as sources (DeepSeek-V2-Lite, LFM2-2.6B, Qwen3.6-35B-A3B → Qwen3.8; 8 held-out chats) | the onboarded encoder shrank its latents to half a jointly fitted model's spread; the new default (`reverse`) removes 17% / 24% / 41% of the floor's KL instead of 3% / 4% / 11% (Qwen3-4B, fitted jointly: 30%), and 20% / 25% / 40% against 5% / 6% / 12% on 11 chats (lower than ridge on 10 of 11 each); GLM-4.7-Flash, onboarded with it, 38%; translations into them unchanged | [9](#9-onboarded-models-as-translation-sources-october-6-2026) |
-| Other cache families: MLA, DSA, KDA and GQA hybrids, DeepSeek V4 as a target | translated on random-weight fixtures and restored in llama.cpp; no such model downloaded, so no quality number | [8](#8-stage-4-october-4-2026-the-recurrent-mean-in-the-bridge-a-faster-assemble-deepseek-v4-switches), [ARCHITECTURE.md](ARCHITECTURE.md#what-the-translator-supports-today) |
+| Onboarded models as sources (DeepSeek-V2-Lite, LFM2-2.6B, Qwen3.6-35B-A3B → Qwen3.8; 8 held-out chats) | the onboarded encoder shrank its latents to half a jointly fitted model's spread; the new default (`reverse`) removes 17% / 24% / 41% of the floor's KL instead of 3% / 4% / 11% (Qwen3-4B, fitted jointly: 30%), and 20% / 25% / 40% against 5% / 6% / 12% on 11 chats (lower than ridge on 10 of 11 each); GLM-4.7-Flash, onboarded with it, 38%; translations into them unchanged. A seven-model joint refit on the models' common spans did worse out of all four sources (individually significant for LFM2 and Qwen3.6, exact sign-flip p 0.023). Selection-set results: the method was chosen on the same chats | [9](#9-onboarded-models-as-translation-sources-october-6-2026) |
+| hub6: fifteen models, eleven onboarded (Gemma 4 iSWA, MLA, MLA + linear-attention and Mamba hybrids among them; 8 held-out chats each way with Qwen3.8, selection-set results) | into the new models, on the six chats every run shares, a switch removes 16-83% of the floor's KL for nine of the twelve and nothing measurable into Granite, Falcon-H1 and Jamba (6-10%; their pooled 42-51% are mostly one reply that rewrites the earlier answer); out of them into Qwen3.8 25-42% where the onboarding's encoder warnings stay quiet (Falcon-H1, Kimi-Linear, Ling, Gemma 4 26B/31B; Qwen3-4B 30%, none distinguishable from it at p < 0.05), and where they fire `reverse` did no good or harm (Granite 5%, Nemotron −115% as the servers render, Jamba −1031%): hub6-20261009 carries `ridge` encoders for Granite (1.3%, harmless) and Nemotron (still −44% as the servers render: a target only, new `kvpark bridge add --no-source`) and leaves Jamba out; a fifteen-model joint refit does not fit the machine | [10](#10-hub6-eight-more-models-onboarded-october-8-9-2026) |
+| Live switches with hub6 (Qwen3.8 → Granite-4.0-H-Tiny and → Gemma-4-26B, Gemma-4-26B and Kimi-Linear → Qwen3.8, Kimi-Linear → Gemma-4-26B; 8-15K tokens; the second series) | 10 of 10 reused exactly T0; into Qwen3.8 a switch took 9.7-12.5 s of wall time against 48-52 s of native prefill, 3.3-6.8 times faster where the native prefill met few guard pauses (the guard's pauses make the exact ratio uncertain); into Gemma-4-26B 2.0-3.1 times, into Granite 1.8-3.0 times; the first 32 tokens equal native's in 5 of 6 switches into Gemma and Granite (mostly what the native tail holds) | [10](#live-switches-with-hub6-october-9) |
+| Other cache families: DSA, the remaining hybrids and GQA architectures, DeepSeek V4 as a target | translated on random-weight fixtures and restored in llama.cpp; no local model, so no quality number | [8](#8-stage-4-october-4-2026-the-recurrent-mean-in-the-bridge-a-faster-assemble-deepseek-v4-switches), [ARCHITECTURE.md](ARCHITECTURE.md#what-the-translator-supports-today) |
 
 ## 1. One hub for four models (test tokens)
 
@@ -953,7 +955,9 @@ Evidence: `evidence/universal-kv/live-stage4-20261004/` (`options/`: run records
 ## 9. Onboarded models as translation sources (October 6, 2026)
 
 The first three onboarding campaigns (README "Onboarding campaign") translated well *into* the new
-models (Qwen3.8 → DeepSeek-V2-Lite, → Qwen3.6-35B-A3B, → LFM2-2.6B removed 37-47% of the floor's KL)
+models (Qwen3.8 → DeepSeek-V2-Lite, → Qwen3.6-35B-A3B, → LFM2-2.6B removed 37-47% of the floor's KL on the
+12-13 chats each scored, 31-51% on the six chats all three render long enough; 93% of DeepSeek-V2-Lite's floor
+and 92% of LFM2's sit in one chat, a5add943, section 10)
 but poorly *out of* them into Qwen3.8: 3% (DeepSeek-V2-Lite), 4% (LFM2) and 11% (Qwen3.6) of the floor's
 KL, against 30% for Qwen3-4B, a weaker model that was fitted jointly with the hub. This section finds
 why, compares onboarding encoders, and changes the default.
@@ -1098,7 +1102,10 @@ whose sha256 did not change and were kept. The previous bundles and runs are in 
 
 Against Qwen3-4B → Qwen3.8 (30%): DeepSeek-V2-Lite +0.0087 [+0.0020, +0.0166] KL, LFM2 +0.0042
 [−0.0003, +0.0097] (not clearly different: within the numeric jitter below), Qwen3.6 −0.0076 [−0.0157,
-−0.0008] (better, on 5 of 8 chats). The campaign's re-fitted encoders give the end-to-end comparison's
+−0.0008] (lower on 5 of 8 chats). With 8 chats the bootstrap interval excludes 0 more readily than the exact
+sign-flip test (all 256 sign patterns, `review-20261009/stats.py`): its p is 0.055 for DeepSeek-V2-Lite, 0.242 for
+LFM2 and 0.078 for Qwen3.6, so none of the three differs from Qwen3-4B at p < 0.05; each one's gain over its
+`ridge` pilot does (p 0.023, 0.023, 0.039). The campaign's re-fitted encoders give the end-to-end comparison's
 numbers to within 0.2 points (LFM2 23.7% against 23.5%: the GPU fit's float16 products).
 
 **Numeric jitter.** The DeepSeek-V2-Lite and Qwen3.6 encoders campaign.py re-fitted are bit-identical to
@@ -1112,7 +1119,7 @@ are the pilots' runs: 47%, 37%, 39% (templates) and 45% (servers) of the floor's
 
 GLM-4.7-Flash (MLA, 47 layers; captured whole on October 5) went through `campaign.py run` with the new
 default: K R² 0.66-0.75 out of it and 0.60-0.65 into it. GLM-4.7-Flash → Qwen3.8 removes 38.1% [22.7%,
-46.3%] of the floor's KL (lower on 8/8), better than Qwen3-4B (−0.0056 [−0.0107, −0.0014], 7/8), and
+46.3%] of the floor's KL (lower on 8/8), better than Qwen3-4B (−0.0056 [−0.0107, −0.0014], 7/8, sign-flip p 0.031), and
 48.1% [35.4%, 55.4%] as the servers render; Qwen3.8 → GLM-4.7-Flash removes 78.5% [74.9%, 82.4%] (13
 chats, with the native prompt start: without it GLM's `[gMASK]` attention sink makes the translation
 collapse) and 81.0% [77.6%, 84.7%] as the servers render.
@@ -1207,22 +1214,377 @@ baseline's, so the table pairs them with ridge and reverse@z from the runs above
   like the base views' estimates 9% / 15%, though ccam has the best held-out K R² of the rescaled encoders.
   The `reverse` default stands. ccam is not an option of `fit_hub.py`.
 
-**The joint refit: estimate corrected, attempted, pending.** The 46.2 GiB estimate counted numpy's float64
-`eigh` for the GCCA (6.1 P² float64 with what is held). The fit goes through `fit_backend.top_eig`'s float32
-subset solver (scipy, in the ROCm venv the fits run in), measured at 1.16-1.41 P² of float64 beyond its
-input (`fit_hub.eigh_bytes`, README "Fit memory"): the GCCA phase is 21.5 GiB and the peak is the decoder
-phase, 35.6 GiB in all, which needs 60.6 GiB of MemAvailable (a reduced-row refit would lower that phase,
-which grows with the dev spans; the review was right that "the same peak" did not follow). That check
-passed at 18:46 on October 7 with kvpark.service still running (68.3 GiB available). The refit ran 61
-minutes (`joint7/attempt-20261007/`): the seven K views in 30, its anonymous memory at most 22.2 GiB, within
-the estimate; then the K GCCA, under the GPU-evaluation guard settings (85/65 °C, 4 threads), which kept it
-stopped 70% of the time. While stopped, its memory went to swap until swap was 99% full with MemAvailable at
-47 GiB; the guard could not let a job continue then (that needed swap use below 80%, and the job's pages
-only come back when it runs), so it was ended by hand. Swap use now counts only while MemAvailable is below
-24 GiB (`resource_guard` `swap_ignore_gib`, README "Running heavy jobs safely"). Pending, and unblocked once the model servers are
-stopped: `window_c.py --steps joint,e2e` runs it with the CPU guard defaults (90/80 °C, 8 threads) and then
-the end-to-end comparison with the joint hub as one more `--extra-hub` (README "Onboarding campaign").
+### The joint refit of the seven models (October 7-9)
 
-**Not tested.** A decoder-side calibration (a variance or temperature correction of the decoded K rows,
-which would also help the jointly fitted Qwen3-4B, whose decoded K variance is 0.70-0.72 of the native),
-onboarded → onboarded pairs end to end, and every target other than Qwen3.8.
+**Track A's option (c).** A refit changes every adapter, the base pairs'
+included, and it trains on the 87,426 train spans the seven models share (DeepSeek-V2-Lite's template drops
+reasoning and tools) instead of hub4's 185,672, so whether it beats onboarding had to be measured. Getting it to
+run took five tries (`joint7/attempt-*`):
+
+- October 7, next to kvpark.service's llama-server (47 GiB of GPU memory), with the GPU-evaluation guard settings
+  (85/65 °C, 4 threads): stopped 70% of the time, its pages went to swap until swap was 99% full, and the guard
+  could not let it continue (that needed swap use below 80%); ended by hand after 61 minutes. Swap use now counts
+  only while MemAvailable is below 24 GiB (`resource_guard` `swap_ignore_gib`, README "Running heavy jobs safely").
+- October 8, with kvpark.service stopped (MemAvailable 104-112 GiB): four tries, each after 17-67 minutes of
+  waiting for the GPU/memory lock behind other campaigns. The guard ended them after 7, 20, 91 and 17 minutes, each
+  time on two samples at 95.0-96.5 °C in a row taken while the fit was already stopped, with other projects' jobs
+  outside the locks (54-122 W). fit_hub.py cannot resume, so each try started over.
+- October 8-9, the fifth, ended a job at 98 °C (the user's change of October 8) and ran once other projects' jobs
+  were off the machine: both kinds in one try (it peaked at 97.0 °C, so it would have been ended under the earlier
+  95 °C line). Its bundle is `joint7/hub7` (`-v2` for the bridge), and `joint7/comparison.json` holds every number
+  below.
+
+Held-out R² of the jointly fitted hub on the seven models' 8,884 common test spans; in brackets the difference
+from hub4 plus the pilots' `reverse` encoders assembled on the same spans (`assembled/hub7-reverse.json`,
+hub5-20261006's adapters):
+
+| K, source → target | Qwen3.8 | Muse | Qwen3-4B | Ornith | LFM2 | DS-V2-Lite | Qwen3.6 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Qwen3.8 | 0.867 (−0.002) | 0.756 (+0.006) | 0.772 (+0.006) | 0.768 (+0.003) | 0.755 (+0.011) | 0.501 (+0.003) | 0.767 (+0.003) |
+| Muse | 0.684 (+0.006) | 0.851 (−0.004) | 0.738 (+0.004) | 0.702 (+0.007) | 0.723 (+0.007) | 0.465 (−0.001) | 0.709 (+0.005) |
+| Qwen3-4B | 0.705 (+0.007) | 0.749 (+0.004) | 0.896 (−0.001) | 0.728 (+0.008) | 0.775 (+0.008) | 0.533 (+0.008) | 0.730 (+0.006) |
+| Ornith | 0.732 (+0.004) | 0.741 (+0.006) | 0.759 (+0.006) | 0.895 (−0.003) | 0.747 (+0.012) | 0.491 (+0.001) | 0.748 (+0.004) |
+| LFM2-2.6B | 0.639 (+0.064) | 0.687 (+0.065) | 0.745 (+0.044) | 0.666 (+0.067) | 0.915 (+0.002) | 0.484 (+0.057) | 0.668 (+0.065) |
+| DS-V2-Lite | 0.619 (+0.049) | 0.669 (+0.046) | 0.719 (+0.029) | 0.642 (+0.049) | 0.717 (+0.035) | 0.736 (−0.001) | 0.652 (+0.045) |
+| Qwen3.6 | 0.721 (+0.037) | 0.734 (+0.035) | 0.750 (+0.030) | 0.735 (+0.040) | 0.743 (+0.041) | 0.479 (+0.043) | 0.907 (−0.016) |
+
+| V, source → target | Qwen3.8 | Muse | Qwen3-4B | Ornith | LFM2 | DS-V2-Lite | Qwen3.6 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Qwen3.8 | 0.823 (+0.009) | 0.625 (+0.007) | 0.548 (+0.006) | 0.692 (+0.002) | 0.576 (+0.013) | 0.469 (+0.003) | 0.671 (+0.006) |
+| Muse | 0.547 (+0.005) | 0.678 (+0.011) | 0.495 (+0.005) | 0.562 (+0.006) | 0.526 (+0.009) | 0.435 (−0.000) | 0.595 (+0.007) |
+| Qwen3-4B | 0.566 (+0.007) | 0.604 (+0.005) | 0.804 (+0.018) | 0.596 (+0.007) | 0.580 (+0.011) | 0.493 (+0.006) | 0.605 (+0.006) |
+| Ornith | 0.659 (+0.003) | 0.608 (+0.006) | 0.544 (+0.005) | 0.855 (+0.004) | 0.577 (+0.014) | 0.462 (+0.001) | 0.649 (+0.006) |
+| LFM2-2.6B | 0.521 (+0.046) | 0.587 (+0.036) | 0.503 (+0.039) | 0.547 (+0.049) | 0.853 (−0.007) | 0.460 (+0.054) | 0.583 (+0.041) |
+| DS-V2-Lite | 0.460 (+0.035) | 0.549 (+0.025) | 0.450 (+0.028) | 0.483 (+0.037) | 0.444 (+0.034) | 0.728 (−0.001) | 0.536 (+0.030) |
+| Qwen3.6 | 0.574 (+0.032) | 0.598 (+0.029) | 0.492 (+0.031) | 0.580 (+0.036) | 0.534 (+0.038) | 0.453 (+0.043) | 0.864 (−0.018) |
+
+- Out of the onboarded models the joint fit gains K R² +0.029 to +0.067 (mean +0.046) and V +0.025 to +0.054 (mean
+  +0.037), into the base models and between the pilots alike: more than `reverse` gave up against `ridge`
+  (0.03-0.05).
+- Out of the base models, into any model, it gains −0.001 to +0.012 (K) and 0.000 to +0.014 (V), mean +0.006,
+  although it sees 87,426 train spans instead of hub4's 185,672.
+- The self pairs move by −0.016 to +0.002 (K) and −0.018 to +0.018 (V).
+
+End to end, each campaign's own command ran again with the joint hub (`joint7/hub7-v2`) as `--extra-hub`, so the
+two hubs are scored on the same chats against the same native outputs (`onboard-encoders/e2e-joint/`). The guard
+ended two of these runs, one of them twice, and each finished on a retry (`--resume`); every rerun reproduced the
+campaign runs' own conditions exactly (largest difference 0.0). Every decoder is refitted, Qwen3.8's
+included, so the joint hub's floors (`floor_prefix.joint`) are its own: they differ from the onboarded hub's by up
+to 0.0041 KL per chat into Qwen3.8, 0.0084 into DeepSeek-V2-Lite and 0.0125 into LFM2 (a5add943; into LFM2 the
+joint floors are higher on average, +0.0017 [+0.0001, +0.0041]). The shares below are each hub's against its own
+floor; the paired KL difference does not involve the floors. p is the exact sign-flip test's (two-sided; all 2^n
+sign patterns), next to the document-bootstrap CI (`review-20261009/joint.py`, `joint.json`):
+
+| Direction | chats | onboarded (`reverse`) | joint refit | KL, joint − onboarded | p | joint lower on |
+| --- | --- | --- | --- | --- | --- | --- |
+| DS-V2-Lite → Qwen3.8 | 8 | 16.9% [9.0, 22.7] | 6.3% [4.3, 8.7] | +0.0069 [+0.0011, +0.0137] | 0.109 | 3/8 |
+| LFM2-2.6B → Qwen3.8 | 8 | 23.7% [13.0, 32.2] | 6.8% [2.9, 10.2] | +0.0112 [+0.0029, +0.0211] | 0.023 | 1/8 |
+| Qwen3.6 → Qwen3.8 | 8 | 41.0% [19.6, 53.6] | 22.9% [13.4, 26.9] | +0.0120 [+0.0018, +0.0243] | 0.023 | 1/8 |
+| Qwen3-4B → Qwen3.8 (hub4's own pair) | 8 | 29.8% [17.0, 36.2] | 22.8% [12.1, 29.3] | +0.0045 [+0.0011, +0.0084] | 0.055 | 1/8 |
+| Qwen3.8 → DS-V2-Lite (fixed + longer set) | 13 | 47.4% [27.7, 48.5] | 55.9% [27.0, 57.5] | −0.0233 [−0.0708, +0.0005] | 0.372 | 8/13 |
+| Qwen3.8 → DS-V2-Lite without a5add943 | 12 | | | −0.0001 [−0.0010, +0.0008] | 0.744 | 7/12 |
+| Qwen3.8 → LFM2-2.6B | 13 | 37.3% [32.6, 55.4] | 35.2% [26.9, 52.3] | +0.0063 [+0.0006, +0.0173] | 0.002 | 1/13 |
+| Qwen3.8 → Qwen3.6 | 12 | 39.2% [26.3, 48.9] | 30.0% [18.7, 36.2] | +0.0034 [+0.0007, +0.0072] | 0.006 | 2/12 |
+
+- Out of the four sources into Qwen3.8 the joint hub is worse in all four, and the sign holds when any one chat is
+  left out (leave-one-out means +0.0033 to +0.0137). Individually the sign-flip test says so for LFM2 and Qwen3.6
+  (p 0.023), not for DeepSeek-V2-Lite (0.109) or Qwen3-4B (0.055): with 8 chats the bootstrap CI excludes 0 more
+  readily than the exact test.
+- Into LFM2 and Qwen3.6 it is worse (p 0.002 and 0.006). Into DS-V2-Lite the −0.0233 is entirely the one chat
+  that rewrites the earlier answer (a5add943, 93% of the floor's KL there): without it the two hubs are equal
+  (−0.0001, lower on 7 of 12, p 0.74).
+- The joint K R² gains above do not show up as KL, as in section 9's diagnosis.
+
+**What this does and does not show.** The comparison is of one configuration, which differs from onboarding in
+three ways at once: it is fitted jointly; it trains on the seven models' 87,426 common spans, against 185,672 for
+the base hub and its onboardings; and it refits Qwen3.8's own decoder (and every other). Its encoders have no
+`reverse`-style variance matching, a likely cause for the onboarded sources, but not for Qwen3-4B → Qwen3.8, which
+drops from 29.8% to 22.8% although hub4's own Qwen3-4B encoder never had variance matching either: the smaller
+common span set or the refitted decoders may matter as much. Not run (each cheap next to a refit): §9's spread and
+decoded-variance diagnostics for the joint encoders; the four base models refitted on the same 87,426 spans with
+Qwen3-4B → Qwen3.8 run again; `reverse`-style scaling applied to the joint encoders.
+
+Cost, measured (`joint7/comparison.json` `cost`; the Watch's package power covers all work on the package):
+
+| | wall | running | package energy over the wall time | peak memory: anonymous / on the GPU |
+| --- | --- | --- | --- | --- |
+| joint seven-model refit, both kinds, on the GPU | 104 min (6,230 s) | 53 min (3,163 s) | 235 kJ (171 kJ while running) | 28.3 GiB / 16.6 GiB (torch's reserved peak: GTT, which RssAnon does not show); estimated then 35.6 GiB in all |
+| one GPU onboarding: LFM2-2.6B (README "Fit placement") / GLM-4.7-Flash (campaign) | 5 / 45 min | 2.5 / 21 min | 10 / 97 kJ | — / 4.5 GiB; 19.2 / 12.1 GiB |
+| `reverse` re-encode of one pilot (campaign) | 5-6 min | 2.3-2.9 min | 12.7-15.2 kJ | 8.9-10.2 GiB / not recorded |
+
+One refit used the energy of 15-19 re-encodes, or of 2.4-24 full onboardings (from LFM2's 10 kJ to GLM-4.7-Flash's
+97 kJ). It cannot resume, changes every adapter (the bridge then needs a new hub directory, and every campaign
+evaluation would have to run again) and grows with the square of the summed view dimensions.
+
+**Conclusion: keep onboarding with `reverse`.** A seven-model joint refit on the models' common spans translated
+worse than onboarding out of every source into Qwen3.8 and into two of the three pilots, at the cost above. That
+is one configuration: a refit with variance-matched encoders, or on more spans, is untested, so this does not rule
+out joint refits in general; it rules out this one as a replacement for onboarding.
+
+### Selection set
+
+Everything in this section was chosen and measured on the same chats: the `reverse` encoder,
+its variance cap of 4 and the native-prefix rule were chosen on the eight fixed chats (RESULTS.md section 2's),
+which every comparison here uses again; the longer set adds the corpus's three other chats in range (section 9's
+review follow-up). By October 9 all 18 chat-type test conversations of the long-chat corpus had been scored, the
+fixed eight 48-88 times each. These are selection-set results: the method choices are frozen as they are, and a
+fresh held-out set (`evidence/linear-transfer/corpus-heldout-20261009/`, from the local SmolTalk2 files, disjoint
+from every corpus used so far; README "Onboarding campaign") is kept unscored for the next choice.
+
+**Not tested.** A decoder-side calibration (a variance or temperature correction of the decoded K rows, which would
+also help the jointly fitted Qwen3-4B, whose decoded K variance is 0.70-0.72 of the native) and every target other
+than Qwen3.8 and the onboarded model itself (section 10 adds a few live hops between onboarded models).
+
+## 10. hub6: eight more models onboarded (October 8-9, 2026)
+
+Eight more local models went through `campaign.py run` with the `reverse` encoder and its 4x variance cap
+(section 9), each onboarded against hub4-d4096 with its four models as pivots and evaluated with Qwen3.8 in
+both directions under the campaign's settings (the eight fixed chats, the longer set where a target renders
+some of them too short, and again as the servers render where the render stage found that they differ;
+the Qwen3-4B → Qwen3.8 baseline, 29.8% [17.0%, 36.2%], under the same settings). Each report was checked
+afterwards by rebuilding its numbers from the per-token score arrays and the held-out R² from the bundles and
+captures; every headline number reproduced. Evidence: `evidence/universal-kv/campaign/NAME/report.md`.
+
+A review of this section on October 9 found the numbers recorded faithfully and their reading too strong: the
+shares into the models rest on chat sets that differ from model to model and largely on one chat; with 8 chats
+the percentile bootstrap calls differences significant that an exact test does not; and hub6 shipped encoders
+already measured to hurt. This version therefore gives the shares into each model on the chats all of them share
+and without the dominant chat, the exact sign-flip test's p next to every bootstrap interval, and hub6 with `ridge`
+encoders for the two models whose `reverse` encoders did not help (`hub6-20261009`). The evidence of the follow-up
+is `evidence/universal-kv/review-20261009/` (`stats.py` and `stats.json`, `tables.py`, `joint.py`). All of it is
+selection-set evidence (section 9, "Selection set").
+
+| Model (llama.cpp arch) | Family | K columns | Source encoder in hub6: smallest / median per-dimension train R², dimensions the 4x cap binds on (K / V) | Notes |
+| --- | --- | --- | --- | --- |
+| Granite-4.0-H-Tiny Q8 (`granitehybrid`) | Mamba2 hybrid, 4 GQA layers, MoE | 2,048 | `ridge` since October 9 (`reverse` before: 0.044 / 0.103, 2,561 / 2,009 of 4,096; warnings) | |
+| Falcon-H1-3B Q8 (`falcon-h1`) | Mamba2 + attention in every layer (32 × 2 × 128) | 8,192 | `reverse`: 0.123 / 0.252, none | 17 of 248 documents left out of the fit (its 192 user-defined LaTeX tokens: the fit keeps kv_probe's special flags, pair_eval and the engine flag control tokens only) |
+| Jamba-Reasoning-3B Q8 (`jamba`) | Mamba hybrid, 2 attention layers of one KV head | 256 | `reverse`: 0.003 / 0.010, 3,926 / 3,876 (uncapped up to 110x / 131x; warnings) | held-out K R² out of it −0.35 to −0.87; a `ridge` encoder (`checks/encoder-ridge/`) is harmless but no better than the floor (−0.2% [−2.6%, 2.5%]); **left out of hub6** |
+| Nemotron-3.5-Lightning-30B-A3B Q8 (`nemotron_h_moe`) | Mamba2 hybrid, 6 GQA layers (the 7th, the MTP block, skipped), MoE | 1,536 | `ridge` since October 9 (`reverse` before: 0.028 / 0.079, 2,915 / 2,952, uncapped up to 11.8x / 12.2x; warnings) | |
+| Kimi-Linear-48B-A3B Q4_K_M (`kimi-linear`) | KDA + MLA hybrid (7 MLA layers of 27, K-only latents) | 4,032 | `reverse`: 0.097 / 0.201, none | |
+| Ling-3.0-tiny Q8 (`bailingmoe3`) | MLA + linear-attention hybrid (6 MLA layers), MoE | 3,456 | `reverse`: 0.061 / 0.147, 1,509 / 1,538 (uncapped up to 5.5x; no R² warning) | its template keeps the earlier reasoning, so 95-99% of the translated cells come from the source, against Qwen3-4B's 10-88% on the same chats: its comparison with Qwen3-4B is not like for like |
+| Gemma-4-26B-A4B QAT Q4 (`gemma4`) | iSWA: 25 sliding + 5 full-attention layers, MoE | 56,320 (source: the 5 full layers, 2,560) | `reverse` on the full-attention layers: 0.095 / 0.186, none | self R² K 0.68, V 0.52 (V equals K up to a scale there); the capture covers 41% of the training tokens (73,656 spans) |
+| Gemma-4-31B QAT Q4 (`gemma4`) | iSWA: 50 sliding + 10 full-attention layers, dense | 225,280 (source: the 10 full layers) | `reverse` on the full-attention layers: 0.211 / 0.353, none | a 185 GB capture of 96 documents (48,746 train spans); its onboarding needed the corrected memory estimate (README "Fit memory"): 32.7 GiB anonymous and 23.7 GiB on the GPU, against 98.5 GiB estimated before, which no lock could grant |
+
+The pilots and GLM-4.7-Flash (section 9) are in the tables below too. Into a model: `hub_prefix` against
+`floor_prefix` on every chat its runs scored (the eight fixed chats, plus the longer set where the model renders
+some of them too short; the reports' figure), the same without the chat that carries the largest part of the floor,
+and on the six fixed chats every model's runs share (1749e42d, b19deab5, f2eef633, 08e28e45, a6c4726d, 3b211f08).
+Each share with its document-bootstrap 95% CI, the exact sign-flip test's p of the paired KL difference and the
+chats where the switch is below the floor (with six chats the smallest p possible is 0.031):
+
+| Into the model | every chat scored (pooled) | the chat carrying most of the floor | without that chat | the six chats every run shares |
+| --- | --- | --- | --- | --- |
+| LFM2-2.6B | 37.3% [32.6%, 55.4%], p < 0.001, 13/13 | a5add943, 92% | 44.8% [26.9%, 59.6%], p < 0.001, 12/12 | 50.6% [45.0%, 65.2%], p 0.031, 6/6 |
+| DeepSeek-V2-Lite | 47.4% [27.7%, 48.5%], p < 0.001, 13/13 | a5add943, 93% | 29.7% [26.9%, 35.5%], p < 0.001, 12/12 | 30.7% [28.1%, 34.1%], p 0.031, 6/6 |
+| Qwen3.6-35B-A3B | 39.2% [26.3%, 48.9%], p 0.002, 11/12 | a5add943, 47% | 41.8% [21.2%, 50.9%], p 0.004, 10/11 | 50.4% [36.9%, 54.5%], p 0.031, 6/6 |
+| Qwen3.6-35B-A3B, as the servers render | 44.6% [36.5%, 53.2%], p 0.008, 8/8 | 2ddc2137, 32% | 48.4% [36.9%, 54.9%], p 0.016, 7/7 | 49.3% [37.5%, 56.0%], p 0.031, 6/6 |
+| GLM-4.7-Flash | 78.5% [74.9%, 82.4%], p < 0.001, 13/13 | a5add943, 22% | 80.4% [77.0%, 83.0%], p < 0.001, 12/12 | 82.9% [80.3%, 84.3%], p 0.031, 6/6 |
+| GLM-4.7-Flash, as the servers render | 81.0% [77.6%, 84.7%], p 0.008, 8/8 | 2ddc2137, 22% | 82.5% [78.6%, 85.4%], p 0.016, 7/7 | 82.3% [78.0%, 85.5%], p 0.031, 6/6 |
+| Granite-4.0-H-Tiny | 41.8% [5.4%, 43.3%], p 0.018, 9/13 | a5add943, 95% | 9.6% [3.5%, 17.3%], p 0.036, 8/12 | 6.3% [−2.0%, 8.3%], p 0.250, 3/6 |
+| Falcon-H1-3B | 50.5% [−4.9%, 53.2%], p 0.184, 12/14 | a5add943, 93% | 8.1% [−13.1%, 21.0%], p 0.367, 11/13 | 9.5% [8.0%, 10.1%], p 0.094, 5/6 |
+| Jamba-Reasoning-3B | 3.6% [−1.8%, 10.0%], p 0.234, 11/14 | db6f4e5f, 16% | 3.7% [−2.7%, 11.3%], p 0.299, 10/13 | 6.8% [−1.1%, 17.6%], p 0.219, 5/6 |
+| Nemotron-3.5 | 22.5% [15.2%, 27.8%], p < 0.001, 13/13 | a5add943, 36% | 19.6% [14.2%, 28.2%], p < 0.001, 12/12 | 16.3% [11.6%, 30.1%], p 0.031, 6/6 |
+| Nemotron-3.5, as the servers render | 33.1% [23.2%, 40.1%], p 0.008, 8/8 | 2ddc2137, 31% | 28.6% [21.4%, 36.3%], p 0.016, 7/7 | 26.9% [19.6%, 34.8%], p 0.031, 6/6 |
+| Kimi-Linear-48B-A3B | 70.2% [11.9%, 72.4%], p 0.011, 11/13 | a5add943, 95% | 19.8% [8.0%, 29.0%], p 0.021, 10/12 | 20.6% [19.3%, 24.0%], p 0.031, 6/6 |
+| Ling-3.0-tiny | 72.1% [66.3%, 75.0%], p 0.008, 8/8 | f2eef633, 33% | 71.6% [63.9%, 75.8%], p 0.016, 7/7 | 70.7% [63.8%, 74.5%], p 0.031, 6/6 |
+| Gemma-4-26B-A4B | 43.5% [28.7%, 48.4%], p 0.001, 11/12 | a5add943, 33% | 39.3% [25.6%, 45.4%], p 0.003, 10/11 | 45.1% [30.5%, 48.1%], p 0.031, 6/6 |
+| Gemma-4-26B-A4B, as the servers render | 39.6% [32.8%, 42.4%], p < 0.001, 12/12 | a5add943, 36% | 37.2% [30.4%, 40.7%], p < 0.001, 11/11 | 37.7% [28.8%, 41.5%], p 0.031, 6/6 |
+| Gemma-4-31B | 27.3% [22.1%, 39.0%], p < 0.001, 11/12 | a5add943, 47% | 31.1% [21.5%, 42.3%], p 0.002, 10/11 | 34.5% [27.2%, 51.2%], p 0.031, 6/6 |
+| Gemma-4-31B, as the servers render | 32.5% [28.7%, 42.2%], p < 0.001, 12/12 | a5add943, 48% | 35.4% [27.9%, 45.1%], p < 0.001, 11/11 | 35.6% [22.5%, 49.7%], p 0.031, 6/6 |
+
+Out of a model, into Qwen3.8, on the eight fixed chats; against the floor, and the paired KL difference from Qwen3-4B →
+Qwen3.8 on the same chats (positive: worse than Qwen3-4B; its floors are identical); for Granite and Nemotron the
+`reverse` runs of October 8 next to the `ridge` runs of October 9 (same chats, identical floors):
+
+| Out of the model, into Qwen3.8 (8 fixed chats) | against the floor | against Qwen3-4B → Qwen3.8 (KL difference) |
+| --- | --- | --- |
+| LFM2-2.6B | 23.7% [13.0%, 32.2%], p 0.023, 7/8 | +0.0042 [−0.0003, +0.0097], p 0.242, 3/8 |
+| LFM2-2.6B, its earlier `ridge` encoder | 4.0% [2.6%, 5.3%], p 0.031, 7/8 | current − earlier: −0.0133 [−0.0257, −0.0033], p 0.023, 7/8 |
+| DeepSeek-V2-Lite | 16.9% [9.0%, 22.7%], p 0.031, 7/8 | +0.0087 [+0.0020, +0.0166], p 0.055, 1/8 |
+| DeepSeek-V2-Lite, its earlier `ridge` encoder | 2.9% [1.1%, 3.6%], p 0.078, 6/8 | current − earlier: −0.0095 [−0.0179, −0.0025], p 0.023, 7/8 |
+| Qwen3.6-35B-A3B | 41.0% [19.6%, 53.6%], p 0.016, 7/8 | −0.0076 [−0.0157, −0.0008], p 0.078, 5/8 |
+| Qwen3.6-35B-A3B, as the servers render | 49.8% [33.4%, 59.6%], p 0.016, 7/8 | — |
+| Qwen3.6-35B-A3B, its earlier `ridge` encoder | 11.3% [7.3%, 13.9%], p 0.008, 8/8 | current − earlier: −0.0201 [−0.0387, −0.0046], p 0.039, 7/8 |
+| Qwen3.6-35B-A3B, as the servers render, its earlier `ridge` encoder | 17.5% [7.5%, 24.0%], p 0.023, 7/8 | current − earlier: −0.0218 [−0.0394, −0.0069], p 0.016, 7/8 |
+| GLM-4.7-Flash | 38.1% [22.7%, 46.3%], p 0.008, 8/8 | −0.0056 [−0.0107, −0.0014], p 0.031, 7/8 |
+| GLM-4.7-Flash, as the servers render | 48.1% [35.4%, 55.4%], p 0.008, 8/8 | — |
+| Granite-4.0-H-Tiny | 1.3% [0.6%, 2.3%], p 0.039, 7/8 | +0.0193 [+0.0063, +0.0360], p 0.016, 1/8 |
+| Granite-4.0-H-Tiny, its earlier `reverse` encoder | 5.4% [−14.4%, 22.1%], p 0.734, 3/8 | current − earlier: +0.0028 [−0.0085, +0.0163], p 0.742, 5/8 |
+| Falcon-H1-3B | 25.3% [13.1%, 32.7%], p 0.055, 6/8 | +0.0031 [−0.0002, +0.0067], p 0.164, 1/8 |
+| Jamba-Reasoning-3B | −1030.5% [−2210.4%, −606.9%], p 0.008, 0/8 | +0.7176 [+0.5148, +0.9279], p 0.008, 0/8 |
+| Nemotron-3.5 | 4.7% [2.6%, 7.7%], p 0.008, 8/8 | +0.0170 [+0.0041, +0.0325], p 0.016, 1/8 |
+| Nemotron-3.5, as the servers render | −43.8% [−158.5%, −5.7%], p 0.062, 1/8 | — |
+| Nemotron-3.5, its earlier `reverse` encoder | −16.1% [−91.6%, 17.2%], p 0.453, 2/8 | current − earlier: −0.0141 [−0.0382, +0.0127], p 0.328, 6/8 |
+| Nemotron-3.5, as the servers render, its earlier `reverse` encoder | −115.4% [−298.6%, −29.4%], p 0.039, 2/8 | current − earlier: −0.0485 [−0.1048, −0.0114], p 0.031, 6/8 |
+| Kimi-Linear-48B-A3B | 32.2% [15.1%, 44.5%], p 0.023, 7/8 | −0.0016 [−0.0073, +0.0041], p 0.594, 4/8 |
+| Ling-3.0-tiny | 42.4% [29.3%, 48.4%], p 0.016, 7/8 | −0.0085 [−0.0154, −0.0020], p 0.078, 6/8 |
+| Gemma-4-26B-A4B | 36.9% [16.6%, 49.7%], p 0.016, 7/8 | −0.0048 [−0.0118, +0.0008], p 0.336, 5/8 |
+| Gemma-4-26B-A4B, as the servers render | 35.4% [14.2%, 49.1%], p 0.039, 6/8 | — |
+| Gemma-4-31B | 33.0% [16.1%, 44.0%], p 0.008, 8/8 | −0.0021 [−0.0067, +0.0020], p 0.320, 6/8 |
+| Gemma-4-31B, as the servers render | 34.0% [18.0%, 43.3%], p 0.008, 8/8 | — |
+
+What the twelve show:
+
+- **Into a new model the shares depend on the chats.** On the six chats every run shares a switch from Qwen3.8
+  removes 6-83% of the floor's KL: GLM-4.7-Flash 83%, Ling 71%, LFM2 51%, Qwen3.6 50%, Gemma-4-26B 45%, Gemma-4-31B
+  35%, DeepSeek-V2-Lite 31%, Kimi-Linear 21%, Nemotron 16% (27% as the servers render), and no measurable part into
+  Falcon-H1 (9.5%, p 0.094), Jamba (6.8%, p 0.22) and Granite (6.3%, p 0.25). The reports' pooled figures differ
+  because the chat sets differ: where a model renders two of the fixed chats too short, its runs add the longer set,
+  which holds a5add943, the reply that rewrites the earlier answer. Its floor KL is 2.2-2.5 nats/token (0.001-0.18 on
+  the other chats), so it carries 92-95% of the pooled floor into DeepSeek-V2-Lite, LFM2, Granite, Falcon and Kimi:
+  into Granite (41.8% pooled), Falcon (50.5%) and Kimi (70.2%) the pooled share is mostly that one chat (without it
+  9.6%, 8.1% with a CI reaching below 0, and 19.8%). Ling renders all eight long enough, so its runs never saw
+  a5add943. The decoders, fitted on the pooled pivot estimates, do not depend on the encoder; they help into nine of
+  the twelve on ordinary chats, and into Granite and Falcon only on the chat that copies earlier context.
+- **Out of a new model the onboarding's encoder warnings decide, not the number of attention layers.** Where no
+  dimension's train R² falls below 0.05 (the source encoder's smallest 0.06-0.21: Falcon, Kimi, Ling, whose cap warning
+  fired on 37% of its dimensions, both Gemma 4 through their full-attention layers) the switch into Qwen3.8 removes 25-42%
+  of the floor's KL, not distinguishable from the jointly fitted Qwen3-4B's 30% (sign-flip p 0.16-0.59; Ling, better
+  at p 0.078, is not like for like). Where both warnings fire (a dimension below R² 0.05 and the cap binding on 49-96%
+  of the dimensions: Granite 0.044, Nemotron 0.028, Jamba 0.003; medians 0.10, 0.08, 0.01), `reverse`, which scales each
+  dimension by about 1 / R², did no measurable good (Granite 5.4%, p 0.73), harm as the servers render (Nemotron
+  −115%, p 0.039) or great harm (Jamba −1031%). The attention layers do not explain it: Gemma-4-26B's source reads 5
+  full-attention layers (2,560 columns) and removes 37%, and Ling, with 6 attention layers like Nemotron, 42%.
+- **`ridge` where the warnings fire.** Re-encoded with `ridge` (October 9, `campaign.py reencode --encoder ridge`), a
+  switch out of Granite removes 1.3% [0.6%, 2.3%] (p 0.039, lower on 7 of 8; every chat within 0.002 KL of the
+  floor) and out of Nemotron 4.7% [2.6%, 7.7%] (p 0.008, lower on 8 of 8) with the templates' rendering, but as the servers
+  render (Nemotron's server keeps the earlier reasoning, so 95-97% of the translated cells come from its cache,
+  against 10-85% with the templates' rendering; what a live switch holds) −43.8% [−158.5%, −5.7%] (p 0.062, lower on 1 of 8; −115% with `reverse`, so `ridge` is less
+  harmful, −0.0485 [−0.1048, −0.0114] KL, p 0.031, but not harmless). Out of either a switch keeps at best about what
+  the floor keeps: the target gets little beyond its native tail. hub6 now carries both `ridge` encoders, and
+  Nemotron is to be registered with `kvpark bridge add --no-source` (new: a target only; switches out of it are
+  skipped, `source-refused`, and the next model prefills natively), which its campaign report's "Bridge settings"
+  now recommend because a switch out of it did worse than the floor; Jamba (`ridge` −0.2% [−2.6%, 2.5%]) stays out.
+  The warnings come from the onboarding itself, before any evaluation (state.json `onboard.result.warnings`). The
+  `ridge` choice was made on the same eight chats (a selection-set result); the campaign's re-encodes reproduced the
+  `checks/encoder-ridge/` runs exactly.
+- **R² does not track this.** In hub6-20261009 (below) K R² out of Nemotron into the base models is 0.63-0.70 and
+  out of Granite 0.56-0.67, as high as out of the healthy sources (0.53-0.76), yet switches out of them keep about the
+  floor or less: `ridge` is the R²-optimal encoder and shrinks, which is what section 9's diagnosis found R² cannot
+  see. With `reverse` those two read 0.36-0.55 (hub6-20261008), which overlapped LFM2's 0.53-0.68 already.
+
+**hub6-20261009** (and `-v2`, for `kvpark bridge engine --hub`) is hub4-d4096's four models plus eleven of the
+twelve onboarded models (all but Jamba): qwen38, muse, qwen3-4b, ornith, lfm2-2.6b, deepseek-v2-lite, qwen3.6-35b-a3b,
+glm-4.7-flash, granite-4.0-h-tiny (`ridge`), falcon-h1-3b, nemotron-3.5-lightning-30b-a3b (`ridge`), kimi-linear-48b-a3b,
+ling-3.0-tiny, gemma-4-26b-a4b, gemma-4-31b (`campaign.py assemble --evaluate`, October 9: hard links, 22 GB in format 1
+and 34 GB in format 2 with no new disk). It replaces **hub6-20261008**, assembled the day before with the `reverse`
+encoders of Granite and Nemotron, which `campaign.py status` now flags as built from an older onboarding. Its R²
+evaluation ran on the GPU under the guard: 146 s running, 142 s paused (69 pauses, at most 95.9 °C), 36.1 GiB anonymous
+and 12.5 GiB on the GPU at the same time at most (46.6 GiB), the longest timed GPU launch 0.0099 s, no GPU line in the
+kernel log. Held-out R² (K / V) of every pair; between two onboarded models on the 8,699 test spans all eleven share
+(`evaluation-onboarded.json`), with a base model on each onboarding's own test spans, between base models on hub4's
+(`hub6-20261009-summary/r2-summary.json`; its script now leaves out hub4's dedicated pairwise map "direct qwen38->muse",
+which until October 9 it read as a hub pair, so hub6-20261008's Muse row said 0.77 and 0.67 for 0.75 and 0.62):
+
+| Model | K R² into it, from the 14 others | K R² out of it, into the 14 others | V into | V out | self K / V |
+| --- | --- | --- | --- | --- | --- |
+| Qwen3.8 | 0.53-0.71 | 0.50-0.77 | 0.38-0.63 | 0.46-0.67 | 0.87 / 0.81 |
+| Muse | 0.59-0.75 | 0.47-0.75 | 0.47-0.62 | 0.43-0.62 | 0.86 / 0.67 |
+| Qwen3-4B | 0.64-0.77 | 0.53-0.76 | 0.36-0.54 | 0.45-0.63 | 0.90 / 0.79 |
+| Ornith | 0.55-0.75 | 0.49-0.76 | 0.40-0.67 | 0.45-0.65 | 0.90 / 0.85 |
+| LFM2-2.6B | 0.60-0.76 | 0.42-0.68 | 0.38-0.56 | 0.36-0.60 | 0.91 / 0.86 |
+| DeepSeek-V2-Lite | 0.34-0.53 | 0.42-0.69 | 0.31-0.49 | 0.36-0.55 | 0.74 / 0.73 |
+| Qwen3.6-35B-A3B | 0.58-0.75 | 0.44-0.75 | 0.47-0.66 | 0.39-0.63 | 0.92 / 0.88 |
+| GLM-4.7-Flash | 0.51-0.65 | 0.49-0.76 | 0.42-0.58 | 0.42-0.61 | 0.83 / 0.79 |
+| Granite-4.0-H-Tiny (`ridge`) | 0.58-0.73 | 0.44-0.70 | 0.44-0.58 | 0.38-0.54 | 0.86 / 0.75 |
+| Falcon-H1-3B | 0.57-0.72 | 0.44-0.72 | 0.36-0.53 | 0.38-0.59 | 0.88 / 0.83 |
+| Nemotron-3.5 (`ridge`) | 0.62-0.76 | 0.42-0.71 | 0.48-0.65 | 0.39-0.54 | 0.88 / 0.80 |
+| Kimi-Linear | 0.60-0.74 | 0.41-0.68 | 0.45-0.58 | 0.32-0.55 | 0.91 / 0.85 |
+| Ling-3.0-tiny | 0.54-0.69 | 0.37-0.67 | 0.48-0.61 | 0.28-0.48 | 0.91 / 0.89 |
+| Gemma-4-26B-A4B | 0.42-0.61 | 0.34-0.64 | 0.31-0.49 | 0.31-0.50 | 0.68 / 0.52 |
+| Gemma-4-31B | 0.37-0.54 | 0.44-0.72 | 0.28-0.46 | 0.41-0.61 | 0.64 / 0.54 |
+
+Between the onboarded models K R² is 0.35-0.75 and V 0.28-0.63 (110 pairs); the weakest pairs are into DeepSeek-V2-Lite
+and Gemma-4-31B (Gemma-4-26B → DeepSeek-V2-Lite K 0.345, Ling → Gemma-4-31B 0.369, Ling → DeepSeek-V2-Lite 0.381). In
+hub6-20261008 they were 0.24-0.75 and 0.17-0.63, the weakest out of Granite and Nemotron into the Gemma 4 models (K
+0.24-0.32) and into DeepSeek-V2-Lite (Granite 0.262, Nemotron 0.274). No onboarded → onboarded pair has a seeded
+end-to-end measurement; the live hops below are the first switches between two onboarded models.
+
+**A joint hub6 instead?** No. The seven-model joint refit on its models' common spans was worse end to end than
+onboarding (section 9), and a fifteen-model one does not fit this machine: its summed views are 55,296 wide, so the
+GCCA phase alone needs 77.7 GiB of anonymous memory and the decoder phase as `fit_hub.joint_bytes` counts it 301 GiB
+(106 GiB without Gemma-4-31B, whose decoder is 225,280 columns wide), against the 98 GiB a 123 GiB machine can grant
+with the 25 GiB margin, before the GPU's share. The eleven onboarded models share only 25,441 train spans
+(Gemma-4-31B's capture holds 52 training documents), against hub4's 185,672. A joint hub6 would need the decoder's dev
+statistics streamed as the onboarding's are, a GCCA that does not hold two float64 P x P matrices (a float32 or GPU
+subspace solver), fits that resume, and full captures of the large Gemma 4 models; whether it would then translate
+better than onboarding is open (section 9's refit differed from onboarding in three ways at once).
+
+### Live switches with hub6 (October 9)
+
+Throwaway llama-servers of the repository's pin, llama.cpp a7b94df2c (its ROCm build in `runtime-next/build-rocm`;
+`runtime/build` is a CPU-only build): every layer on the GPU, 36,864-token contexts, one slot, 4 threads. The bridge
+configuration, slots and engine socket lived in scratch directories (`XDG_DATA_HOME`, `KVPARK_BRIDGE_CONFIG`), each
+model registered with its campaign report's settings (native prompt start; the recurrent means of Qwen3.8, Granite
+and Kimi). `live_bridge.py hops` took two held-out chats of the corpus's test split that are also among the campaigns'
+eight (`multi_turn_concat_sessions:595` = 3b211f08, `multi_turn_reasoning_if_think:18676` = b19deab5): prime the
+first model, then per hop a native prefill of the target (the reference), an engine prewarm,
+`kvpark.bridge.switch.switch()` (save the source's slot, translate, restore, then the warm request that prefills
+the 2,048-token native tail) and 32 generated tokens (temperature 0) compared with the native run's. Two models per
+run, each run under `campaign.py exec --gpu-evaluation` (GPU/memory lock, memory check, the guard's Watch over the
+servers and the engine daemon), with `--cool-c 65` (a wait until the package is at most 65 °C before each timed
+step) and the ggml Vulkan engine (below: the torch daemon's busy thread).
+
+Two series ran. The first (`live-hub6-20261009/`, hub6-20261008-v2) is superseded: its timings were wall times with
+the guard's pauses inside, its "running" times took those pauses out (from the guard log), and both mislead. A
+guard pause stops the processes, but the GPU finishes the work already queued, so a step's own time lies between
+its wall time less the pauses inside it and its wall time; the identical 15,355-token Qwen3.8 prefill read 39.3 s
+"running" in one run and 28.6 s in another. Its two Gemma-4-26B → Qwen3.8 hops were round trips as well: the
+Gemma slot held a prefix translated from Qwen3.8 (6,197 of its 8,245 tokens). The second series
+(`live-hub6-20261009b/`, hub6-20261009-v2, five runs) runs Gemma-4-26B → Qwen3.8 on its own route (Gemma primed
+natively), and prefills every native reference once more in 1,024-token requests, each after the cooling wait
+(`live_bridge.py --native-chunk`), so that no guard pause falls inside a timed request. No pause did, but the
+requests carry an overhead of their own: on Qwen3.8 each took 4.1 s per 1,024 tokens wherever it sat in the
+conversation, against about 3 s inside one request (on Granite they matched one request, on Gemma they were 10-27%
+slower), so their sum bounds the native prefill from above rather than measuring it. The table gives, per step,
+the wall time and the pauses inside it, and the speed-up as an interval: native in [wall − pauses, min(wall, the
+chunked sum)] over the switch in [wall − pauses, wall] (`scripts/live_md.py`; evidence `live-table.json`, each run's
+`hops.jsonl` with the generated text, guard logs, `scripts/`):
+
+| Hop | Chat | T0 / P | Reuse | Engine s | Tail prefill s | Switch s (paused inside) | Native prefill, one request s (paused inside) | Native prefill, cooled 1,024-token requests s | Switch faster by | First 32 tokens agree |
+| --- | --- | --- | --- | ---: | ---: | --- | --- | ---: | ---: | ---: |
+| Gemma-4-26B-A4B → Qwen3.8 | 595 (3b211f08) | 13,307 / 15,355 | yes | 1.46 | 8.5 | 11.3 (4) | 48.1 (4) | 62.7 | 3.9-6.8x | 0 |
+| Gemma-4-26B-A4B → Qwen3.8 | 18676 (b19deab5) | 10,028 / 12,076 | yes | 1.09 | 8.9 | 10.4 (4) | 49.4 (29) | 48.3 | 1.9-7.7x | 2 |
+| Kimi-Linear-48B-A3B → Gemma-4-26B-A4B | 595 (3b211f08) | 6,197 / 8,245 | yes | 0.47 | 1.9 | 3.0 (0) | 6.6 (0) | 8.4 | 2.2x | 32 |
+| Kimi-Linear-48B-A3B → Gemma-4-26B-A4B | 18676 (b19deab5) | 7,845 / 9,893 | yes | 0.58 | 1.9 | 2.7 (0) | 13.4 (6) | 8.6 | 2.6-3.1x | 32 |
+| Kimi-Linear-48B-A3B → Qwen3.8 | 595 (3b211f08) | 13,307 / 15,355 | yes | 1.09 | 10.3 | 12.5 (4) | 52.2 (10) | 61.6 | 3.3-6.4x | 0 |
+| Kimi-Linear-48B-A3B → Qwen3.8 | 18676 (b19deab5) | 10,028 / 12,076 | yes | 1.04 | 8.4 | 9.7 (4) | 50.0 (29) | 49.4 | 2.1-9.0x | 2 |
+| Qwen3.8 → Gemma-4-26B-A4B | 595 (3b211f08) | 6,197 / 8,245 | yes | 0.69 | 1.9 | 3.5 (0) | 6.8 (0) | 7.5 | 2.0x | 32 |
+| Qwen3.8 → Gemma-4-26B-A4B | 18676 (b19deab5) | 7,845 / 9,893 | yes | 0.74 | 2.0 | 3.2 (0) | 13.7 (8) | 8.8 | 1.8-3.1x | 32 |
+| Qwen3.8 → Granite-4.0-H-Tiny | 595 (3b211f08) | 6,098 / 8,146 | yes | 0.51 | 1.0 | 2.1 (0) | 3.8 (0) | 3.9 | 1.8x | 32 |
+| Qwen3.8 → Granite-4.0-H-Tiny | 18676 (b19deab5) | 9,187 / 11,235 | yes | 0.45 | 1.0 | 1.8 (0) | 8.9 (4) | 5.3 | 2.8-3.0x | 0 |
+
+- **Reuse: 10 of 10 switches restored and reused exactly T0**, into the Mamba2 hybrid Granite-4.0-H-Tiny (with its
+  recurrent mean), into Gemma 4's iSWA cache (the sliding layers' last window) from Qwen3.8 and from Kimi, and into
+  Qwen3.8 out of Kimi-Linear's MLA + KDA cache and out of Gemma-4-26B's. Kimi → Gemma-4-26B is a switch between two
+  onboarded models. The first series reused exactly T0 in 10 of 10 as well.
+- **Time.** The engine took 0.45-1.46 s. Into Qwen3.8 (12-15K tokens) a switch took 9.7-12.5 s of wall time with
+  about 4 s of pauses inside each (5.7-8.5 s of its own at least), most of it the 2,048-token tail (8.4-10.3 s of
+  wall time), against 48-52 s of native prefill. On the 15K-token chat, whose native prefill met 4-10 s of pauses,
+  the switch was 3.3-6.8 times faster; on the 12K-token chat the native prefill met 29 s of pauses, so only
+  1.9-2.1 times is certain there (up to 7.7-9.0). Into Gemma-4-26B (8-10K tokens) 2.7-3.5 s against 6.6-6.8 s of
+  native prefill with no pause inside (2.0-2.2 times), and 1.8-3.1 times on the longer chat. Granite prefills 8-11K
+  tokens in 3.8-5.3 s, so a switch into it (1.8-2.1 s) saves 1.7-3.5 s (1.8-3.0 times); the bridge's `min_handover`
+  setting exists for such targets. The first series' "3.6-5.9 times" into Qwen3.8 rested on the pause correction
+  above and is withdrawn.
+- **Answers.** Into Gemma-4-26B the 32 generated tokens equal the native run's in all four switches (from Qwen3.8 and
+  from Kimi). Into Qwen3.8, which opens with its reasoning, they part after 0-2 tokens in all four, but each
+  restates the last user request correctly in other words. Into Granite one chat agrees 32 of 32; on the other
+  (18676: the last turn asks to work two keywords into the previous four-section answer, which lies in the
+  translated part) the switched Granite again wrote a new short essay on the keywords instead of revising its
+  answer: section 9's weakness on replies that copy the earlier context (the campaign's teacher-forced score of this
+  chat into Granite: KL 0.044 against the floor's 0.048). These agreements say little about the translation: the
+  2,048-token native tail holds the last user message, which Gemma restates and which Granite's 595 answer copies as
+  JSON, and the campaigns' teacher-forced scores are the measure of quality.
+- **Guard.** The five runs took 3-8 minutes each, with 14-63 pauses (29-130 s), at most 96.4 °C, MemAvailable at
+  least 50.2 GiB, no abort and no amdgpu line in the kernel log. Their memory (the guard's GTT reading, new): up to
+  7.9 GiB anonymous and 57 GiB on the GPU, 63.7 GiB at the same time for Kimi-Linear and Qwen3.8 together (the
+  command asked for 63.0 GiB: the models' files plus 8 GiB; `scripts/live.sh` now asks for 12 GiB on top). In the
+  first series, the first attempt ran the torch engine as the bridge starts it, in a session of its own outside the
+  guard's process group: the guard stopped the run at 90 °C after the 15K-token prime, the daemon's first load drew
+  up to 59 W while it was stopped, Tctl reached 98.2 °C twice and the guard ended the run (70 s in; `aborted-1/`).
+  With the torch daemon inside the group, its busy runtime thread alone held Tctl at 93 °C at 48 W, and the guard
+  stopped and continued the run 170 times in 764 s; it was stopped by hand after one chat (`aborted-2/`). Since
+  then `live_bridge.py` starts the daemon inside the run's group with an idle exit of a week (the run stops it; its
+  default 600 s counts on a clock that runs on while the guard holds the run, and the bridge would then start a new
+  daemon outside the group) and checks before every switch that the daemon answering is still that one.

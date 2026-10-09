@@ -42,14 +42,19 @@ def tearDownModule():
 
 
 class FakeMachine:
-    """A fake /sys/class/hwmon (k10temp Tctl and optionally Tccd1, amdgpu edge and PPT, one NVMe) and
-    /proc/meminfo; set() changes them, tctl=None removes the CPU sensors (sensor loss)."""
+    """A fake /sys/class/hwmon (k10temp Tctl and optionally Tccd1, amdgpu edge and PPT, one NVMe),
+    /proc/meminfo and /sys/class/drm (one amdgpu card's GTT and VRAM use); set() changes them, tctl=None
+    removes the CPU sensors (sensor loss)."""
 
     def __init__(self, root, *, tctl=45.0, ccd=None, edge=40.0, ppt=20.0, nvme=35.0, available_gib=100.0,
-                 swap_total_gib=32.0, swap_used_gib=0.0):
+                 swap_total_gib=32.0, swap_used_gib=0.0, gtt_gib=1.0):
         self.root = Path(root)
         self.hwmon = self.root / "hwmon"
         self.meminfo = self.root / "meminfo"
+        self.drm = self.root / "drm"
+        (self.drm / "card1" / "device").mkdir(parents=True)
+        (self.drm / "card1-DP-1").mkdir()                       # a connector: no memory counters
+        (self.drm / "card1" / "device" / "mem_info_vram_used").write_text(f"{2 * GIB}\n")
         self.cpu_lock = self.root / "cpu.lock"
         self.values = {}
         for index, name in enumerate(("k10temp", "amdgpu", "nvme")):
@@ -60,7 +65,7 @@ class FakeMachine:
         (self.hwmon / "hwmon1" / "temp1_label").write_text("edge\n")
         (self.hwmon / "hwmon2" / "temp1_label").write_text("Composite\n")
         self.set(tctl=tctl, ccd=ccd, edge=edge, ppt=ppt, nvme=nvme, available_gib=available_gib,
-                 swap_total_gib=swap_total_gib, swap_used_gib=swap_used_gib)
+                 swap_total_gib=swap_total_gib, swap_used_gib=swap_used_gib, gtt_gib=gtt_gib)
 
     def set(self, **values):
         self.values.update(values)
@@ -78,22 +83,25 @@ class FakeMachine:
             (gpu / "temp1_input").unlink(missing_ok=True)
         (gpu / "power1_average").write_text(f"{int(v['ppt'] * 1e6)}\n")
         (self.hwmon / "hwmon2" / "temp1_input").write_text(f"{int(v['nvme'] * 1000)}\n")
+        (self.drm / "card1" / "device" / "mem_info_gtt_used").write_text(f"{int(v['gtt_gib'] * GIB)}\n")
         kib = lambda gib: int(gib * 1024 * 1024)  # noqa: E731
         self.meminfo.write_text(f"MemTotal: {kib(128)} kB\nMemFree: {kib(10)} kB\n"
                                 f"MemAvailable: {kib(v['available_gib'])} kB\nSwapTotal: {kib(v['swap_total_gib'])} kB\n"
                                 f"SwapFree: {kib(v['swap_total_gib'] - v['swap_used_gib'])} kB\n")
 
     def settings(self, **overrides):
-        values = dict(hwmon_root=str(self.hwmon), meminfo=str(self.meminfo), cpu_lock=str(self.cpu_lock), poll_s=0.05,
-                      sensor_loss_s=0.5, stop_grace_s=2.0, max_pause_s=0.0, gpu_watch="off",
+        values = dict(hwmon_root=str(self.hwmon), meminfo=str(self.meminfo), drm_root=str(self.drm),
+                      cpu_lock=str(self.cpu_lock), poll_s=0.05,
+                      sensor_loss_s=0.5, stop_grace_s=2.0, max_pause_s=0.0, gpu_watch="off", abort_c=95.0, start_c=75.0, resume_c=80.0,
                       gpu_lock=str(self.root / "gpu.lock"))
         values.update(overrides)
         return resource_guard.Settings(**values)
 
     def environ(self, **extra):
         return {"KVPARK_HWMON_ROOT": str(self.hwmon), "KVPARK_GUARD_MEMINFO": str(self.meminfo),
+                "KVPARK_GUARD_DRM_ROOT": str(self.drm),
                 "KVPARK_GUARD_CPU_LOCK": str(self.cpu_lock), "KVPARK_GUARD_GPU_WATCH": "off",
-                "KVPARK_GUARD_GPU_LOCK": str(self.root / "gpu.lock"), **extra}
+                "KVPARK_GUARD_GPU_LOCK": str(self.root / "gpu.lock"), "KVPARK_GUARD_ABORT_C": "95", **extra}
 
 
 def guard_arguments(root):
@@ -210,13 +218,19 @@ class SensorTest(unittest.TestCase):
         sample = resource_guard.read_sample(fake.settings())
         self.assertEqual(sample["cpu_c"], {"Tctl": 61.5, "Tccd1": 66.0})
         self.assertEqual((sample["edge_c"], sample["ppt_w"], sample["nvme_c"]), (58.0, 95.5, [41.0]))
-        self.assertEqual(sample["package_c"], 66.0)                     # the hottest CPU sensor or the iGPU edge
+        self.assertEqual(sample["package_c"], 66.0)                     # the hottest CPU sensor
         fake.set(edge=70.0)
-        self.assertEqual(resource_guard.read_sample(fake.settings())["package_c"], 70.0)
+        self.assertEqual(resource_guard.read_sample(fake.settings())["package_c"], 66.0)   # the iGPU edge is only logged
+        self.assertEqual(resource_guard.read_sample(fake.settings(sensors="package"))["package_c"], 70.0)
+        self.assertEqual(resource_guard.Settings.from_env({"KVPARK_GUARD_SENSORS": "package"}).sensors, "package")
+        with self.assertRaises(ValueError):
+            resource_guard.Settings(sensors="gpu")
         self.assertEqual(sample["mem_available"], 70 * GIB)
         self.assertAlmostEqual(sample["swap_fraction"], 0.25)
         record = resource_guard.sample_record(sample)
         self.assertEqual((record["mem_available_gib"], record["swap_used_gib"], record["swap_pct"]), (70.0, 8.0, 25.0))
+        self.assertEqual((sample["gtt_used"], sample["vram_used"], record["gtt_used_gib"]), (1 * GIB, 2 * GIB, 1.0))
+        self.assertEqual(resource_guard.read_gpu_memory(str(fake.root / "missing")), {"gtt_used": None, "vram_used": None})
 
     def test_without_a_cpu_sensor_there_is_no_package_temperature(self):
         fake = machine(self, tctl=None, edge=50.0)
@@ -240,7 +254,7 @@ class SensorTest(unittest.TestCase):
 class SettingsTest(unittest.TestCase):
     def test_defaults(self):
         s = resource_guard.Settings.from_env({})
-        self.assertEqual((s.start_c, s.pause_c, s.resume_c, s.abort_c), (75, 90, 80, 95))
+        self.assertEqual((s.start_c, s.pause_c, s.resume_c, s.abort_c), (88, 90, 88, 98))
         self.assertEqual((s.swap_pause, s.swap_resume, s.mem_floor_gib, s.mem_resume_gib, s.fit_margin_gib),
                          (0.85, 0.80, 8, 12, 25))
         self.assertEqual((s.poll_s, s.sensor_loss_s, s.stop_grace_s, s.threads, s.enabled, s.abort_samples),
@@ -262,7 +276,9 @@ class SettingsTest(unittest.TestCase):
         args = parser.parse_args(["--guard", "pause_c=85", "--guard", "resume_c=70", "--guard", "off"])
         s = resource_guard.Settings.from_args(args, environ={"KVPARK_GUARD_PAUSE_C": "88"})
         self.assertEqual((s.pause_c, s.resume_c, s.enabled), (85, 70, False))             # the command line wins
-        for bad in (["pause_c=79"], ["nonsense=1"], ["pause_c"], ["pause_c=hot"], ["swap_resume=0.9"]):
+        s = resource_guard.Settings.from_env({}, ["pause_c=79"])                          # start and resume follow it
+        self.assertEqual((s.start_c, s.resume_c), (77, 77))
+        for bad in (["pause_c=79", "resume_c=80"], ["nonsense=1"], ["pause_c"], ["pause_c=hot"], ["swap_resume=0.9"]):
             with self.assertRaises(ValueError, msg=bad):
                 resource_guard.Settings.from_env({}, bad)
         with self.assertRaises(ValueError):
@@ -290,7 +306,7 @@ class ThreadTest(unittest.TestCase):
 
     def test_gpu_evaluation_defaults_yield_to_the_environment_and_overrides(self):
         settings = resource_guard.Settings.from_env({}, defaults=resource_guard.GPU_EVALUATION)
-        self.assertEqual((settings.pause_c, settings.resume_c, settings.threads, settings.abort_c), (85.0, 65.0, 4, 95.0))
+        self.assertEqual((settings.pause_c, settings.resume_c, settings.threads, settings.abort_c), (90.0, 88.0, 4, 98.0))
         settings = resource_guard.Settings.from_env({"KVPARK_GUARD_PAUSE_C": "88", "KVPARK_GUARD_THREADS": "6"},
                                                     ["resume_c=70"], defaults=resource_guard.GPU_EVALUATION)
         self.assertEqual((settings.pause_c, settings.resume_c, settings.threads), (88.0, 70.0, 6))
@@ -338,12 +354,13 @@ class ThreadTest(unittest.TestCase):
 
 class AssessTest(unittest.TestCase):
     def test_decisions(self):
-        s = resource_guard.Settings(swap_pause=0.85, swap_resume=0.8)
+        s = resource_guard.Settings(swap_pause=0.85, swap_resume=0.8, resume_c=80.0)
 
         def sample(c, available=100, swap=0.1):
             return {"package_c": c, "mem_available": available * GIB, "swap_total": 32 * GIB, "swap_fraction": swap}
         cases = [(sample(70), False, "run"), (sample(89.9), False, "run"), (sample(90), False, "pause"),
-                 (sample(95), False, "abort"), (sample(96), True, "abort"), (sample(85), True, "hold"),
+                 (sample(95), False, "pause"), (sample(97.9), True, "hold"), (sample(98), False, "abort"),
+                 (sample(98), True, "abort"), (sample(85), True, "hold"),
                  (sample(80), True, "resume"), (sample(None), False, "lost"), (sample(70, available=7), False, "pause"),
                  (sample(70, available=10), True, "hold"), (sample(70, available=12), True, "resume"),
                  (sample(70, available=20, swap=0.86), False, "pause"), (sample(70, available=20, swap=0.82), True, "hold"),
@@ -401,6 +418,50 @@ class WatchTest(unittest.TestCase):
         self.assertIn("91.0 C >= pause 90 C", events[3]["reason"])
         self.assertIn("child_rss_gib", events[1])
         self.assertEqual(events[4]["state"], "paused")
+
+    def test_the_groups_gpu_memory_is_the_rise_of_gtt_since_it_started(self):
+        """On this APU a GPU job's memory is GTT, which no RssAnon shows: the Watch logs the rise of the
+        system's GTT use over its value when the group started, and the largest anonymous + GPU sum."""
+        fake = machine(self, gtt_gib=6.0)
+        log = fake.root / "gpu.jsonl"
+        child = self.start(sleeper())
+        clock = FakeClock()
+        watch = resource_guard.Watch(fake.settings(), log_path=log, clock=clock).attach(child.pid)
+        for gtt in (10.0, 8.0):
+            fake.set(gtt_gib=gtt)
+            clock.sleep(1)
+            watch.step()
+        summary = watch.close()
+        self.assertEqual(summary["max_gpu_gib"], 4.0)
+        self.assertGreaterEqual(summary["max_total_gib"], 4.0)
+        samples = [e for e in read_log(log) if e["event"] == "sample"]
+        self.assertEqual([e["child_gpu_gib"] for e in samples], [0.0, 4.0, 2.0])
+        self.assertEqual(samples[1]["gtt_used_gib"], 10.0)
+        blind = resource_guard.Watch(fake.settings(drm_root=str(fake.root / "none")), clock=clock).attach(child.pid)
+        self.assertIsNone(blind.close()["max_gpu_gib"])                   # no amdgpu counters: not known
+
+    def test_the_production_defaults(self):
+        """The thresholds every job runs with since 2026-10-08 (the fake machine's other tests pin 75/80/95 C): stop at
+        90 C, continue at 88 C, a sample at 98 C stops and a second in a row ends the job."""
+        fake = machine(self)
+        child = self.start(sleeper())
+        clock = FakeClock()
+        settings = fake.settings(start_c=None, resume_c=None, abort_c=98.0)
+        self.assertEqual((settings.start_c, settings.pause_c, settings.resume_c, settings.abort_c), (88, 90, 88, 98))
+        self.assertEqual(settings, resource_guard.Settings.from_env({}, {key: getattr(settings, key) for key in (
+            "hwmon_root", "meminfo", "drm_root", "cpu_lock", "gpu_lock", "poll_s", "sensor_loss_s", "stop_grace_s",
+            "max_pause_s", "gpu_watch")}))
+        watch = resource_guard.Watch(settings, clock=clock).attach(child.pid)
+        for tctl, expected in ((89.9, "running"), (90.0, "stopped"), (88.5, "stopped"), (88.0, "running"),
+                               (97.9, "stopped"), (62.0, "running"), (98.0, "stopped")):
+            fake.set(tctl=tctl)
+            clock.sleep(2)
+            watch.step()
+            self.assertTrue(stopped(child.pid) if expected == "stopped" else running(child.pid), (tctl, expected))
+        clock.sleep(2)
+        with self.assertRaisesRegex(resource_guard.GuardAbort, "98.0 C >= abort 98 C"):
+            watch.step()                                                  # the second sample at 98 C in a row
+        self.assertEqual(watch.pauses, 3)
 
     def test_memory_floor_and_swap_pause_the_group(self):
         fake = machine(self)
@@ -1064,7 +1125,7 @@ class CampaignGuardTest(unittest.TestCase):
         self.assertIn("abort", entry["guard_abort"])
 
     def test_a_hot_machine_delays_the_start(self):
-        self.fake.set(tctl=80.0)
+        self.fake.set(tctl=89.0)                                          # above start_c (88 C by default)
         threading.Thread(target=lambda: (time.sleep(0.4), self.fake.set(tctl=70.0)), daemon=True).start()
         self.camp.run([sys.executable, "-c", "pass"], stage="render", label="cooled", cwd=self.fake.root)
         entry = self.camp.state["stages"]["render"]["commands"][0]
@@ -1105,23 +1166,45 @@ class CampaignGuardTest(unittest.TestCase):
 
 class FitMemoryTest(unittest.TestCase):
     def test_onboarding_estimate_is_the_campaigns_and_covers_the_recorded_peaks(self):
+        """The estimate counts what a fit takes off MemAvailable: anonymous memory and, on the GPU, the device's
+        (GTT on this APU, which RssAnon does not show). Calibrated on the twelve onboardings' recorded peaks: the
+        anonymous peak, plus torch's reserved peak for the GPU fits (until 2026-10-09 the estimate covered the
+        anonymous peak only, and 7 of the 9 GPU fits' real peaks exceeded it by 1.0-3.9 GiB)."""
         import campaign
         import fit_hub
-        self.assertEqual((fit_hub.ONBOARD_BASE, fit_hub.ONBOARD_COVARIANCE_BYTES, fit_hub.ONBOARD_DECODER_BYTES,
-                          fit_hub.ONBOARD_DEV_LATENT_BYTES, fit_hub.ONBOARD_DEV_COLUMN_BYTES),
-                         (campaign.FIT_HUB_BASE, campaign.FIT_HUB_COVARIANCE_BYTES, campaign.FIT_HUB_DECODER_BYTES,
-                          campaign.FIT_HUB_DEV_LATENT_BYTES, campaign.FIT_HUB_DEV_COLUMN_BYTES))
+        self.assertEqual((fit_hub.ONBOARD_BASE, fit_hub.ONBOARD_GPU_BYTES, fit_hub.ONBOARD_COVARIANCE_BYTES,
+                          fit_hub.ONBOARD_DECODER_BYTES, fit_hub.ONBOARD_CHUNK_BYTES, fit_hub.ONBOARD_DEV_LATENT_BYTES),
+                         (campaign.FIT_HUB_BASE, campaign.FIT_HUB_GPU, campaign.FIT_HUB_COVARIANCE_BYTES,
+                          campaign.FIT_HUB_DECODER_BYTES, campaign.FIT_HUB_CHUNK_BYTES, campaign.FIT_HUB_DEV_LATENT_BYTES))
         base = int(4.58 * GIB)
         pivot = fit_hub.view_shape([1024] * 16, 512, 4096)
-        # (per-layer widths of K, dev spans of the onboarding, the recorded peak in GiB)
-        for widths, dev, measured in (([512] * 8, 9945, 11.0),                # LFM2-2.6B: 8 layers of 8 x 64
-                                      ([576] * 27, 8010, 16.7),               # DeepSeek-V2-Lite: MLA K rows
-                                      ([512] * 10, 17355, 12.96)):            # Qwen3.6-35B-A3B: 10 of 2 x 256
+        # (per-layer widths of the widest kind, dev spans of the onboarding, on the GPU, the recorded peak in GiB:
+        # anonymous, plus torch's reserved peak on the GPU)
+        for name, widths, dev, gpu, measured in (
+                ("LFM2-2.6B: 8 layers of 8 x 64", [512] * 8, 9945, False, 11.0),
+                ("DeepSeek-V2-Lite: MLA K rows", [576] * 27, 8010, False, 16.72),
+                ("Qwen3.6-35B-A3B: 10 of 2 x 256", [512] * 10, 17355, False, 12.96),
+                ("Jamba: 2 layers of one KV head", [128] * 2, 17213, True, 9.68 + 3.93),
+                ("Nemotron-3.5: 6 of 2 x 128", [256] * 6, 17204, True, 9.63 + 3.85),
+                ("Granite-4.0-H-Tiny: 4 of 4 x 128", [512] * 4, 10082, True, 10.37 + 4.05),
+                ("Ling-3.0-tiny: 6 MLA layers", [576] * 6, 17207, True, 11.32 + 4.11),
+                ("Kimi-Linear: 7 MLA layers", [576] * 7, 9993, True, 11.26 + 4.37),
+                ("Falcon-H1-3B: 32 of 2 x 128", [256] * 32, 9918, True, 11.52 + 4.95),
+                ("GLM-4.7-Flash: 47 MLA layers", [576] * 47, 17353, True, 19.2 + 12.05),
+                ("Gemma-4-26B-A4B: 25 sliding of 8 x 256, 5 full of 2 x 512", [2048] * 25 + [1024] * 5, 16930, True,
+                 15.74 + 8.43),
+                ("Gemma-4-31B: 50 sliding of 16 x 256, 10 full of 4 x 512", [4096] * 50 + [2048] * 10, 16930, True,
+                 32.7 + 23.67)):
             shapes = {"k": [fit_hub.view_shape(widths, 512, 4096)] + [pivot] * 4}
-            estimate = fit_hub.memory_estimate(shapes, hub_dim=4096, dev_spans=dev, base_bytes=base)
-            self.assertEqual(estimate["mode"], "onboard")
-            self.assertGreater(estimate["bytes"], measured * GIB)
-            self.assertLess(estimate["bytes"], (measured + 1.5) * GIB)
+            estimate = fit_hub.memory_estimate(shapes, hub_dim=4096, dev_spans=dev, base_bytes=base, gpu=gpu)
+            self.assertEqual((estimate["mode"], estimate["gpu"]), ("onboard", gpu))
+            self.assertGreater(estimate["bytes"], measured * GIB, name)
+            self.assertLess(estimate["bytes"], (measured + 4.5) * GIB, name)
+        # the chunk rows have their own term: 12 bytes per chunk row and column, whatever the hub dimension
+        shapes = {"k": [fit_hub.view_shape([512] * 8, 512, 4096)] + [pivot] * 4}
+        small = fit_hub.memory_estimate(shapes, hub_dim=4096, dev_spans=0, base_bytes=0, chunk=1024)
+        large = fit_hub.memory_estimate(shapes, hub_dim=4096, dev_spans=0, base_bytes=0, chunk=4096)
+        self.assertEqual(large["bytes"] - small["bytes"], fit_hub.ONBOARD_CHUNK_BYTES * 3072 * 4096)
 
     def test_a_joint_refit_estimate_follows_top_eigs_path(self):
         """Seven views of 4,096 (P = 28,672). The GCCA holds C and W C W (EIGH_HELD P x P float64) plus what
@@ -1141,6 +1224,11 @@ class FitMemoryTest(unittest.TestCase):
         self.assertEqual(with_scipy["phase"], "v decoder")
         self.assertGreater(with_scipy["kinds"]["k"]["decoder"], with_scipy["kinds"]["k"]["gcca"])
         self.assertLess(with_scipy["bytes"], 40 * GIB)
+        # on the GPU the device's memory comes on top: the one joint GPU fit (2026-10-08/09) peaked at 28.3 GiB
+        # anonymous and 16.6 GiB reserved on the device
+        on_gpu = fit_hub.memory_estimate(shapes, hub_dim=D, dev_spans=7965, scipy=True, gpu=True)
+        self.assertGreater(on_gpu["bytes"], (28.3 + 16.6) * GIB)
+        self.assertLess(on_gpu["bytes"], 60 * GIB)
         without = fit_hub.memory_estimate(shapes, hub_dim=D, dev_spans=7965, scipy=False)
         self.assertAlmostEqual(without["kinds"]["k"]["gcca"],
                                ((fit_hub.EIGH_HELD + fit_hub.EIGH_FULL32_COPIES) * 8 * P * P + 12 * P * D) / GIB, places=1)

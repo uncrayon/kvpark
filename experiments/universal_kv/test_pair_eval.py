@@ -67,6 +67,37 @@ class RenderTest(unittest.TestCase):
                              pair_eval.render(CONVERSATION, gguf, server=True)["text"])
 
 
+class EngineSpecialTest(unittest.TestCase):
+    def test_only_control_tokens_stay_special_as_in_the_engine(self):
+        # kv_probe flags control, user-defined and unknown tokens; the engine (and so a live switch) only
+        # control tokens: a user-defined token in a chat's text (Falcon-H1's \frac) must not reject it
+        import numpy as np
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "m.gguf"
+            gguf = tiny_fixture._gguf_module()
+            writer = gguf.GGUFWriter(str(path), "llama")
+            writer.add_tokenizer_model("gpt2")
+            writer.add_token_list(["a", "b", "<|endoftext|>", "\\frac", "<unk>"])
+            writer.add_token_types([1, 1, 3, 4, 2])
+            writer.add_token_merges(["a b"])
+            writer.add_chat_template(TEMPLATE)
+            writer.write_header_to_file()
+            writer.write_kv_data_to_file()
+            writer.write_tensors_to_file()
+            writer.close()
+            probe = {"d": {"token_id": np.array([2, 0, 3, 1, 4], dtype=np.int32),
+                           "byte_end": np.array([13, 14, 19, 20, 25]),
+                           "special": np.array([1, 0, 1, 0, 1], dtype=np.uint8)}}
+            out = pair_eval.engine_special(probe, path)
+            expected = pair_eval.engine.token_arrays(path, [2, 0, 3, 1, 4],
+                                                     [b"<|endoftext|>", b"a", b"\\frac", b"b", b"<unk>"])
+        np.testing.assert_array_equal(out["d"]["special"], [1, 0, 0, 0, 0])
+        np.testing.assert_array_equal(out["d"]["special"], expected["special"])
+        np.testing.assert_array_equal(out["d"]["token_id"], probe["d"]["token_id"])
+        np.testing.assert_array_equal(out["d"]["byte_end"], probe["d"]["byte_end"])
+        np.testing.assert_array_equal(probe["d"]["special"], [1, 0, 1, 0, 1])     # the input is left as it was
+
+
 def side(sha):
     return {"files": {"f32": {"file": f"{sha}.npy", "sha256": sha}, "f16": {"file": f"{sha}.f16.npy", "sha256": sha + "h"}}}
 
@@ -187,7 +218,9 @@ class ResumeMainTest(unittest.TestCase):
                     "segment_keys": ["0:system", "1:user"]}
 
         def tokenize(probe, gguf, records, ctx, workdir):
-            return {r["document_id"]: {"token_id": list(range(40)), "byte_end": list(range(1, 41))} for r in records}
+            # kv_probe's flags: control (5) and user-defined (7) tokens
+            return {r["document_id"]: {"token_id": list(range(40)), "byte_end": list(range(1, 41)),
+                                       "special": [int(t in (5, 7)) for t in range(40)]} for r in records}
 
         def probe(probe_path, artifacts, mode, model, records, output, *, ctx, extra=(), guard=None):
             output.mkdir(parents=True, exist_ok=True)
@@ -212,11 +245,20 @@ class ResumeMainTest(unittest.TestCase):
             return types.SimpleNamespace(to_bytes=lambda: b"t"), {"mapped_cells": 7, "fill_cells": 3, "seconds": 0.1}
 
         def side(name, spec, record, tokens, gguf=None):
+            ran.setdefault("side_special", set()).add((name, tuple(np.asarray(tokens.get("special", ())).tolist())))
             return types.SimpleNamespace(document_id=record["document_id"])
+
+        def engine_special(tokens, gguf):
+            # as pair_eval.engine_special does with the GGUF's token types: here token 5 is a control token, the rest
+            # (a user-defined token at 7, which kv_probe flags too) not
+            ran.setdefault("engine_special", []).append(str(gguf))
+            return {document: {**item, "special": (np.asarray(item["token_id"]) == 5).astype(np.uint8)}
+                    for document, item in tokens.items()}
         manifest = {"format_version": 2, "models": {"a": {}, "b": {}}, "sides": {}}
         spec = types.SimpleNamespace(n_swa=None)
         patches = [mock.patch.object(pair_eval, "render", render),
                    mock.patch.object(pair_eval.collect_v2, "tokenize", tokenize),
+                   mock.patch.object(pair_eval, "engine_special", engine_special),
                    mock.patch.object(pair_eval, "probe", probe),
                    mock.patch.object(pair_eval, "verify_runtime", lambda path: ("rev", None, [])),
                    mock.patch.object(pair_eval.kvstate.ModelSpec, "from_gguf", lambda gguf, llama_revision=None: spec),
@@ -270,6 +312,18 @@ class ResumeMainTest(unittest.TestCase):
                 self.assertEqual(len(single["scored"]), 3)
                 once = pair_eval.json.loads((Path(other) / "run" / "report.json").read_text())
             self.assertEqual(once["summary"], report["summary"])
+
+    def test_main_gives_the_translator_the_engines_special_flags(self):
+        """pair_eval.main replaces kv_probe's special flags (control, user-defined and unknown tokens) with the
+        engine's (control tokens only, engine_special) on both models' tokens before the translator aligns them: a
+        user-defined token inside a segment no longer rejects a chat a live switch translates."""
+        with tempfile.TemporaryDirectory() as directory:
+            ran = self.run_main(Path(directory), resume=False)
+        self.assertEqual(sorted(ran["engine_special"]), ["/a.gguf", "/b.gguf"])
+        flags = {flags for _, flags in ran["side_special"]}
+        self.assertEqual(len(flags), 1)
+        (only,) = flags
+        self.assertEqual([index for index, flag in enumerate(only) if flag], [5])     # 7 is not special any more
 
 
 if __name__ == "__main__":
