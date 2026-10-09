@@ -254,6 +254,9 @@ class Adapter:
             source_name = matches[0]
         if source_name == target_name:
             raise ValueError("that is the current model")
+        if config["models"][source_name].get("source") is False:
+            raise ValueError(f"{source_name} is registered as a target only (kvpark bridge add --no-source): its cache "
+                             f"is not translated, so {target_name} reads the conversation itself; switch with /model alone")
         session = session_value("HERMES_SESSION_ID")
         if not session:
             raise ValueError("run /kvpark switch inside the conversation you want to move")

@@ -363,6 +363,25 @@ class BridgeTest(unittest.TestCase):
         for path in self.slots.values():
             self.assertEqual([p.name for p in path.iterdir()], [])
 
+    def test_a_target_only_model_is_never_translated_out_of(self):
+        """kvpark bridge add --no-source: a model the hub translates out of worse than no translation
+        (Nemotron-3.5 as the servers render, experiments/universal_kv/RESULTS.md section 10) is a target only.
+        A switch out of it is skipped before either server is touched; switches into it go on."""
+        registry.add_model(self.config, "a", url=self.servers["a"].url, gguf=self.gguf, slot_dir=self.slots["a"],
+                           source=False)
+        self.assertIs(self.config["models"]["a"]["source"], False)
+        report = self.switch()
+        self.assertEqual(report["skipped"], "source-refused")
+        self.assertIn("target only", report["note"])
+        self.assertIn("prefills the conversation natively", report["note"])
+        self.assertEqual(self.servers["a"].calls, [])
+        self.assertEqual(self.servers["b"].calls, [])
+        registry.add_model(self.config, "a", url=self.servers["a"].url, gguf=self.gguf, slot_dir=self.slots["a"])
+        self.assertNotIn("source", self.config["models"]["a"])                 # the default: a source too
+        with self.assertRaisesRegex(ValueError, "source must be true or false"):
+            registry.add_model(registry.empty(), "x", url=self.servers["a"].url, gguf=self.gguf,
+                               slot_dir=self.slots["a"], source="no")
+
     def test_per_target_minimum_handover(self):
         self.config["models"]["b"]["min_handover"] = 10_000
         self.assertEqual(self.switch()["skipped"], "short")

@@ -22,8 +22,10 @@ MTP) keep drafting after a switch, an image in the conversation is read natively
 target, and Hermes' reasoning settings are rendered as the server renders them. A hybrid
 target such as Qwen3.8 can start its recurrent state from a per-model mean, which removes most
 of the reset's cost on chats. Quality is close to native for chat and noticeably lower for long
-documents and tool-heavy agent work. More cache families (DeepSeek-style MLA and DSA, Kimi's
-KDA hybrids, Mamba-style hybrids, DeepSeek V4 as a target) are supported but verified on small
+documents and tool-heavy agent work. More cache families are supported: twelve more local models
+(DeepSeek-style MLA, Kimi's and Ling's linear-attention hybrids, Mamba-style hybrids, Gemma 4) have been
+onboarded into the shared latent and measured against Qwen3.8, with quality that varies by model and
+direction (a few models are targets only); DSA models and DeepSeek V4 as a target are verified on small
 test models only. See [docs/bridge.md](docs/bridge.md).
 
 ## Server support

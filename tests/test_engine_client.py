@@ -333,7 +333,12 @@ class EngineClientTest(unittest.TestCase):
         (self.root / "engine_daemon.py").write_text(DAEMON)
         self.config["engine"]["device"] = "cpu"
         events = []
-        report = engine_client.run_job(self.config, self.job, bridge_dir=self.bridge, log=events.append)
+        # without thread variables in the environment (a caller that caps its BLAS threads, a resource guard for
+        # one, would set them: the daemon then takes those)
+        with mock.patch.dict(os.environ):
+            for name in engine_client.THREAD_VARIABLES:
+                os.environ.pop(name, None)
+            report = engine_client.run_job(self.config, self.job, bridge_dir=self.bridge, log=events.append)
         self.assertEqual((report["t0"], report["engine_mode"]), (9, "daemon"))
         steps = [e["step"] for e in events]
         self.assertEqual(steps[:2], ["engine-daemon-start", "engine-daemon-ready"])

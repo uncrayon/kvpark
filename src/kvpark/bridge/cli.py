@@ -48,6 +48,10 @@ def add_parser(sub):
     add.add_argument("--recurrent-tools", action="store_true",
                      help="with --recurrent-mean: its tools group was calibrated on this deployment's own agent "
                      "prompts and tools; use it for conversations that declare tools")
+    add.add_argument("--no-source", dest="source", action="store_false",
+                     help="a target only: never translate this model's cache; switches out of it are skipped "
+                     "(source-refused) and the next model prefills natively. For a model the hub translates out of "
+                     "worse than no translation (docs/bridge.md, Models)")
     rope = add.add_argument_group("RoPE settings of the model's server, when it runs with any of these "
                                   "llama-server flags (the same values)")
     rope.add_argument("--rope-scaling", choices=registry.ROPE_SCALING_TYPES)
@@ -252,7 +256,7 @@ def run(args):
                                          native_prefix=args.native_prefix, min_handover=args.min_handover,
                                          draft_window=args.draft_window, runtime=runtime,
                                          template_kwargs=template_kwargs, recurrent_mean=args.recurrent_mean,
-                                         recurrent_tools=args.recurrent_tools), path)
+                                         recurrent_tools=args.recurrent_tools, source=args.source), path)
         print(f"registered {args.name} ({config['models'][args.name]['arch']})")
     elif command == "remove":
         if config["models"].pop(args.name, None) is None:

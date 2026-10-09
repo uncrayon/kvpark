@@ -3,7 +3,8 @@
     report = switch(config, conversation, "qwen38", "muse")
 
 0. The switch is skipped (``report["skipped"]`` = a reason code, ``report["note"]``) when the
-   translator cannot handle it: an architecture the engine cannot translate, an embedding model
+   source is registered as a target only ("source-refused": kvpark bridge add --no-source, for a model
+   the hub translates out of worse than no translation), or when the translator cannot handle it: an architecture the engine cannot translate, an embedding model
    or a LongRoPE model, a vocabulary the engine cannot read (with an engine older than the
    "vocabularies" feature: any but GPT-2 byte-level BPE; see capabilities.py), media the target
    cannot take that get no text surrogate (the media policy says skip, or nothing could make
@@ -303,7 +304,11 @@ def switch(config, conversation, source, target, *, tail=None, fill=None, warm=T
         log({"step": "skipped", "reason": code})
         return report
 
-    # 0. what the translator can handle (first: a model it cannot handle has no hub adapter either)
+    # 0. a model registered as a target only (kvpark bridge add --no-source): its cache is never translated
+    if src_cfg.get("source") is False:
+        return skip("source-refused", f"{source} is registered as a target only (kvpark bridge add --no-source): "
+                                      "its cache is not translated")
+    # what the translator can handle (first: a model it cannot handle has no hub adapter either)
     source_arch = registry.model_arch(config, source, path=config_path)
     target_arch = registry.model_arch(config, target, path=config_path)
     # embedding models and LongRoPE first: their GGUF, not their architecture, rules them out

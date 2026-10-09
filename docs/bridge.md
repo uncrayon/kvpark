@@ -29,8 +29,13 @@ Design and evidence: [experiments/universal_kv/ARCHITECTURE.md](../experiments/u
   under load; a translation into the dense Qwen3-4B now takes 0.8-1.1 s) and 2-14 s on the CPU. Muse → the
   production Qwen3.8 build, the latest run: 0.9-3.2 s for the switch plus an 8 s tail, against
   41-59 s of native prefill. Staging the switch in Hermes loads the engine ahead (20 s the very
-  first time, while the bridge caches the models' metadata). Measurements:
-  [RESULTS.md](../experiments/universal_kv/RESULTS.md), sections 6 and 8.
+  first time, while the bridge caches the models' metadata). With the fifteen-model hub6 bundle
+  and the Vulkan engine (October 9, under a thermal guard that paused the jobs): Kimi-Linear-48B and
+  Gemma-4-26B → Qwen3.8 took 10-12.5 s against 48-52 s of native prefill (12-15K tokens), 3.3-6.8
+  times faster where the native prefill was paused least, and switches into Gemma-4-26B 2.7-3.5 s
+  against 6.6-6.8 s (8-10K tokens, no pause); a small, fast target such as Granite-4.0-H-Tiny prefills
+  8-11K tokens in 4-5 s, so a switch into it (about 2 s) saves little. Measurements:
+  [RESULTS.md](../experiments/universal_kv/RESULTS.md), sections 6, 8 and 10.
 - **Models.** A model can take part only if the hub bundle has an adapter for it. The engine
   translates these llama.cpp architectures (`TRANSLATABLE` in `src/kvpark/bridge/capabilities.py`):
   - dense GQA `qwen3` and sliding-window + global `muse-glimmer` (measured live);
@@ -51,11 +56,30 @@ Design and evidence: [experiments/universal_kv/ARCHITECTURE.md](../experiments/u
   - `deepseek4` (DeepSeek V4) as a target only: see [DeepSeek V4 targets](#deepseek-v4-targets).
 
   Real models have been measured for `qwen3`, `muse-glimmer` and `qwen35` (Qwen3-4B,
-  Muse-Glimmer-30B, Qwen3.8-27B and Ornith-1.5-9B). Real Gemma 4 26B-A4B and 31B slot saves are
-  read and written back byte for byte. Every other architecture is verified on tiny random-weight
-  models only: its cache layout, the restore and decoding are checked, the translation quality
-  is not (local DeepSeek-V2-Lite, GLM-4.7-Flash, Kimi-Linear, LFM2, granite, Falcon-H1 and Jamba
-  models load and round-trip their slots, but have not been onboarded into a hub). Pure
+  Muse-Glimmer-30B, Qwen3.8-27B and Ornith-1.5-9B, fitted jointly), and onboarded into the hub and
+  measured against Qwen3.8 in both directions for `qwen35moe` (Qwen3.6-35B-A3B), `lfm2` (LFM2-2.6B),
+  `deepseek2` (DeepSeek-V2-Lite, GLM-4.7-Flash), `kimi-linear` (Kimi-Linear-48B-A3B), `bailingmoe3`
+  (Ling-3.0-tiny), `falcon-h1` (Falcon-H1-3B), `granitehybrid` (Granite-4.0-H-Tiny), `nemotron_h_moe`
+  (Nemotron-3.5-Lightning-30B-A3B), `jamba` (Jamba-Reasoning-3B) and `gemma4` (Gemma 4 26B-A4B and
+  31B); the hub bundle with all of them but Jamba is `hub6-20261009-v2`
+  ([RESULTS.md section 10](../experiments/universal_kv/RESULTS.md#10-hub6-eight-more-models-onboarded-october-8-9-2026);
+  use it rather than `hub6-20261008-v2`, which carries the `reverse` encoders of Granite-4.0-H-Tiny and
+  Nemotron-3.5 measured to do no good or harm). How much of the conversation a switch keeps varies by model: on the ordinary chats
+  every measurement shares, a switch from Qwen3.8 removed 71-83% of what an information-free cache
+  loses into GLM-4.7-Flash and Ling-3.0-tiny, 31-51% into LFM2, Qwen3.6, DeepSeek-V2-Lite and Gemma 4,
+  16-21% into Nemotron-3.5 and Kimi-Linear, and nothing measurable into Granite-4.0-H-Tiny, Falcon-H1
+  and Jamba. Out of a model, into Qwen3.8, it removed 25-42% (like the jointly fitted Qwen3-4B's 30%)
+  wherever the model's cache predicted every hub dimension at least a little. Where the onboarding's
+  encoder warnings fired (a hub dimension the model's cache predicts with R² below 0.05, and the
+  variance cap binding on half of the dimensions or more: Granite-4.0-H-Tiny, Nemotron-3.5, Jamba),
+  the bundle carries a plain `ridge` encoder for Granite and Nemotron. Out of Granite it is harmless and keeps about as little as an
+  information-free cache (1%): the target gets little beyond its native tail, so when the earlier
+  conversation matters a native prefill is the better choice. Out of Nemotron, as the servers render
+  (what a live switch holds), even that encoder does worse than no translation, so register
+  Nemotron-3.5 with `--no-source`: switches out of it are then skipped (`source-refused`) and the
+  next model prefills natively, while switches into it still translate. Jamba is not in the bundle.
+  Every other architecture is verified on tiny random-weight models only: its cache layout, the
+  restore and decoding are checked, the translation quality is not. Pure
   recurrent models (Mamba, Mamba2, RWKV6/7, ARWKV7) keep no per-token cache and are always
   prefilled natively. MiniMax-M3 is not supported yet, nor are LongRoPE models (the
   long-context Phi-3/4 models, and Llama or Mistral 3 GGUFs converted with LongRoPE) and
@@ -113,6 +137,7 @@ Design and evidence: [experiments/universal_kv/ARCHITECTURE.md](../experiments/u
    | `--min-handover N` | small models (e.g. 4B) | their native prefill is already fast; translate only very long prompts |
    | `--tail N` | targets that need more native context | a longer native tail is slower but closer to native quality |
    | `--draft-window N` | targets whose server runs a DFlash draft with a sliding window other than 2048 | the native tail is kept at least `N - 1` tokens long, so the draft sees only native context |
+   | `--no-source` | a model the hub translates out of worse than no translation (Nemotron-3.5 with the hub6 bundle) | switches out of it are skipped (`source-refused`) and the next model prefills natively; switches into it still translate |
 
    `kvpark bridge add` records the model's GGUF architecture (`arch` in `kvpark bridge status`);
    entries registered before that get it on their next switch.
@@ -254,6 +279,13 @@ measured before this change). A DeepSeek V4 target always runs on the CPU.
 - **Devices.** `--device` (or the environment variable `KVPARK_ENGINE_DEVICE`) picks
   `gpu`, `vulkan`, `cpu` or `auto`. A GPU error that looks like a broken device moves the daemon to the
   CPU until it exits (`gpu_fault` in its status); the job itself is redone on the CPU.
+- **The torch daemon keeps a core busy.** On ROCm (measured on the Radeon 8060S with torch 2.12),
+  every torch process keeps one runtime thread at 100% of a core from its first GPU kernel on, also
+  while it waits: a resident torch daemon does so until it exits (`--idle-exit`, 600 s after the
+  last switch by default), including after its idle unload. On October 9 that thread alone held
+  this machine's CPU at 93 °C at 48 W with the llama-servers idle. `--device auto` prefers torch;
+  on an AMD APU whose cooling is tight, choose `--device vulkan` (the ggml engine has no such
+  thread; a warm switch takes 0.6-0.8 s instead of 0.4-0.6 s) or a shorter `--idle-exit`.
 - **Threads.** The CPU path uses one BLAS thread per physical core, at most 16
   (`--threads N`, or `OPENBLAS_NUM_THREADS`, `OMP_NUM_THREADS` or `MKL_NUM_THREADS` in the
   environment, overrides it; one set there is copied to the unset ones). The servers
@@ -351,6 +383,7 @@ run one-shot. An engine from before a feature keeps the skip.
 
 | `skipped` | When |
 | --- | --- |
+| `source-refused` | the source is registered as a target only (`kvpark bridge add --no-source`): its cache is never translated. Decided before any server is touched. For a model the hub translates out of worse than no translation: a campaign report's "Bridge settings" add the flag when a switch out of the model did worse than the floor |
 | `short` | the target would translate fewer than `min_handover` tokens (default 1024) after its native tail, or before the first message with media; a native prefill is about as fast |
 | `no-per-token-cache` | source or target is a pure recurrent model (Mamba, Mamba2, RWKV6/7, ARWKV7): its whole history is one fixed-size state, with no per-token cache to translate |
 | `dsv4-source` | the source is DeepSeek-V4: it keeps per-token latents only for the last 128 tokens and pools the rest |
@@ -891,9 +924,12 @@ for what each architecture has been validated on.
 - **Sources.** A small model's cache helps a larger model little: of the gap between an
   information-free cache and a native prefill, Qwen3-4B → Qwen3.8 closed 15% and Qwen3-4B → Muse
   nothing (Qwen3.8 → Muse: 56%). Prefer the larger model as the source.
-- **Validated models.** Four real models have been measured (Qwen3.8-27B, Ornith-1.5-9B,
-  Qwen3-4B, Muse-Glimmer-30B); Gemma 4 26B/31B slots are read and written back exactly. Every
-  other architecture is verified on random-weight models only.
+- **Validated models.** Sixteen real models of thirteen llama.cpp architectures are measured end to end
+  (four fitted jointly, twelve onboarded, fifteen of them in hub6; see Models above); the onboarded ones only
+  against Qwen3.8 and themselves, apart from a few live hops, and on chats the methods were chosen on.
+  Out of Granite-4.0-H-Tiny a switch keeps little more than an information-free cache, and out of
+  Nemotron-3.5 less (register it with `--no-source`). Every other architecture is verified on random-weight
+  models only.
 - **The native tail** dominates a switch (8-16 s on the 27-30B models). A shorter tail needs
   better translation; on hybrids, the recurrent mean allows one for chats.
 - **Images.** The translated part stops before the first image the target reads itself or the

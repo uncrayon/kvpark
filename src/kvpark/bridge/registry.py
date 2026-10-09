@@ -177,7 +177,7 @@ def check_recurrent_mean(path, gguf, arch):
 
 def add_model(config, name, *, url, gguf, slot_dir, hub_name=None, tail=None, native_prefix=False,
               min_handover=None, draft_window=None, runtime=None, template_kwargs=None, recurrent_mean=None,
-              recurrent_tools=False):
+              recurrent_tools=False, source=True):
     if not name or not name.replace("-", "").replace("_", "").replace(".", "").isalnum():
         raise ValueError("model names use letters, digits, '-', '_' and '.'")
     gguf, slot_dir = Path(gguf).expanduser().resolve(), Path(slot_dir).expanduser().resolve()
@@ -212,6 +212,8 @@ def add_model(config, name, *, url, gguf, slot_dir, hub_name=None, tail=None, na
                          "without native_prefix")
     if recurrent_tools and not recurrent_mean:
         raise ValueError("recurrent_tools needs a recurrent mean")
+    if not isinstance(source, bool):
+        raise ValueError("source must be true or false")
     if recurrent_mean is not None:
         if arch not in capabilities.HYBRID:
             raise ValueError(f"only hybrid models keep a recurrent state; {arch} has none to start from a mean")
@@ -254,6 +256,11 @@ def add_model(config, name, *, url, gguf, slot_dir, hub_name=None, tail=None, na
         config["models"][name]["recurrent_mean"] = str(recurrent_mean)
         if recurrent_tools:
             config["models"][name]["recurrent_tools"] = True
+    if not source:
+        # a target only: switches out of this model are skipped ("source-refused") and the target prefills the
+        # conversation natively. For a model whose cache the hub translates worse than an information-free cache
+        # (experiments/universal_kv/RESULTS.md section 10: Nemotron-3.5 as the servers render)
+        config["models"][name]["source"] = False
     return config
 
 

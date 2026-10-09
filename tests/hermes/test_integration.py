@@ -479,6 +479,10 @@ class HermesIntegrationTests(unittest.TestCase):
         self.assertIn("No bridge switch", self.command_text("switch status"))
         self.assertIn("name the model you are leaving", self.command_text("switch muse"))
         self.assertIn("unknown bridge model", self.command_text("switch nope from qwen38"))
+        # a model registered as a target only (kvpark bridge add --no-source) cannot be switched out of
+        registry.add_model(config, "nemo", url="http://127.0.0.1:18084", gguf=gguf, slot_dir=slots, source=False)
+        registry.save(config, config_path)
+        self.assertIn("registered as a target only", self.command_text("switch muse from nemo"))
         # staging also prewarms the engine for the pair, in the background
         with patch("kvpark.bridge.stage.prewarm") as prewarm:
             self.assertIn("Ready", self.command_text("switch muse from qwen38"))
