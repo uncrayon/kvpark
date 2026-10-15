@@ -1,0 +1,337 @@
+% refs.bib -- every entry checked against arXiv abstract pages, official
+% proceedings pages (ACM/Crossref, NeurIPS, ICLR, PMLR, MLSys, CVF, USENIX),
+% OpenReview, or the publisher's DOI record (2026-10-09).
+
+% ---------------------------------------------------------------------------
+% KV-cache serving and reuse
+% ---------------------------------------------------------------------------
+
+@inproceedings{kwon2023vllm,
+  title     = {Efficient Memory Management for Large Language Model Serving with {PagedAttention}},
+  author    = {Kwon, Woosuk and Li, Zhuohan and Zhuang, Siyuan and Sheng, Ying and Zheng, Lianmin and Yu, Cody Hao and Gonzalez, Joseph E. and Zhang, Hao and Stoica, Ion},
+  booktitle = {Proceedings of the 29th Symposium on Operating Systems Principles (SOSP '23)},
+  pages     = {611--626},
+  publisher = {ACM},
+  year      = {2023},
+  doi       = {10.1145/3600006.3613165},
+  eprint    = {2309.06180},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG}
+}
+
+@inproceedings{zheng2024sglang,
+  title     = {{SGLang}: Efficient Execution of Structured Language Model Programs},
+  author    = {Zheng, Lianmin and Yin, Liangsheng and Xie, Zhiqiang and Sun, Chuyue and Huang, Jeff and Yu, Cody Hao and Cao, Shiyi and Kozyrakis, Christos and Stoica, Ion and Gonzalez, Joseph E. and Barrett, Clark and Sheng, Ying},
+  booktitle = {Advances in Neural Information Processing Systems},
+  volume    = {37},
+  pages     = {62557--62583},
+  year      = {2024},
+  doi       = {10.52202/079017-2000},
+  eprint    = {2312.07104},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.AI}
+}
+
+@inproceedings{gim2024promptcache,
+  title     = {Prompt Cache: Modular Attention Reuse for Low-Latency Inference},
+  author    = {Gim, In and Chen, Guojun and Lee, Seung-seob and Sarda, Nikhil and Khandelwal, Anurag and Zhong, Lin},
+  booktitle = {Proceedings of Machine Learning and Systems},
+  volume    = {6},
+  pages     = {325--338},
+  year      = {2024},
+  url       = {https://proceedings.mlsys.org/paper_files/paper/2024/hash/a66caa1703fe34705a4368c3014c1966-Abstract-Conference.html},
+  eprint    = {2311.04934},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CL}
+}
+
+@inproceedings{yao2025cacheblend,
+  title     = {{CacheBlend}: Fast Large Language Model Serving for {RAG} with Cached Knowledge Fusion},
+  author    = {Yao, Jiayi and Li, Hanchen and Liu, Yuhan and Ray, Siddhant and Cheng, Yihua and Zhang, Qizheng and Du, Kuntai and Lu, Shan and Jiang, Junchen},
+  booktitle = {Proceedings of the Twentieth European Conference on Computer Systems (EuroSys '25)},
+  pages     = {94--109},
+  publisher = {ACM},
+  year      = {2025},
+  doi       = {10.1145/3689031.3696098},
+  eprint    = {2405.16444},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG}
+}
+
+% Published at NSDI '26 under this title; the arXiv version (2411.02820) is
+% titled "DroidSpeak: KV Cache Sharing for Cross-LLM Communication and
+% Multi-LLM Serving".
+@inproceedings{liu2024droidspeak,
+  title     = {{DroidSpeak}: {KV} Cache Sharing Across Fine-tuned Model Variants},
+  author    = {Liu, Yuhan and Huang, Yuyang and Yao, Jiayi and Feng, Shaoting and Gu, Zhuohan and Du, Kuntai and Li, Hanchen and Cheng, Yihua and Jiang, Junchen and Lu, Shan and Musuvathi, Madan and Choukse, Esha},
+  booktitle = {23rd USENIX Symposium on Networked Systems Design and Implementation (NSDI 26)},
+  pages     = {319--338},
+  publisher = {USENIX Association},
+  year      = {2026},
+  url       = {https://www.usenix.org/conference/nsdi26/presentation/liu-yuhan},
+  eprint    = {2411.02820},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.MA}
+}
+
+% ---------------------------------------------------------------------------
+% Communication between different LLMs through KV caches / hidden states
+% ---------------------------------------------------------------------------
+
+@inproceedings{fu2025c2c,
+  title     = {Cache-to-Cache: Direct Semantic Communication Between Large Language Models},
+  author    = {Fu, Tianyu and Min, Zihan and Zhang, Hanling and Yan, Jichao and Dai, Guohao and Ouyang, Wanli and Wang, Yu},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2026},
+  url       = {https://openreview.net/forum?id=LeatkxrBCi},
+  eprint    = {2510.03215},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CL}
+}
+
+@inproceedings{shi2026kvcomm,
+  title     = {{KVComm}: Enabling Efficient {LLM} Communication through Selective {KV} Sharing},
+  author    = {Shi, Xiangyu and Chiesa, Marco and Maguire Jr., Gerald Q. and Kostic, Dejan},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2026},
+  url       = {https://openreview.net/forum?id=F7rUng23nw},
+  eprint    = {2510.03346},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG}
+}
+
+@misc{dery2026kvalign,
+  title         = {Latent Space Communication via {K-V} Cache Alignment},
+  author        = {Dery, Lucio M. and Yahav, Zohar and Prior, Henry and Feng, Qixuan and Shen, Jiajun and Szlam, Arthur},
+  year          = {2026},
+  eprint        = {2601.06123},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2601.06123}
+}
+
+@misc{qu2026cachebridge,
+  title         = {{CacheBridge}: Efficient Cross-Model {KV} Cache Transfer},
+  author        = {Qu, Xingyu and Lu, Siyuan and Chen, Zhiyu and Wang, Sheng and Lin, Tao},
+  year          = {2026},
+  eprint        = {2609.00891},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.AI},
+  url           = {https://arxiv.org/abs/2609.00891}
+}
+
+@inproceedings{ramesh2025activations,
+  title     = {Communicating Activations Between Language Model Agents},
+  author    = {Ramesh, Vignav and Li, Kenneth},
+  booktitle = {Proceedings of the 42nd International Conference on Machine Learning},
+  series    = {Proceedings of Machine Learning Research},
+  volume    = {267},
+  pages     = {51094--51116},
+  publisher = {PMLR},
+  year      = {2025},
+  url       = {https://proceedings.mlr.press/v267/ramesh25a.html},
+  eprint    = {2501.14082},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CL}
+}
+
+% ---------------------------------------------------------------------------
+% Representation similarity, stitching, shared latent spaces
+% ---------------------------------------------------------------------------
+
+@inproceedings{lenc2015equivariance,
+  title     = {Understanding Image Representations by Measuring Their Equivariance and Equivalence},
+  author    = {Lenc, Karel and Vedaldi, Andrea},
+  booktitle = {Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},
+  pages     = {991--999},
+  year      = {2015},
+  eprint    = {1411.5908},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CV}
+}
+
+@inproceedings{bansal2021stitching,
+  title     = {Revisiting Model Stitching to Compare Neural Representations},
+  author    = {Bansal, Yamini and Nakkiran, Preetum and Barak, Boaz},
+  booktitle = {Advances in Neural Information Processing Systems},
+  volume    = {34},
+  pages     = {225--236},
+  year      = {2021},
+  eprint    = {2106.07682},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG}
+}
+
+@inproceedings{kornblith2019cka,
+  title     = {Similarity of Neural Network Representations Revisited},
+  author    = {Kornblith, Simon and Norouzi, Mohammad and Lee, Honglak and Hinton, Geoffrey},
+  booktitle = {Proceedings of the 36th International Conference on Machine Learning},
+  series    = {Proceedings of Machine Learning Research},
+  volume    = {97},
+  pages     = {3519--3529},
+  publisher = {PMLR},
+  year      = {2019},
+  url       = {https://proceedings.mlr.press/v97/kornblith19a.html},
+  eprint    = {1905.00414},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG}
+}
+
+@inproceedings{raghu2017svcca,
+  title     = {{SVCCA}: Singular Vector Canonical Correlation Analysis for Deep Learning Dynamics and Interpretability},
+  author    = {Raghu, Maithra and Gilmer, Justin and Yosinski, Jason and Sohl-Dickstein, Jascha},
+  booktitle = {Advances in Neural Information Processing Systems},
+  volume    = {30},
+  year      = {2017},
+  url       = {https://proceedings.neurips.cc/paper/2017/hash/dc6a7e655d7e5840e66733e9ee67cc69-Abstract.html},
+  eprint    = {1706.05806},
+  archivePrefix = {arXiv},
+  primaryClass  = {stat.ML}
+}
+
+% PMLR title carries the "Position:" prefix; arXiv title omits it.
+@inproceedings{huh2024platonic,
+  title     = {Position: The {Platonic} Representation Hypothesis},
+  author    = {Huh, Minyoung and Cheung, Brian and Wang, Tongzhou and Isola, Phillip},
+  booktitle = {Proceedings of the 41st International Conference on Machine Learning},
+  series    = {Proceedings of Machine Learning Research},
+  volume    = {235},
+  pages     = {20617--20642},
+  publisher = {PMLR},
+  year      = {2024},
+  url       = {https://proceedings.mlr.press/v235/huh24a.html},
+  eprint    = {2405.07987},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG}
+}
+
+@inproceedings{moschella2023relative,
+  title     = {Relative Representations Enable Zero-Shot Latent Space Communication},
+  author    = {Moschella, Luca and Maiorca, Valentino and Fumero, Marco and Norelli, Antonio and Locatello, Francesco and Rodol{\`a}, Emanuele},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2023},
+  eprint    = {2209.15430},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG}
+}
+
+@article{kettenring1971gcca,
+  title     = {Canonical Analysis of Several Sets of Variables},
+  author    = {Kettenring, J. R.},
+  journal   = {Biometrika},
+  volume    = {58},
+  number    = {3},
+  pages     = {433--451},
+  year      = {1971},
+  doi       = {10.1093/biomet/58.3.433}
+}
+
+% ---------------------------------------------------------------------------
+% Coding agents and benchmarks
+% ---------------------------------------------------------------------------
+
+@inproceedings{jimenez2024swebench,
+  title     = {{SWE}-bench: Can Language Models Resolve Real-World {GitHub} Issues?},
+  author    = {Jimenez, Carlos E. and Yang, John and Wettig, Alexander and Yao, Shunyu and Pei, Kexin and Press, Ofir and Narasimhan, Karthik},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2024},
+  eprint    = {2310.06770},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CL}
+}
+
+@inproceedings{yang2024sweagent,
+  title     = {{SWE}-agent: Agent-Computer Interfaces Enable Automated Software Engineering},
+  author    = {Yang, John and Jimenez, Carlos E. and Wettig, Alexander and Lieret, Kilian and Yao, Shunyu and Narasimhan, Karthik and Press, Ofir},
+  booktitle = {Advances in Neural Information Processing Systems},
+  volume    = {37},
+  pages     = {50528--50652},
+  year      = {2024},
+  doi       = {10.52202/079017-1601},
+  eprint    = {2405.15793},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.SE}
+}
+
+@inproceedings{wang2025openhands,
+  title     = {{OpenHands}: An Open Platform for {AI} Software Developers as Generalist Agents},
+  author    = {Wang, Xingyao and Li, Boxuan and Song, Yufan and Xu, Frank F. and Tang, Xiangru and Zhuge, Mingchen and Pan, Jiayi and Song, Yueqi and Li, Bowen and Singh, Jaskirat and Tran, Hoang H. and Li, Fuqiang and Ma, Ren and Zheng, Mingzhang and Qian, Bill and Shao, Yanjun and Muennighoff, Niklas and Zhang, Yizhe and Hui, Binyuan and Lin, Junyang and Brennan, Robert and Peng, Hao and Ji, Heng and Neubig, Graham},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2025},
+  url       = {https://proceedings.iclr.cc/paper_files/paper/2025/hash/a4b6ad6b48850c0c331d1259fc66a69c-Abstract-Conference.html},
+  eprint    = {2407.16741},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.SE}
+}
+
+@inproceedings{yang2025swesmith,
+  title     = {{SWE}-smith: Scaling Data for Software Engineering Agents},
+  author    = {Yang, John and Lieret, Kilian and Jimenez, Carlos E. and Wettig, Alexander and Khandpur, Kabir and Zhang, Yanzhe and Hui, Binyuan and Press, Ofir and Schmidt, Ludwig and Yang, Diyi},
+  booktitle = {Advances in Neural Information Processing Systems (Datasets and Benchmarks Track)},
+  volume    = {38},
+  year      = {2025},
+  doi       = {10.52202/085713-3239},
+  eprint    = {2504.21798},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.SE}
+}
+
+% ---------------------------------------------------------------------------
+% Cost-aware model selection
+% ---------------------------------------------------------------------------
+
+% arXiv 2023; journal version in TMLR (2024, Featured Certification).
+@article{chen2023frugalgpt,
+  title     = {{FrugalGPT}: How to Use Large Language Models While Reducing Cost and Improving Performance},
+  author    = {Chen, Lingjiao and Zaharia, Matei and Zou, James},
+  journal   = {Transactions on Machine Learning Research},
+  issn      = {2835-8856},
+  year      = {2024},
+  url       = {https://openreview.net/forum?id=cSimKw5p6R},
+  eprint    = {2305.05176},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG}
+}
+
+% ICLR 2025 proceedings title says "from Preference Data"; arXiv says "with".
+@inproceedings{ong2024routellm,
+  title     = {{RouteLLM}: Learning to Route {LLMs} from Preference Data},
+  author    = {Ong, Isaac and Almahairi, Amjad and Wu, Vincent and Chiang, Wei-Lin and Wu, Tianhao and Gonzalez, Joseph E. and Kadous, M. Waleed and Stoica, Ion},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  pages     = {34433--34448},
+  year      = {2025},
+  url       = {https://proceedings.iclr.cc/paper_files/paper/2025/hash/5503a7c69d48a2f86fc00b3dc09de686-Abstract-Conference.html},
+  eprint    = {2406.18665},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG}
+}
+
+% ---------------------------------------------------------------------------
+% Models, software, data
+% ---------------------------------------------------------------------------
+
+@misc{gemmateam2026gemma4,
+  title         = {Gemma 4 Technical Report},
+  author        = {{Gemma Team}},
+  year          = {2026},
+  eprint        = {2607.02770},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CL},
+  url           = {https://arxiv.org/abs/2607.02770}
+}
+
+@misc{ggml2023llamacpp,
+  title        = {llama.cpp: {LLM} inference in {C/C++}},
+  author       = {{ggml-org}},
+  year         = {2023},
+  howpublished = {\url{https://github.com/ggml-org/llama.cpp}},
+  note         = {GitHub repository}
+}
+
+@misc{huggingface2025smoltalk2,
+  title        = {{SmolTalk2}},
+  author       = {{Hugging Face}},
+  year         = {2025},
+  howpublished = {\url{https://huggingface.co/datasets/HuggingFaceTB/smoltalk2}},
+  note         = {Post-training dataset for SmolLM3}
+}

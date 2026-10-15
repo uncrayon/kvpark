@@ -1,0 +1,32 @@
+% Source: evidence/universal-kv/review-20261009/tables.md (hub6-20261009; templates' own rendering).
+% "Into": Qwen3.8 -> model, the six held-out chats every run shares. "Out of": model -> Qwen3.8, eight chats.
+\begin{table}[t]
+\centering
+\small
+\caption{Long held-out chats (4.5--16K tokens): share of the information-free floor's KL removed by a
+switch, with 95\% document-bootstrap intervals and exact paired sign-flip $p$. Base models (fitted
+jointly) above the rule, onboarded models below. $^\dagger$: \texttt{ridge} encoder (the default
+\texttt{reverse} encoder did no good or harm). --: not in the hub.}
+\label{tab:chat}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{llll}
+\toprule
+Model & Cache family & Into the model (from Qwen3.8) & Out of the model (into Qwen3.8) \\
+\midrule
+Qwen3-4B & dense GQA & -- & 30\% (reference) \\
+\midrule
+GLM-4.7-Flash & MLA & 83\% [80, 84], $p$ .031 & 38\% [23, 46], $p$ .008 \\
+Ling-3.0-tiny & MLA + linear attn. & 71\% [64, 75], $p$ .031 & 42\% [29, 48], $p$ .016 \\
+LFM2-2.6B & conv. hybrid & 51\% [45, 65], $p$ .031 & 24\% [13, 32], $p$ .023 \\
+Qwen3.6-35B-A3B & DeltaNet hybrid, MoE & 50\% [37, 55], $p$ .031 & 41\% [20, 54], $p$ .016 \\
+Gemma-4-26B-A4B & sliding + global GQA & 45\% [31, 48], $p$ .031 & 37\% [17, 50], $p$ .016 \\
+Gemma-4-31B & sliding + global GQA & 35\% [27, 51], $p$ .031 & 33\% [16, 44], $p$ .008 \\
+DeepSeek-V2-Lite & MLA & 31\% [28, 34], $p$ .031 & 17\% [9, 23], $p$ .031 \\
+Kimi-Linear-48B-A3B & MLA + linear attn. & 21\% [19, 24], $p$ .031 & 32\% [15, 45], $p$ .023 \\
+Nemotron-3.5-30B-A3B & Mamba hybrid & 16\% [12, 30], $p$ .031 & 5\%$^\dagger$ [3, 8]; $-44\%$ as served \\
+Falcon-H1-3B & Mamba hybrid & 9.5\% [8, 10], $p$ .094 & 25\% [13, 33], $p$ .055 \\
+Granite-4.0-H-Tiny & Mamba hybrid & 6.3\% [$-2$, 8], $p$ .25 & 1.3\%$^\dagger$ [0.6, 2.3] \\
+Jamba-Reasoning-3B & Mamba hybrid & 6.8\% [$-1$, 18], $p$ .22 & $-1031\%$ (--) \\
+\bottomrule
+\end{tabular}}
+\end{table}

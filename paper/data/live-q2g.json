@@ -1,0 +1,70 @@
+{
+ "qwen38-to-gemma-4-31b": {
+  "sessions": 18,
+  "errors": 0,
+  "reuse_ok": 18,
+  "bridged_vs_native": {
+   "same_tool": 15,
+   "same_target": 8,
+   "identical": 5
+  },
+  "native_vs_session": {
+   "same_tool": 13,
+   "same_target": 10,
+   "identical": 10
+  },
+  "bridged_vs_session": {
+   "same_tool": 11,
+   "same_target": 8,
+   "identical": 6
+  },
+  "timing_net": {
+   "native_prefill_s": [
+    14.0,
+    20.7,
+    36.8
+   ],
+   "switch_plus_tail_s": [
+    6.4,
+    9.0,
+    18.1
+   ],
+   "speedup": [
+    1.99,
+    2.19,
+    3.02
+   ]
+  },
+  "timing": {
+   "native_prefill_s": [
+    29.3,
+    44.1,
+    57.0
+   ],
+   "switch_plus_tail_s": [
+    12.6,
+    15.5,
+    32.7
+   ],
+   "engine_s": [
+    1.11,
+    1.51,
+    1.79
+   ],
+   "speedup": [
+    1.13,
+    2.73,
+    3.62
+   ],
+   "native_prefix_prefills": 1,
+   "tokens": [
+    6306,
+    10238
+   ],
+   "t0": [
+    4258,
+    8190
+   ]
+  }
+ }
+}

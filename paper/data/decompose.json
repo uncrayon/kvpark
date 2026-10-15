@@ -1,0 +1,107 @@
+{
+ "documents": 12,
+ "scored_tokens": 1158,
+ "kl": {
+  "hub": 0.335,
+  "floor": 0.502,
+  "hub_prefix": 0.324,
+  "floor_prefix": 0.413
+ },
+ "classes": {
+  "fill": {
+   "tokens_share": 0.244,
+   "hub": {
+    "kl": 0.169,
+    "removed": 0.494,
+    "ci95": [
+     0.359,
+     0.619
+    ]
+   },
+   "floor": {
+    "kl": 0.247,
+    "removed": 0.509,
+    "ci95": [
+     0.273,
+     0.665
+    ]
+   }
+  },
+  "tool_output": {
+   "tokens_share": 0.148,
+   "hub": {
+    "kl": 0.234,
+    "removed": 0.301,
+    "ci95": [
+     0.043,
+     0.505
+    ]
+   },
+   "floor": {
+    "kl": 0.355,
+    "removed": 0.293,
+    "ci95": [
+     0.052,
+     0.404
+    ]
+   }
+  },
+  "tool_call": {
+   "tokens_share": 0.025,
+   "hub": {
+    "kl": 0.303,
+    "removed": 0.095,
+    "ci95": [
+     0.007,
+     0.166
+    ]
+   },
+   "floor": {
+    "kl": 0.478,
+    "removed": 0.047,
+    "ci95": [
+     0.008,
+     0.158
+    ]
+   }
+  },
+  "reasoning": {
+   "tokens_share": 0.058,
+   "hub": {
+    "kl": 0.217,
+    "removed": 0.352,
+    "ci95": [
+     0.084,
+     0.551
+    ]
+   },
+   "floor": {
+    "kl": 0.237,
+    "removed": 0.527,
+    "ci95": [
+     0.128,
+     0.717
+    ]
+   }
+  },
+  "recent": {
+   "tokens_share": 0.491,
+   "hub": {
+    "kl": 0.168,
+    "removed": 0.497,
+    "ci95": [
+     0.325,
+     0.676
+    ]
+   },
+   "floor": {
+    "kl": 0.253,
+    "removed": 0.497,
+    "ci95": [
+     0.29,
+     0.724
+    ]
+   }
+  }
+ }
+}

@@ -1,0 +1,22 @@
+% Source: paper/data/decompose.json (paper/scripts/decompose_stats.py over
+% evidence/universal-kv/swe-agent-decompose/qwen38-to-gemma-4-31b).
+\begin{table}[t]
+\centering
+\small
+\caption{Where the loss of a switch into Gemma~4~31B lives (Qwen3.8 $\to$ Gemma, 12 agent sessions, KL
+0.335, floor 0.502). An oracle gives Gemma its native values for one class of translated tokens; share of the
+remaining KL removed, 95\% document-bootstrap intervals. Classes overlap.}
+\label{tab:decompose}
+\begin{tabular}{lcc}
+\toprule
+Class made native & Tokens & KL removed \\
+\midrule
+Fill (no hub estimate: markup, special tokens) & 24\% & 49\% [36, 62] \\
+Reasoning & 6\% & 35\% [8, 55] \\
+Tool output & 15\% & 30\% [4, 50] \\
+Tool-call arguments & 3\% & 10\% [1, 17] \\
+\midrule
+The 2,048 tokens before the native tail & 49\% & 50\% [33, 68] \\
+\bottomrule
+\end{tabular}
+\end{table}

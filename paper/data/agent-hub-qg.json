@@ -1,0 +1,118 @@
+{
+ "qwen38-to-gemma-4-31b-agent": {
+  "documents": 18,
+  "scored_tokens": 2243,
+  "hub": {
+   "chat": {
+    "kl": 0.318,
+    "floor_kl": 0.434,
+    "removed": 0.269,
+    "ci95": [
+     0.086,
+     0.403
+    ]
+   },
+   "agent": {
+    "kl": 0.254,
+    "floor_kl": 0.421,
+    "removed": 0.397,
+    "ci95": [
+     0.183,
+     0.523
+    ]
+   },
+   "kl_change": 0.201,
+   "kl_change_ci95": [
+    0.042,
+    0.383
+   ],
+   "agent_better_documents": 14,
+   "sign_flip_p": 0.0334
+  },
+  "hub_prefix": {
+   "chat": {
+    "kl": 0.295,
+    "floor_kl": 0.365,
+    "removed": 0.191,
+    "ci95": [
+     0.077,
+     0.272
+    ]
+   },
+   "agent": {
+    "kl": 0.264,
+    "floor_kl": 0.362,
+    "removed": 0.272,
+    "ci95": [
+     0.144,
+     0.394
+    ]
+   },
+   "kl_change": 0.107,
+   "kl_change_ci95": [
+    0.03,
+    0.246
+   ],
+   "agent_better_documents": 13,
+   "sign_flip_p": 0.0129
+  }
+ },
+ "qwen38-to-gemma-4-31b-chat": {
+  "documents": 6,
+  "scored_tokens": 1536,
+  "hub": {
+   "chat": {
+    "kl": 0.273,
+    "floor_kl": 0.288,
+    "removed": 0.053,
+    "ci95": [
+     -0.003,
+     0.092
+    ]
+   },
+   "agent": {
+    "kl": 0.29,
+    "floor_kl": 0.295,
+    "removed": 0.017,
+    "ci95": [
+     -0.011,
+     0.062
+    ]
+   },
+   "kl_change": -0.062,
+   "kl_change_ci95": [
+    -0.121,
+    -0.006
+   ],
+   "agent_better_documents": 1,
+   "sign_flip_p": 0.0625
+  },
+  "hub_prefix": {
+   "chat": {
+    "kl": 0.047,
+    "floor_kl": 0.072,
+    "removed": 0.35,
+    "ci95": [
+     0.197,
+     0.469
+    ]
+   },
+   "agent": {
+    "kl": 0.052,
+    "floor_kl": 0.073,
+    "removed": 0.283,
+    "ci95": [
+     0.149,
+     0.449
+    ]
+   },
+   "kl_change": -0.118,
+   "kl_change_ci95": [
+    -0.15,
+    -0.035
+   ],
+   "agent_better_documents": 0,
+   "sign_flip_p": 0.0312
+  }
+ }
+}

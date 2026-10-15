@@ -1,0 +1,25 @@
+% Source: paper/data/live.json (paper/scripts/live_stats.py over evidence/universal-kv/swe-agent-live/*).
+\begin{table}[t]
+\centering
+\small
+\caption{Live hand-offs of 18 agent sessions per direction (the target's own, 4.6--13.6K tokens): the
+target's next call at temperature 0 after a switch, against its call after a native prefill and the call the
+session made. Floor: a hub copy with the target's decoders zeroed. Speed-up: native prefill over switch plus
+tail, guard pauses removed, median [range].}
+\label{tab:live}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{llccccc}
+\toprule
+ & & \multicolumn{3}{c}{vs.\ native next call} & vs.\ session & \\
+\cmidrule(lr){3-5}
+Direction & Cache & Tool & Target & Identical & Tool / identical & Speed-up \\
+\midrule
+Qwen3.8 $\to$ Gemma~4~31B & hub & 15 & 8 & 5 & 11 / 6 & 2.2$\times$ [2.0, 3.0] \\
+ & floor & 14 & 10 & 4 & 11 / 4 & 2.2$\times$ [2.0, 2.8] \\
+ & native & -- & -- & -- & 13 / 10 & 1 \\
+Gemma~4~31B $\to$ Qwen3.8 & hub & 12 & 6 & 1 & 10 / 0 & 2.9$\times$ [1.4, 3.9] \\
+ & floor & 11 & 5 & 1 & 11 / 1 & 2.9$\times$ [1.4, 4.0] \\
+ & native & -- & -- & -- & 11 / 1 & 1 \\
+\bottomrule
+\end{tabular}}
+\end{table}

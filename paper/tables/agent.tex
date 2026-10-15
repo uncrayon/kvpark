@@ -1,0 +1,22 @@
+% Source: paper/data/pilot.json (paper/scripts/agent_stats.py over evidence/universal-kv/swe-agent-pilot/ and
+% campaign/gemma-4-31b/eval/*-server). Deployed setting: native prompt start (system message and tool schemas).
+\begin{table}[t]
+\centering
+\small
+\caption{The same model pair on chat and on coding-agent sessions (hub6, server rendering, 2,048-token
+native tail, native prompt start). Agent: 18 of Gemma~4~31B's resolved sessions, cut half way and scored on the
+next reasoning and tool call. Nats per token over 256 scored tokens; 95\% document-bootstrap intervals; $p$:
+exact paired sign-flip test.}
+\label{tab:agent}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{llcccc}
+\toprule
+Direction & Sessions & Floor KL & Translated KL & Translated $\Delta$NLL & Floor KL removed \\
+\midrule
+Qwen3.8 $\to$ Gemma~4~31B & chat (6) & 0.072 & 0.046 & $+0.022$ [$-0.001$, 0.044] & 36\% [23, 50], $p$ .031 \\
+ & agent (18) & 0.365 & 0.308 & $+0.315$ [0.146, 0.526] & 16\% [5, 24], $p$ .012 \\
+Gemma~4~31B $\to$ Qwen3.8 & chat (8) & 0.068 & 0.045 & $+0.033$ [0.010, 0.065] & 34\% [18, 43], $p$ .008 \\
+ & agent (18) & 0.163 & 0.102 & $+0.094$ [0.031, 0.167] & 38\% [2, 49], $p$ .058 \\
+\bottomrule
+\end{tabular}}
+\end{table}
