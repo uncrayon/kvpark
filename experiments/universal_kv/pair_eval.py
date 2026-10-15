@@ -52,6 +52,14 @@ pointing at a bundle re-encoded since is scored again, not read from the stopped
 
 The hubs are read lazily (hub.open_hub): only the sides a translation needs are loaded.
 
+--native-classes CLASS,... (a diagnostic: where the loss lives) also builds, per class, the deployed translation
+with the target's own native values for that class of tokens in [0, T0) (`<base>-CLASS`, base hub_prefix or with
+--native-base hub) and the floor the same way (`<floor>-CLASS`), copied from the target's native save at T0
+(translate's native_mask): an oracle that translates that class perfectly. Classes (token_classes): fill (cells the
+hub does not map: template markup, special and unmatched tokens), tool_output, tool_call (tool-call arguments),
+reasoning, text (user and assistant content), content (every mapped cell), recent (the last --tail tokens before T0:
+exactly a native tail twice as long) and older (the rest from the prompt start on).
+
 Writes <output>/report.json and prints token-weighted delta NLL with document-bootstrap CIs.
 
 Resource guard (resource_guard.py) with the GPU-evaluation defaults (resource_guard.GPU_EVALUATION, where
@@ -75,6 +83,7 @@ import datetime
 import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -165,6 +174,40 @@ def wanted_ids(text, document_ids):
 
 
 EXTRA_CONDITIONS = ("hub", "hub_prefix")
+NATIVE_CLASSES = ("fill", "tool_output", "tool_call", "reasoning", "text", "content", "recent", "older")
+CONDITION_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")   # kv_probe seed-score's own rule
+
+
+def token_classes(conversation, record, tokens, mapped, t0, H, tail):
+    """{class: bool [t0]} of the target tokens in [H, t0) (NATIVE_CLASSES): a token belongs to the segment
+    holding its first byte; mapped: bool [tokens] of the cells the hub decodes (translate.prepare's rule)."""
+    ends = np.asarray(tokens["byte_end"], dtype=np.int64)[:t0]
+    starts = np.concatenate([[0], ends[:-1]])
+    roles = [message["role"] for message in conversation["messages"]]
+    kind = np.full(t0, "", dtype=object)
+    for number, start, end in record["segments"]:
+        key = record["segment_keys"][number]
+        index, what = key.split(":", 1)
+        role = roles[int(index)]
+        label = ("tool_output" if role == "tool" else "tool_call" if what.startswith("arg:")
+                 else "reasoning" if what == "reasoning" else "text")
+        kind[(starts >= start) & (starts < end)] = label
+    after = np.arange(t0) >= H
+    mapped = np.asarray(mapped[:t0], dtype=bool) & after
+    out = {"fill": after & ~mapped, "content": mapped,
+           "recent": after & (np.arange(t0) >= t0 - tail), "older": after & (np.arange(t0) < t0 - tail)}
+    for label in ("tool_output", "tool_call", "reasoning", "text"):
+        out[label] = mapped & (kind == label)
+    return out
+
+
+def mapped_cells(source_record, source_tokens, target_record, target_tokens, n_source):
+    """bool [target tokens]: the cells translate.prepare decodes (aligned to a source token below n_source)."""
+    alignment = handoff.align_document({**source_record, "document_id": target_record["document_id"]},
+                                       source_tokens, target_record, target_tokens)
+    source_of = np.full(len(target_tokens["token_id"]), -1, dtype=np.int64)
+    source_of[alignment.tgt_position] = alignment.src_position
+    return (alignment.tgt_class == translate.ALIGNED) & (source_of >= 0) & (source_of < n_source)
 
 
 def parse_extra_hubs(items):
@@ -329,12 +372,19 @@ def main(argv=None):
                         help="continue a stopped run in --output: keep its saved states and scored documents")
     parser.add_argument("--extra-conditions", default="hub_prefix",
                         help=f"what each --extra-hub builds: a comma list of {', '.join(EXTRA_CONDITIONS)}")
+    parser.add_argument("--native-classes", default="",
+                        help=f"diagnostic oracles, a comma list of {', '.join(NATIVE_CLASSES)} (module docstring)")
+    parser.add_argument("--native-base", default="hub_prefix", choices=("hub", "hub_prefix"),
+                        help="the condition --native-classes builds on")
     resource_guard.add_arguments(parser)
     args = parser.parse_args(argv)
     try:
         guard = resource_guard.Settings.from_args(args, defaults=resource_guard.GPU_EVALUATION)
         extra_dirs = parse_extra_hubs(args.extra_hub)
         extra_conditions = parse_extra_conditions(args.extra_conditions)
+        native_classes = [c for c in args.native_classes.split(",") if c]
+        if set(native_classes) - set(NATIVE_CLASSES):
+            raise ValueError(f"--native-classes: unknown {sorted(set(native_classes) - set(NATIVE_CLASSES))}")
     except ValueError as error:
         parser.error(str(error))
     args.output.mkdir(parents=True, exist_ok=args.resume)
@@ -432,13 +482,19 @@ def main(argv=None):
     built = args.output / "built"
     if built.exists():                                      # a stopped run's translations: built again
         shutil.rmtree(built)
+    native_floor = args.native_base.replace("hub", "floor")
+    native_names = [f"{base}-{c}" for c in native_classes for base in (args.native_base, native_floor)]
     names = (("sanity", "hub", "floor", "hub_prefix", "floor_prefix") + (("hub_table_prefix",) if table is not None else ())
-             + tuple(extra_names))
+             + tuple(extra_names) + tuple(native_names))
+    bad = [name for name in names if not CONDITION_NAME.fullmatch(name)]
+    if bad:                                                 # before any translation, not at the probe
+        raise ValueError(f"condition names kv_probe would refuse: {bad}")
     hub_digests = {"": model_digests(main_manifest, (s_name, t_name)),
                    **{label: model_digests(extra.manifest, (s_name, t_name)) for label, (extra, _) in extras.items()}}
     options = {"table": hub_module.sha256_file(table_path) if table is not None else None,
                "recurrent": args.recurrent, "recurrent_group": args.recurrent_group, "tail": args.tail,
-               "recurrent_mean": hub_module.sha256_file(args.recurrent_mean) if args.recurrent_mean else None}
+               "recurrent_mean": hub_module.sha256_file(args.recurrent_mean) if args.recurrent_mean else None,
+               **({"native_classes": native_classes, "native_base": args.native_base} if native_classes else {})}
     inputs, digests, means = [], {}, {}
     for d in documents:
         did = d["id"]
@@ -460,7 +516,8 @@ def main(argv=None):
                                {"name": "floor_prefix", "state_file": str(out / "floor_prefix.state")}]
                 + ([{"name": "hub_table_prefix", "state_file": str(out / "hub_table_prefix.state")}]
                    if table is not None else [])
-                + [{"name": name, "state_file": str(out / f"{name}.state")} for name in extra_names]}
+                + [{"name": name, "state_file": str(out / f"{name}.state")} for name in extra_names]
+                + [{"name": name, "state_file": str(out / f"{name}.state")} for name in native_names]}
         digests[did] = build_digest(hub_digests, item, options)
         inputs.append(item)
         kept = stored_build(args.output / "scores" / did, did, ("native",) + names, digests[did]) if args.resume else None
@@ -499,7 +556,20 @@ def main(argv=None):
                     state, _ = translate.translate(source_state, side, target, extra, t0=d["t0"], template=template,
                                                    **prefix, **recurrent)
                     kvstate.write_new(out / f"{name}.{label}.state", state.to_bytes())
+        if native_classes:
+            masks = token_classes(d["conversation"], d["records"]["t"], tokens["t"][did],
+                                  mapped_cells(d["records"]["s"], tokens["s"][did], d["records"]["t"], tokens["t"][did],
+                                               d["P_s"]), d["t0"], H, args.tail)
+            d["classes"] = {c: int(masks[c].sum()) for c in native_classes}
+            prefix = {"native_prefix": H} if args.native_base == "hub_prefix" else {}
+            for c in native_classes:
+                for base, side in ((args.native_base, source), (native_floor, empty)):
+                    state, _ = translate.translate(source_state, side, target, hubs, t0=d["t0"], template=template,
+                                                   native_state=template, native_mask=masks[c], **prefix, **recurrent)
+                    kvstate.write_new(out / f"{base}-{c}.state", state.to_bytes())
         d["build"] = {key: report[key] for key in BUILD_KEPT if key in report}
+        if "classes" in d:
+            d["build"]["classes"] = d["classes"]
         print(json.dumps({"built": did[:12], "P": d["P"], "t0": d["t0"], "mapped": report["mapped_cells"],
                           "fill": report["fill_cells"], "seconds": report["seconds"]}), flush=True)
     if args.resume:                                         # one probe run per document: a stop keeps the rest
@@ -524,7 +594,8 @@ def main(argv=None):
         base = args.output / "scores" / (d["id"] if args.resume else "") / "scores" / d["id"]
         native = np.load(base / "native.npy").astype(np.float64)
         row = {"document_id": d["id"], "source": d["conversation"].get("source"), "P": d["P"], "t0": d["t0"], "H": d["H"],
-               "n_scored": len(native), "mapped_cells": d["build"]["mapped_cells"], "fill_cells": d["build"]["fill_cells"]}
+               "n_scored": len(native), "mapped_cells": d["build"]["mapped_cells"], "fill_cells": d["build"]["fill_cells"],
+               **({"classes": d["build"]["classes"]} if "classes" in d["build"] else {})}
         for name in names:
             scores = np.load(base / f"{name}.npy").astype(np.float64)
             row[name] = {"nll_delta": float(np.mean(scores[:, 0] - native[:, 0])), "kl": float(scores[:, 1].mean()),

@@ -161,5 +161,46 @@ class LiveBridgeGuardTest(unittest.TestCase):
         self.assertEqual(out["chunked"]["prompt_ms"], 300.0)
 
 
+
+AGENT_CHECKS = r"""
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import live_bridge
+message = {"tool_calls": [{"id": "a", "type": "function",
+                           "function": {"name": "run_command", "arguments": '{"command": "ls"}'}}]}
+calls = live_bridge.tool_calls(message)
+other = [{"name": "run_command", "arguments": {"command": "pwd"}}]
+messages = [{"role": "assistant", "content": "", "tool_calls": [
+    {"id": "a", "type": "function", "function": {"name": "f", "arguments": {"x": "\u00e9"}}}]}]
+out = live_bridge.openai_messages(messages)
+print("RESULT " + json.dumps({
+    "calls": calls, "none": live_bridge.tool_calls({"content": "done"}),
+    "same": live_bridge.same_calls(calls, calls), "args_differ": live_bridge.same_calls(calls, other),
+    "missing": live_bridge.same_calls(calls, []),
+    "string": out[0]["tool_calls"][0]["function"]["arguments"],
+    "input_kept": messages[0]["tool_calls"][0]["function"]["arguments"],
+    "round_trip": live_bridge.conversation_from_openai(out)["messages"][0]["tool_calls"][0]["function"]["arguments"]}))
+"""
+
+
+class AgentHelpersTest(unittest.TestCase):
+    def test_tool_calls_and_openai_messages(self):
+        python = bridge_python()
+        if python is None:
+            self.skipTest("no python3 with psutil (kvpark.bridge's registry)")
+        result = subprocess.run([python, "-c", AGENT_CHECKS, str(HERE)], capture_output=True, text=True, timeout=60)
+        lines = [line for line in result.stdout.splitlines() if line.startswith("RESULT ")]
+        self.assertTrue(lines, result.stderr[-3000:])
+        out = json.loads(lines[-1][len("RESULT "):])
+        self.assertEqual(out["calls"], [{"name": "run_command", "arguments": {"command": "ls"}}])
+        self.assertEqual(out["none"], [])
+        self.assertEqual(out["same"], [True, True])
+        self.assertEqual(out["args_differ"], [True, False])
+        self.assertEqual(out["missing"], [False, False])
+        self.assertEqual(out["string"], '{"x": "\u00e9"}')
+        self.assertEqual(out["input_kept"], {"x": "\u00e9"})
+        self.assertEqual(out["round_trip"], {"x": "\u00e9"})
+
+
 if __name__ == "__main__":
     unittest.main()

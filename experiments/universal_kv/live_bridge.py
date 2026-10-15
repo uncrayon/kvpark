@@ -8,6 +8,7 @@
     python live_bridge.py options --servers SERVERS.json --source muse --target qwen38 [--extra-target qwen3-4b] ...
     python live_bridge.py surrogates --servers SERVERS.json --source qwen38 --target muse --engine gpu=PY:gpu ...
     python live_bridge.py surrogates-hermes --servers SERVERS.json --source qwen38 --target qwen3-4b --engine gpu=PY:gpu ...
+    python live_bridge.py agent  --servers SERVERS.json --source qwen38 --target gemma-4-31b --engine gpu=PY:gpu ...
     python live_bridge.py --model NAME=GGUF ... --server BINARY ...     (hops with one upstream build, as before)
 
 Starts throwaway llama-servers (private ports and slot directories; nothing deployed is
@@ -719,7 +720,100 @@ def chat(server, messages, tools, max_tokens):
     return {**generation(reply), "wall_s": round(seconds, 2), "answer": (message.get("content") or "")[:600],
             "reasoning_chars": len(message.get("reasoning_content") or ""),
             "reasoning_head": (message.get("reasoning_content") or "")[:300],
+            "tool_calls": tool_calls(message),
             "finish_reason": reply["choices"][0].get("finish_reason")}
+
+
+def tool_calls(message):
+    """[{"name", "arguments"}] of a message's tool calls, arguments parsed from JSON where they are a string."""
+    out = []
+    for call in message.get("tool_calls") or ():
+        function = call.get("function") or {}
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except ValueError:
+                pass
+        out.append({"name": function.get("name"), "arguments": arguments})
+    return out
+
+
+def openai_messages(messages):
+    """chat.py messages (tool-call arguments as objects) as an OpenAI chat request carries them (JSON strings)."""
+    out = []
+    for message in messages:
+        message = dict(message)
+        if message.get("tool_calls"):
+            message["tool_calls"] = [{**call, "function": {**call["function"],
+                                                           "arguments": json.dumps(call["function"]["arguments"],
+                                                                                   ensure_ascii=False)}}
+                                     for call in message["tool_calls"]]
+        out.append(message)
+    return out
+
+
+def same_calls(a, b):
+    """(same tool names in order, same names and arguments) of two tool_calls lists."""
+    names = [call["name"] for call in a] == [call["name"] for call in b]
+    return names, names and [call["arguments"] for call in a] == [call["arguments"] for call in b]
+
+
+def agent(args):
+    """Coding-agent sessions (agent_corpus.py; the scored assistant turn removed): the target's next turn after a
+    native prefill against after a switch from the source, both real chat requests with the session's tools
+    (temperature 0, --max-tokens): the tool calls each makes, against each other and against the call the session
+    actually made, the reuse (cache_n against T0) and the times, with the wall clock of every step."""
+    rig = Rig(args, {args.source, args.target})
+    results = []
+    try:
+        rig.start()
+        source, target = rig.client(args.source), rig.client(args.target)
+        label, (config, path) = next(iter(rig.configs.items()))
+        # every request carries tool-call arguments as JSON strings, as an agent's client sends them
+        items = [{**item, "messages": openai_messages(item["messages"])} for item in corpus(args)]
+        chosen = choose(args, target, items, limit=args.limit, min_tokens=args.min_tokens,
+                        max_tokens=min(spec["ctx"] for spec in rig.specs.values()) - args.max_tokens - 512)
+        for item, conversation, n_tokens in chosen:
+            messages, tools = conversation["messages"], conversation.get("tools")
+            record = {"id": item.get("id"), "task_id": item.get("task_id"), "source": item.get("source"),
+                      "engine": label, "tokens": n_tokens, "gold": tool_calls(item["messages"][-1])}
+            try:
+                target.slot_action("erase")
+                waited, started = cool(args), time.time()
+                record["native"] = {**chat(target, messages, tools, args.max_tokens), **machine(),
+                                    "clock": [round(started, 3), round(time.time(), 3)], "cool_wait_s": waited}
+                record["prime"] = {"model": args.source, **prime(source, conversation)}
+                warmed = prewarm(config, path, args.source, args.target) if args.prewarm else None
+                waited, before, started = cool(args), machine(), time.time()
+                report = switch(config, conversation_from_openai(messages, tools), args.source, args.target,
+                                config_path=path, warm=False)
+                record["switch"] = {**switch_record(report, warmed, before),
+                                    "clock": [round(started, 3), round(time.time(), 3)], "cool_wait_s": waited}
+                started = time.time()
+                record["bridged"] = {**chat(target, messages, tools, args.max_tokens), **machine(),
+                                     "clock": [round(started, 3), round(time.time(), 3)]}
+                record["bridged"]["reuse_ok"] = record["bridged"]["cache_n"] == record["switch"].get("t0")
+                for case in ("native", "bridged"):
+                    record[case]["gold_name"], record[case]["gold_call"] = same_calls(record[case]["tool_calls"],
+                                                                                      record["gold"])
+                record["same_name"], record["same_call"] = same_calls(record["bridged"]["tool_calls"],
+                                                                      record["native"]["tool_calls"])
+            except Exception as error:      # noqa: BLE001  (record and continue)
+                record["error"] = f"{type(error).__name__}: {error}"[:400]
+            results.append(record)
+            print(json.dumps({"id": (record["id"] or "")[:12], "t0": (record.get("switch") or {}).get("t0"),
+                              "reuse_ok": (record.get("bridged") or {}).get("reuse_ok"),
+                              "native_ms": (record.get("native") or {}).get("prompt_ms"),
+                              "switch_s": ((record.get("switch") or {}).get("timings") or {}).get("total_s"),
+                              "tail_ms": (record.get("bridged") or {}).get("prompt_ms"),
+                              "same_name": record.get("same_name"), "same_call": record.get("same_call"),
+                              "error": record.get("error")}), flush=True)
+            with open(args.output / "agent.jsonl", "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record) + "\n")
+    finally:
+        rig.stop()
+    return results
 
 
 def media(args):
@@ -1560,7 +1654,7 @@ def surrogates_hermes(args):
 
 MODES = {"hops": hops, "drafts": drafts, "media": media, "drafts-control": drafts_control,
          "media-control": media_control, "options": options, "surrogates": surrogates_mode,
-         "surrogates-hermes": surrogates_hermes}
+         "surrogates-hermes": surrogates_hermes, "agent": agent}
 
 
 def main(argv=None):

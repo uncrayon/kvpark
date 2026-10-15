@@ -584,6 +584,26 @@ class SidesAndBundlesTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "not a format 1"):
                 convert_hub.convert(Path(directory) / "v2", Path(directory) / "v3", log=lambda line: None)
 
+    def test_a_published_bundle_keeps_only_f16_sides_and_translates_alike(self):
+        import convert_hub
+        import publish_hub
+        with tempfile.TemporaryDirectory() as directory:
+            v1 = self.save(directory)
+            convert_hub.convert(v1, Path(directory) / "v2", log=lambda line: None)
+            manifest, files = publish_hub.publish(Path(directory) / "v2", Path(directory) / "pub",
+                                                  strip_prefix=directory)
+            self.assertFalse(any(name.endswith(".f32.npy") and ".view." not in name for name in files))
+            self.assertNotIn(directory, json.dumps({k: v for k, v in manifest.items() if k != "published"}))
+            full, published = hub.open_hub(Path(directory) / "v2"), hub.open_hub(Path(directory) / "pub")
+            for kind in hub.KINDS:
+                for name in ("a", "b", "c"):
+                    e1, e2 = full.encoder_side(kind, name), published.encoder_side(kind, name)
+                    self.assertEqual(e2.weight.dtype, np.float32)
+                    d1, d2 = full.decoder_side(kind, name), published.decoder_side(kind, name)
+                    got = d2.decode(e2.encode(self.blocks[name][kind]), d2.layers)
+                    expected = d1.decode(e1.encode(self.blocks[name][kind]), d1.layers)
+                    np.testing.assert_allclose(got, expected, rtol=0, atol=2e-3 * np.abs(expected).max())
+
     def test_files_are_hashed_once_per_identity(self):
         import convert_hub
         with tempfile.TemporaryDirectory() as directory:

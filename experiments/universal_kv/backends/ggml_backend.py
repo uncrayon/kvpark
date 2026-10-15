@@ -899,13 +899,30 @@ class GgmlBackend(Backend):
             self._call(code, "cache rows")
         return result
 
+    def layer_groups(self, decoder, layers):
+        """Consecutive groups of a section's layers whose fused decoder weight (float16 [sum d_l, D], _Decoder.section)
+        fits the device's largest buffer: Gemma-4-31B's sliding layers (50 x 4,096 rows at D = 4,096, 1.6 GB) exceed
+        ggml-vulkan's 1 GiB. A layer wider than the buffer on its own stays a group of one (refused when built)."""
+        groups, current, size = [], [], 0
+        for layer in layers:
+            nbytes = 2 * len(decoder.means[int(layer)]) * decoder.dim
+            if current and size + nbytes > self.max_buffer:
+                groups.append(tuple(current))
+                current, size = [], 0
+            current.append(layer)
+            size += nbytes
+        if current:
+            groups.append(tuple(current))
+        return groups
+
     def warm_products(self, encoder, decoder, rows, sections, *, spec=None, kind="k"):
         """A switch's products on `rows` zero rows (engine_daemon.warm_products): encode centred on the
-        decoder, each section's decode and, with the target's spec, its RoPE and float16 cast."""
+        decoder, each section's decode (per layer group, layer_groups) and, with the target's spec, its RoPE and
+        float16 cast."""
         zeros = {layer: np.zeros((rows, width), dtype=np.float16) for layer, width in encoder.widths.items()}
         z = self.encode_rows(encoder, zeros, center=decoder)
         everything = np.arange(rows, dtype=np.int64)
-        for layers in sections:
+        for layers in [group for section in sections for group in self.layer_groups(decoder, section)]:
             values = self.section(decoder, z, layers, rows, everything, everything, np.zeros(0, dtype=np.int64),
                                   centered=True)
             if spec is not None:

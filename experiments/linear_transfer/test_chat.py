@@ -282,6 +282,15 @@ class SyntheticTemplateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "final message content"):
             rendered_record(conv, "muse", render(conv, dropping))
         rendered_record(conversation("train"), "muse", render(conversation("train"), dropping))
+        # an agent turn to score (reasoning and a tool call, no content): its first segment counts
+        agent = conversation("train")
+        agent["messages"] = agent["messages"][:3]
+        agent["messages"][2]["content"] = ""
+        agent_record = rendered_record({**agent, "split": "test"}, "muse", render(agent, MUSE_LIKE, bos_token=MUSE_BOS))
+        self.assertEqual([agent_record["segment_keys"][n] for n in agent_record["final_message_segments"]],
+                         ["2:reasoning", "2:arg:0:city"])
+        with self.assertRaisesRegex(ValueError, "final message content"):
+            rendered_record({**agent, "split": "test"}, "muse", render(agent, dropping))
         json.dumps(record, allow_nan=False)
         other = conversation("train")
         other["messages"].pop()

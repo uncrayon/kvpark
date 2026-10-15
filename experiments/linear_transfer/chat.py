@@ -832,8 +832,12 @@ def rendered_record(conversation, model_name, rendered):
     if not isinstance(rendered.template_sha256, str) or not isinstance(rendered.bos_token, str):
         raise ValueError("rendering lacks its template and BOS provenance")
     if conversation["split"] == "test":
-        content = rendered.segment_keys.index(f"{len(conversation['messages']) - 1}:content")
-        if content not in rendered.final_message_segments:
+        # the final message's content, or for an agent turn without content (reasoning and a tool
+        # call) its first segment
+        final = f"{len(conversation['messages']) - 1}:"
+        keys = [number for number, key in enumerate(rendered.segment_keys) if key == final + "content"] or [
+            number for number, key in enumerate(rendered.segment_keys) if key.startswith(final)]
+        if not keys or keys[0] not in rendered.final_message_segments:
             raise ValueError("the template does not render the final message content of a test conversation")
     return {
         "document_id": document_id(conversation),

@@ -358,6 +358,7 @@ class Plan:
     recurrent: str = "zero"         # hybrid targets: the recurrent_init strategy of the cell at t0 - 1
     recurrent_mean: object = None   # its recurrent_init.RecurrentMean (strategies reading the mean)
     recurrent_group: str = recurrent_init.ALL       # the mean's group
+    native_mask: object = None      # bool [target tokens] or None: further cells copied from native_state
 
     @property
     def mapped_cells(self):
@@ -430,7 +431,7 @@ def _recurrent_strategy(template, strategy, mean, group, native_state, native_pr
 
 def prepare(source_state, source, target, layers, *, t0, template, fill="mean", table=None, swa_cells=None,
             server_tokens=True, native_state=None, native_prefix=0, indexer_ridge=None, recurrent="zero",
-            recurrent_mean=None, recurrent_group=recurrent_init.ALL):
+            recurrent_mean=None, recurrent_group=recurrent_init.ALL, native_mask=None):
     """The Plan of a translation; layers: {kind: source layers the hub encodes} (see source_layers);
     indexer_ridge: the target's hub.IndexerRidge (DSA targets) or None; recurrent, recurrent_mean,
     recurrent_group: what a hybrid target's recurrent cell at t0 - 1 starts from (translate)."""
@@ -449,6 +450,14 @@ def prepare(source_state, source, target, layers, *, t0, template, fill="mean", 
             raise ValueError("the native prefix state and the template hold different llama.cpp revisions' layouts")
         if not np.array_equal(np.asarray(native_state.tokens)[:native_prefix],
                               np.asarray(target.tokens["token_id"])[:native_prefix]):
+            raise ValueError("the native state's tokens differ from the target prompt")
+    if native_mask is not None:
+        native_mask = np.asarray(native_mask, dtype=bool)
+        if len(native_mask) < t0:
+            raise ValueError("a native mask must cover the target positions [0, t0)")
+        if native_state is None or len(native_state.tokens) < t0:
+            raise ValueError("a native mask needs a native target state holding [0, t0)")
+        if not np.array_equal(np.asarray(native_state.tokens)[:t0], np.asarray(target.tokens["token_id"])[:t0]):
             raise ValueError("the native state's tokens differ from the target prompt")
     layouts = target.spec.layouts(template.state.flags)
     if [part.name for part in template.state.parts] != [layout.name for layout in layouts]:
@@ -482,7 +491,7 @@ def prepare(source_state, source, target, layers, *, t0, template, fill="mean", 
     return Plan(t0, swa_cells, fill, source, target, template, cache, source_of[mapped_at], sections,
                 int(len(needed)), native_state, native_prefix, bool(server_tokens), mapped_at, kinds, norms,
                 _indexer_fill(target, sections, t0, indexer_ridge, native_prefix), recurrent, recurrent_mean,
-                recurrent_group)
+                recurrent_group, native_mask)
 
 
 def _table_fill(plan, positions, layers, kind, table, renorm_fill_k):
@@ -662,15 +671,19 @@ def _indexer_rows(plan, backend, section, values, r0, r1, out):
             cast_to_cache(keys, dtype, f"layer {layer} indexer keys", out=out[other.name][0][layer][i0:i1])
 
 
-def _store_rows(plan, backend, section, kind, values, r0, r1, out):
-    """A section's decoded float32 rows [r0, r1) (values [rows, sum d_l] of section.decoded[kind]) into
-    its cache arrays in out: MLA latents back on their RMS shell, the ridge-filled indexer keys of
-    these positions (from the pre-RoPE K rows), then RoPE at the target positions and the cache dtype
-    (backend.cache_rows rotates values in place)."""
-    spec, layers = plan.target.spec, section.decoded[kind]
+def _store_rows(plan, backend, section, kind, values, r0, r1, out, layers=None):
+    """A section's decoded float32 rows [r0, r1) (values [rows, sum d_l] of `layers`, by default every layer of
+    section.decoded[kind]) into its cache arrays in out: MLA latents back on their RMS shell, the ridge-filled
+    indexer keys of these positions (from the pre-RoPE K rows), then RoPE at the target positions and the cache
+    dtype (backend.cache_rows rotates values in place)."""
+    spec = plan.target.spec
+    every = tuple(section.decoded[kind])
+    layers = every if layers is None else tuple(layers)
     if kind == "k" and plan.norms:
         backend.renormalize_latents(spec, layers, values, plan.norms)
     if kind == "k" and isinstance(plan.indexer, hub_module.IndexerRidge):
+        if layers != every:
+            raise ValueError("indexer keys need a section's K rows decoded in one group")
         _indexer_rows(plan, backend, section, values, r0, r1, out)
     rows = out[section.name][KINDS.index(kind)]
     backend.cache_rows(spec, layers, kind, values, section.positions[r0:r1], _cache_dtype(section.part),
@@ -715,21 +728,25 @@ def compute_cache(plan, hub, backend, *, table=None, renorm_fill_k=True, window=
                     started = time.perf_counter()
                     i0, i1 = np.searchsorted(section.mapped_rows, [r0, r1])
                     f0, f1 = np.searchsorted(section.fill_rows, [r0, r1])
-                    fill = None
-                    if plan.fill == "table" and f1 > f0:
-                        fill = _table_fill(plan, section.positions[section.fill_rows[f0:f1]], layers, kind, table,
-                                           renorm_fill_k)
-                    values = backend.section(decoder, z, layers, r1 - r0, section.mapped[i0:i1] - m0,
-                                             section.mapped_rows[i0:i1] - r0, section.fill_rows[f0:f1] - r0, fill,
-                                             centered=True)
-                    backend.synchronize()
-                    timings["decode_s"] = timings.get("decode_s", 0.0) + time.perf_counter() - started
-                    started = time.perf_counter()
                     if prefault is not None:
                         prefault.wait((section.name, kind))
-                    _store_rows(plan, backend, section, kind, values, r0, r1, out)
-                    del values
-                    timings["assemble_s"] = timings.get("assemble_s", 0.0) + time.perf_counter() - started
+                    # one group, unless the device bounds it; a DSA target's indexer ridge reads every K layer
+                    whole = kind == "k" and isinstance(plan.indexer, hub_module.IndexerRidge)
+                    for group in [tuple(layers)] if whole else backend.layer_groups(decoder, layers):
+                        fill = None
+                        if plan.fill == "table" and f1 > f0:
+                            fill = _table_fill(plan, section.positions[section.fill_rows[f0:f1]], group, kind, table,
+                                               renorm_fill_k)
+                        values = backend.section(decoder, z, group, r1 - r0, section.mapped[i0:i1] - m0,
+                                                 section.mapped_rows[i0:i1] - r0, section.fill_rows[f0:f1] - r0, fill,
+                                                 centered=True)
+                        backend.synchronize()
+                        timings["decode_s"] = timings.get("decode_s", 0.0) + time.perf_counter() - started
+                        started = time.perf_counter()
+                        _store_rows(plan, backend, section, kind, values, r0, r1, out, layers=group)
+                        del values
+                        timings["assemble_s"] = timings.get("assemble_s", 0.0) + time.perf_counter() - started
+                        started = time.perf_counter()
                 del z
     except BaseException:
         if prefault is not None:
@@ -769,10 +786,13 @@ def build_state(plan, arrays):
             template_stream = part.stream()
             dtype = _cache_dtype(part)
             k, v = arrays[part.name]
-            if plan.native_prefix and (positions < plan.native_prefix).any():
+            copied = positions < plan.native_prefix
+            if plan.native_mask is not None:
+                copied |= plan.native_mask[positions]
+            if copied.any():
                 native_stream = plan.native_state.state.part(part.name).stream()
                 native_index = handoff._stream_index(native_stream, "native target state")
-                rows = np.flatnonzero(positions < plan.native_prefix)
+                rows = np.flatnonzero(copied)
                 available = [i for i in rows if int(positions[i]) in native_index]
                 if available:
                     cells = handoff._cells(native_index, positions[available], "native target state")
@@ -802,13 +822,15 @@ def build_state(plan, arrays):
 def translate(source_state, source, target, hub, *, t0, template, fill="mean", table=None, swa_cells=None,
               server_tokens=True, chunk_rows=4096, renorm_fill_k=True, native_state=None, native_prefix=0,
               backend=None, window_rows=None, indexer_ridge=None, recurrent="zero", recurrent_mean=None,
-              recurrent_group=recurrent_init.ALL):
+              recurrent_group=recurrent_init.ALL, native_mask=None):
     """kvstate.StateFile for the target holding positions [0, t0); see the module docstring.
 
     native_state / native_prefix H: cells at positions < H are copied from a native target state
     holding at least H tokens. K/V of the first H tokens depend only on those tokens, so a short
     native prefill of the prompt's start (the attention-sink tokens, the system prompt, tools)
-    gives exact values whatever the rest of the conversation is.
+    gives exact values whatever the rest of the conversation is. native_mask (bool per target
+    token, a diagnostic: native_state must hold [0, t0)) copies the native cells at those positions
+    too, the oracle for one class of tokens (decompose.py).
 
     backend: a backends instance (default numpy, the float32 reference); window_rows: target
     positions per compute_cache window (default backend.window_rows); chunk_rows: source rows per
@@ -845,7 +867,7 @@ def translate(source_state, source, target, hub, *, t0, template, fill="mean", t
     plan = prepare(source_state, source, target, layers, t0=t0, template=template, fill=fill, table=table,
                    swa_cells=swa_cells, server_tokens=server_tokens, native_state=native_state,
                    native_prefix=native_prefix, indexer_ridge=indexer_ridge, recurrent=recurrent,
-                   recurrent_mean=recurrent_mean, recurrent_group=recurrent_group)
+                   recurrent_mean=recurrent_mean, recurrent_group=recurrent_group, native_mask=native_mask)
     timings["prepare_s"] = time.perf_counter() - started
     window = int(window_rows or backend.window_rows)
     arrays = compute_cache(plan, hub, backend, table=table, renorm_fill_k=renorm_fill_k, window=window,

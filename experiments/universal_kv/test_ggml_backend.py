@@ -523,6 +523,24 @@ class BlockedProductsTest(ProductsTest):
         np.testing.assert_array_equal(self.backend.host(z), np.arange(150 * 96, dtype=np.float32).reshape(150, 96))
         self.assertEqual(z.nbytes, sum(tensor.nbytes for _, tensor in z.blocks))
 
+    def test_layer_groups_keep_each_fused_decoder_within_the_largest_buffer(self):
+        decoder = self.sides("k", self.backend)[1]
+        widths = {layer: len(decoder.means[layer]) for layer in (0, 1, 2, 3)}
+        two = 2 * (widths[0] + widths[1]) * decoder.dim
+        saved = self.backend.max_buffer
+        try:
+            self.backend.max_buffer = two
+            groups = self.backend.layer_groups(decoder, (0, 1, 2, 3))
+            self.assertEqual([layer for group in groups for layer in group], [0, 1, 2, 3])
+            self.assertTrue(all(2 * sum(widths[l] for l in group) * decoder.dim <= two or len(group) == 1
+                                for group in groups))
+            self.assertGreater(len(groups), 1)
+            self.backend.max_buffer = 1 << 40
+            self.assertEqual(self.backend.layer_groups(decoder, (0, 1, 2, 3)), [(0, 1, 2, 3)])
+        finally:
+            self.backend.max_buffer = saved
+        self.assertEqual(numpy_backend.NumpyBackend().layer_groups(None, [0, 1]), [(0, 1)])
+
     test_an_array_beyond_the_largest_buffer_is_out_of_memory = None
     test_uploads_keep_no_graph_buffer = None
     test_resident_sides_report_device_bytes_and_release = None

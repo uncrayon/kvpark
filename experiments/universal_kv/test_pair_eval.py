@@ -4,6 +4,8 @@
 import sys
 import tempfile
 import unittest
+
+import numpy as np
 from pathlib import Path
 
 import pair_eval
@@ -198,6 +200,17 @@ class ResumeTest(unittest.TestCase):
             self.assertFalse(output.with_name("d1.built.json").exists())
             self.assertIsNone(pair_eval.stored_build(output, "d1", names, digest))
 
+class ConditionNameTest(unittest.TestCase):
+    """Every condition name pair_eval builds passes kv_probe's rule (a '+' there failed a run after its builds)."""
+
+    def test_native_class_names_pass_the_probe(self):
+        for base in ("hub", "hub_prefix"):
+            for floor in (base, base.replace("hub", "floor")):
+                for c in pair_eval.NATIVE_CLASSES:
+                    self.assertTrue(pair_eval.CONDITION_NAME.fullmatch(f"{floor}-{c}"))
+        self.assertIsNone(pair_eval.CONDITION_NAME.fullmatch("hub+fill"))
+
+
 class ResumeMainTest(unittest.TestCase):
     """pair_eval.main --resume with the probe, the models and the translator replaced by stand-ins: a run stopped
     after scoring some documents translates and scores only the others when resumed, and its report equals an
@@ -328,3 +341,27 @@ class ResumeMainTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TokenClassesTest(unittest.TestCase):
+    def test_classes_partition_by_segment_and_mapping(self):
+        conversation = {"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "u"},
+                                     {"role": "assistant", "content": "", "reasoning_content": "r",
+                                      "tool_calls": [{"id": "1", "type": "function",
+                                                      "function": {"name": "f", "arguments": {"a": "x"}}}]},
+                                     {"role": "tool", "tool_call_id": "1", "name": "f", "content": "o"}]}
+        # bytes: [S][s][U][u][A][r][x][T][o][E]: one token per byte; segments s, u, r, x, o
+        record = {"segments": [[0, 1, 2], [1, 3, 4], [2, 5, 6], [3, 6, 7], [4, 8, 9]],
+                  "segment_keys": ["0:content", "1:content", "2:reasoning", "2:arg:0:a", "3:content"]}
+        tokens = {"byte_end": list(range(1, 11))}
+        mapped = np.array([1, 1, 0, 1, 0, 1, 1, 0, 1, 0], dtype=bool)
+        out = pair_eval.token_classes(conversation, record, tokens, mapped, t0=9, H=2, tail=3)
+        on = {name: list(np.flatnonzero(mask)) for name, mask in out.items()}
+        self.assertEqual(on["text"], [3])
+        self.assertEqual(on["reasoning"], [5])
+        self.assertEqual(on["tool_call"], [6])
+        self.assertEqual(on["tool_output"], [8])
+        self.assertEqual(on["fill"], [2, 4, 7])
+        self.assertEqual(on["content"], [3, 5, 6, 8])
+        self.assertEqual(on["recent"], [6, 7, 8])
+        self.assertEqual(on["older"], [2, 3, 4, 5])

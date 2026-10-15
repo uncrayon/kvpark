@@ -75,6 +75,11 @@ class Backend:
         self._sides = OrderedDict()           # key -> (owner, handle, last used)
         self._lock = threading.RLock()
 
+    def layer_groups(self, decoder, layers):
+        """A section's decoded layers in groups decoded one call each (translate.compute_cache): one group, unless
+        the device bounds a tensor (GgmlBackend: a section's fused decoder weight above the largest buffer)."""
+        return [tuple(layers)]
+
     # -- resident sides --------------------------------------------------------------------------
 
     def side(self, hub, kind, name, role):

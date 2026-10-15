@@ -442,6 +442,24 @@ class TranslateTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "native prefix needs"):
             self.build(native_prefix=2)
 
+    def test_native_mask_copies_only_those_cells(self):
+        t0 = len(self.t_tok["token_id"]) - 1
+        mask = np.zeros(t0, dtype=bool)
+        mask[[1, 3]] = True
+        plain, _ = self.build()
+        state, _ = self.build(native_state=self.native, native_mask=mask)
+        stream, native, base = (s.state.part("kv").stream() for s in (state, self.native, plain))
+        for layer in (0, 1, 2):
+            for kind in ("k", "v"):
+                got, want, before = (np.asarray(getattr(s, kind)[layer]) for s in (stream, native, base))
+                np.testing.assert_array_equal(got[[1, 3]], want[[1, 3]])
+                keep = [p for p in range(t0) if not mask[p]]
+                np.testing.assert_array_equal(got[keep], before[keep])
+        with self.assertRaisesRegex(ValueError, "native mask needs"):
+            self.build(native_mask=mask)
+        with self.assertRaisesRegex(ValueError, "must cover"):
+            self.build(native_state=self.native, native_mask=mask[:2])
+
     def test_refusals(self):
         with self.assertRaisesRegex(ValueError, "t0 must lie"):
             translate.translate(self.source_state, translate.Side("src", SOURCE, self.s_rec, self.s_tok),

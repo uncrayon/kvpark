@@ -1810,6 +1810,10 @@ class Hub:
         if self.version != FORMAT_V2:
             raise ValueError("packed sides exist only in format 2 hubs (convert_hub.py)")
         entry = self.manifest["sides"][f"{name}.{kind}.{role}"]
+        if dtype == "f32" and "f32" not in entry["files"] and "f16" in entry["files"]:
+            # a published bundle may carry only the f16 copies: the float32 readers get them widened
+            path = self.side_file(kind, name, role, "f16")
+            return entry, np.load(path, allow_pickle=False).astype(np.float32)
         path = self.side_file(kind, name, role, dtype)
         return entry, np.load(path, mmap_mode="r" if mmap else None, allow_pickle=False)
 
